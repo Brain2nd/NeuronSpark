@@ -32,6 +32,7 @@ class SNNBlock(base.MemoryModule):
         D: 可见维度（Block 间通信的 spike 维度）
         N: 状态扩展因子（每个通道的隐神经元数）
         v_th_min: 动态阈值下限
+        output_v_threshold: 输出神经元阈值（deeper blocks 需要更低值）
         surrogate_function: surrogate gradient 函数
     """
 
@@ -40,6 +41,7 @@ class SNNBlock(base.MemoryModule):
         D: int,
         N: int = 8,
         v_th_min: float = 0.1,
+        output_v_threshold: float = 0.3,
         surrogate_function=surrogate.Sigmoid(alpha=4.0),
     ):
         super().__init__()
@@ -77,12 +79,13 @@ class SNNBlock(base.MemoryModule):
         )
 
         # ====== 输出神经元（D 个，固定参数 PLIF） ======
-        # v_threshold 校准：ParametricLIFNode 使用 V = β·V + (1-β)·x，
-        # 稳态 V_ss = x。σ(I_total) ≈ 0.42，v_threshold=0.3 → ~20% 输出发放率。
+        # v_threshold 根据 block 深度校准：
+        #   Block 0（~50% input）: v_threshold=0.3 → ~20% 输出
+        #   Deeper blocks（input firing rate 衰减）: 需要更低 v_threshold
         # init_tau=2.0（β=0.5）：快速响应，适合 K-bit 二进制编码。
         self.output_neuron = neuron.ParametricLIFNode(
             init_tau=2.0,
-            v_threshold=0.3,
+            v_threshold=output_v_threshold,
             v_reset=None,  # soft reset
             surrogate_function=surrogate_function,
             step_mode='s',

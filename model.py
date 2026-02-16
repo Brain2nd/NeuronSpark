@@ -1,29 +1,43 @@
 """
-SNNLanguageModel v2: Qwen3 预训练语义层 + SNN 隐状态空间
+SNNLanguageModel v7: SNN 隐状态空间语言模型（Parallel Scan 版本）
+
+v6 → v7 变更：
+  - K: 8 → 16 (16-bit 二进制编码精度)
+  - 移除 W^(V)（见文档第 7.2 节）
+  - 前向传播：parallel scan 并行处理全序列
+  - 编码/解码：批量处理所有 token
 
 架构：
-  token → Qwen3 Embedding (frozen, 1024-dim)
+  token → Embedding (trainable, D-dim)
   → encode_proj → sigmoid → K-bit 二进制编码 → K 帧 spike
-  → L 个 SNNBlock（SPSA 训练，每帧逐 Block 串行处理）
+  → L 个 SNNDecoderLayer（SNNBlock + SNNFFN，parallel scan）
   → K 帧 spike 二进制解码 → [0,1]^D
-  → decode_proj → RMSNorm (frozen) → Embedding^T (frozen) → logits
+  → decode_proj → RMSNorm (trainable) → Embedding^T (tied) → logits
 
-设计原则：
-  - 预训练层（Embedding + RMSNorm）提供成熟的语义空间，冻结不训练
-  - SNN blocks 在语义空间中学习序列建模（唯一 SPSA 训练的部分）
-  - LM Head 与 Embedding 共享权重（tie_word_embeddings）
+数学原理见 SNN_SELECTIVE_STATE_SPACE.md 第 7 节。
 """
+
+from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from spikingjelly.activation_based import functional
+from torch.utils.checkpoint import checkpoint
 
-from atomic_ops import SNNBlock
+from atomic_ops import SNNDecoderLayer
+
+
+@dataclass
+class SNNModelOutput:
+    """模型输出容器，对齐教程 CausalLMOutputWithPast 接口。"""
+    last_loss: Optional[torch.Tensor] = None
+    logits: Optional[torch.Tensor] = None
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm（与 Qwen3 兼容）。"""
+    """RMSNorm 归一化层。"""
 
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -38,24 +52,26 @@ class RMSNorm(nn.Module):
 
 class SNNLanguageModel(nn.Module):
     """
-    基于 Qwen3 预训练语义层 + SNN 隐状态空间的语言模型。
+    从零训练的 SNN 隐状态空间语言模型（v7: parallel scan）。
 
     Args:
-        vocab_size: 词表大小（Qwen3: 151936）
-        D: 可见维度（Qwen3 hidden_size: 1024）
+        vocab_size: 词表大小（默认 6144，自训练 BPE）
+        D: 可见维度
         N: 状态扩展因子
-        K: 每 token 的 SNN 时间步数
-        num_blocks: SNN Block 层数
+        K: 每 token 的 SNN 时间步数（v7 默认 16）
+        num_layers: SNN 解码层数
+        D_ff: FFN 中间层维度
         v_th_min: 动态阈值下限
     """
 
     def __init__(
         self,
-        vocab_size: int = 151936,
+        vocab_size: int = 6144,
         D: int = 1024,
         N: int = 8,
-        K: int = 8,
-        num_blocks: int = 10,
+        K: int = 16,
+        num_layers: int = 20,
+        D_ff: int = 3072,
         v_th_min: float = 0.1,
     ):
         super().__init__()
@@ -63,9 +79,10 @@ class SNNLanguageModel(nn.Module):
         self.D = D
         self.N = N
         self.K = K
-        self.num_blocks = num_blocks
+        self.num_layers = num_layers
+        self.D_ff = D_ff
 
-        # ====== 预训练冻结层 ======
+        # ====== Embedding + Norm（全部可训练）======
         self.embed_tokens = nn.Embedding(vocab_size, D)
         self.norm = RMSNorm(D)
 
@@ -73,16 +90,16 @@ class SNNLanguageModel(nn.Module):
         self.encode_proj = nn.Linear(D, D)
         self.decode_proj = nn.Linear(D, D)
 
-        # ====== SNN Blocks ======
-        # 输出阈值按深度递减：
-        #   Block 0: ~50% input, σ(I)≈0.42 → v_th=0.3 (~20% output)
-        #   Block 1: input firing rate 急剧衰减 → v_th=0.05
-        #   Block 2+: 信号稳定在 ~25-40% → v_th=0.05 维持传播
-        output_v_thresholds = [0.3] + [0.05] * (num_blocks - 1)
-        self.blocks = nn.ModuleList([
-            SNNBlock(D=D, N=N, v_th_min=v_th_min,
-                     output_v_threshold=output_v_thresholds[i])
-            for i in range(num_blocks)
+        # ====== SNN Decoder Layers ======
+        self.layers = nn.ModuleList([
+            SNNDecoderLayer(
+                D=D, N=N, D_ff=D_ff, v_th_min=v_th_min,
+                block_output_v_threshold=0.3 if i == 0 else 0.05,
+                ffn_output_v_threshold=0.5 if i == 0 else 0.15,
+                num_layers=num_layers,
+                layer_idx=i,
+            )
+            for i in range(num_layers)
         ])
 
         # ====== K-bit 二进制权重 ======
@@ -90,171 +107,146 @@ class SNNLanguageModel(nn.Module):
             'bit_weights',
             torch.tensor([2.0 ** (-(k + 1)) for k in range(K)]),
         )
-
-        self._init_trainable_weights()
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        pretrained_model_name: str = "Qwen/Qwen3-0.6B",
-        **kwargs,
-    ):
-        """从预训练模型加载 Embedding + RMSNorm 并冻结。
-
-        Args:
-            pretrained_model_name: HuggingFace 模型名称
-            **kwargs: 传递给 __init__ 的其他参数（N, K, num_blocks 等）
-        """
-        from transformers import AutoModelForCausalLM, AutoConfig
-
-        print(f"Loading pretrained weights from {pretrained_model_name}...")
-        config = AutoConfig.from_pretrained(pretrained_model_name)
-        pretrained = AutoModelForCausalLM.from_pretrained(
-            pretrained_model_name,
-            dtype=torch.float32,
+        # ====== K-bit 编码缩放因子（并行编码用） ======
+        self.register_buffer(
+            'bit_scales',
+            torch.tensor([2.0 ** (k + 1) for k in range(K)]),
         )
 
-        # 提取权重
-        embed_weight = pretrained.model.embed_tokens.weight.data.clone()
-        norm_weight = pretrained.model.norm.weight.data.clone()
-        vocab_size = config.vocab_size
-        D = config.hidden_size
+        self._init_weights()
 
-        # 释放预训练模型
-        del pretrained
-        torch.cuda.empty_cache()
-
-        print(f"  vocab_size={vocab_size}, D={D}")
-
-        # 构建模型
-        model = cls(vocab_size=vocab_size, D=D, **kwargs)
-
-        # 复制预训练权重
-        model.embed_tokens.weight.data.copy_(embed_weight)
-        model.norm.weight.data.copy_(norm_weight)
-
-        # 冻结预训练层
-        model.embed_tokens.weight.requires_grad = False
-        model.norm.weight.requires_grad = False
-
-        print("  Pretrained layers loaded and frozen.")
-        return model
-
-    def _init_trainable_weights(self):
-        """初始化可训练的编码/解码投影层。"""
+    def _init_weights(self):
+        """初始化所有可训练权重（从零训练）。"""
+        nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=0.02)
         nn.init.xavier_uniform_(self.encode_proj.weight)
         nn.init.zeros_(self.encode_proj.bias)
         nn.init.xavier_uniform_(self.decode_proj.weight)
         nn.init.zeros_(self.decode_proj.bias)
 
-    def _encode_token(self, x: torch.Tensor) -> list[torch.Tensor]:
+    def _encode_all_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
         """
-        将 embedding 编码为 K 帧二值 spike（MSB-first 二进制编码）。
+        将所有 token 编码为 spike 帧序列。
 
         Args:
-            x: token embedding, shape (batch, D)
+            token_ids: (batch, seq_len)
 
         Returns:
-            K 个 (batch, D) 的 {0,1} 张量列表
+            spike_seq: (seq_len * K, batch, D) — 全部 T×K 帧的 spike
         """
-        h = torch.sigmoid(self.encode_proj(x))  # (batch, D) → [0, 1]
+        batch, seq_len = token_ids.shape
 
-        frames = []
-        residual = h
-        for k in range(self.K):
-            bit = (residual >= 0.5).float()
-            frames.append(bit)
-            residual = (residual - bit * 0.5) * 2.0
-        return frames
+        # 1. Embedding: (batch, seq_len, D)
+        emb = self.embed_tokens(token_ids)
 
-    def _decode_spikes(self, spike_frames: list[torch.Tensor]) -> torch.Tensor:
+        # 2. 编码: (batch, seq_len, D) → (batch, seq_len, D)
+        h = torch.sigmoid(self.encode_proj(emb))
+
+        # 3. K-bit 并行二进制编码 → (batch, seq_len, K, D)
+        #    数学：h ∈ [0,1] 的二进制小数展开 bit_k = ⌊2^{k+1}·h⌋ mod 2
+        #    STE: forward = bit_hard (二值 {0,1}), backward = ∂/∂h = 1（恒等）
+        #    等价于逐位展开，但全部 K 位同时计算，无循环
+        scaled = h.unsqueeze(2) * self.bit_scales.view(1, 1, self.K, 1)  # (batch, seq_len, K, D)
+        bit_hard = torch.floor(scaled) % 2  # {0.0, 1.0}
+        h_k = h.unsqueeze(2)  # (batch, seq_len, 1, D), broadcasts to (batch, seq_len, K, D)
+        bits = h_k + (bit_hard - h_k).detach()  # STE: forward=bit_hard, backward=∂/∂h=1
+
+        # 4. (batch, seq_len, K, D) → (seq_len*K, batch, D)
+        spike_seq = bits.reshape(batch, seq_len * self.K, self.D)
+        spike_seq = spike_seq.permute(1, 0, 2)  # (seq_len*K, batch, D)
+
+        return spike_seq
+
+    def _decode_all_tokens(self, spike_seq: torch.Tensor, seq_len: int) -> torch.Tensor:
         """
-        将 K 帧 spike 解码为 [0,1] 实数。
+        将 spike 帧序列解码为所有 token 的实数表示。
 
         Args:
-            spike_frames: K 个 (batch, D) 的 {0,1} 张量列表
+            spike_seq: (seq_len * K, batch, D)
+            seq_len: token 序列长度
 
         Returns:
-            decoded: shape (batch, D), 值域 [0, 1]
+            decoded: (batch, seq_len, D)
         """
-        decoded = torch.zeros_like(spike_frames[0])
-        for k, frame in enumerate(spike_frames):
-            decoded = decoded + frame * self.bit_weights[k]
-        return decoded
+        batch = spike_seq.shape[1]
+
+        # (seq_len*K, batch, D) → (batch, seq_len, K, D)
+        spike_seq = spike_seq.permute(1, 0, 2)  # (batch, seq_len*K, D)
+        spike_seq = spike_seq.reshape(batch, seq_len, self.K, self.D)
+
+        # 二进制加权求和: sum(spike * 2^{-k})
+        decoded = torch.einsum('bskd,k->bsd', spike_seq, self.bit_weights)
+
+        return decoded  # (batch, seq_len, D)
 
     def forward(
         self,
         token_ids: torch.Tensor,
         target_ids: torch.Tensor = None,
-    ) -> torch.Tensor:
+    ) -> SNNModelOutput:
         """
-        自回归前向传播。
+        前向传播（v7: parallel scan 并行处理全序列）。
 
         Args:
             token_ids: (batch, seq_len) 的 token ID 序列
-            target_ids: (batch, seq_len) 的目标 ID。若提供，直接返回 scalar loss，
-                        避免在内存中同时存在 (batch, seq_len, vocab_size) 张量。
+            target_ids: (batch, seq_len) 的目标 ID
 
         Returns:
-            若 target_ids is None: logits (batch, seq_len, vocab_size)
-            若 target_ids 提供:    scalar loss（交叉熵均值）
+            SNNModelOutput:
+                若 target_ids 提供: .last_loss = mean cross-entropy loss
+                若 target_ids is None: .logits = (batch, seq_len, vocab_size)
         """
         batch, seq_len = token_ids.shape
 
-        # 重置所有 Block 内部的神经元状态
-        for block in self.blocks:
-            functional.reset_net(block)
+        # 重置所有 Layer 内部的神经元状态
+        for layer_module in self.layers:
+            functional.reset_net(layer_module)
 
-        # 逐 token loss 累积模式：避免 logits 全量驻留
+        # ====== 1. 编码全部 token ======
+        spike_seq = self._encode_all_tokens(token_ids)  # (seq_len*K, batch, D)
+
+        # ====== 2. 逐层并行处理（梯度检查点：按层重计算，省显存） ======
+        # 注意：checkpoint 反向时重跑 forward，必须先重置神经元状态回 0.0
+        def _layer_forward(layer_mod, x):
+            functional.reset_net(layer_mod)
+            return layer_mod.forward_parallel(x)
+
+        for layer_module in self.layers:
+            spike_seq = checkpoint(
+                _layer_forward, layer_module, spike_seq,
+                use_reentrant=False,
+            )
+
+        # ====== 3. 解码全部 token ======
+        decoded = self._decode_all_tokens(spike_seq, seq_len)  # (batch, seq_len, D)
+
+        # ====== 4. 投影 → RMSNorm → tied LM Head ======
+        h = self.decode_proj(decoded)  # (batch, seq_len, D)
+        h = self.norm(h)               # (batch, seq_len, D)
+        logits = F.linear(h, self.embed_tokens.weight)  # (batch, seq_len, vocab)
+
         if target_ids is not None:
-            total_loss = 0.0
-            for t in range(seq_len):
-                logits_t = self._forward_one_token(token_ids[:, t])
-                loss_t = F.cross_entropy(logits_t, target_ids[:, t])
-                total_loss = total_loss + loss_t
-                del logits_t, loss_t
-            return total_loss / seq_len
+            # 计算 loss
+            logits_flat = logits.reshape(-1, self.vocab_size)
+            targets_flat = target_ids.reshape(-1)
+            self.last_loss = F.cross_entropy(
+                logits_flat, targets_flat,
+                ignore_index=0, reduction='none',
+            )
+            return SNNModelOutput(last_loss=self.last_loss)
 
-        # 兼容模式：返回完整 logits（评估用）
-        all_logits = []
-        for t in range(seq_len):
-            logits_t = self._forward_one_token(token_ids[:, t])
-            all_logits.append(logits_t)
-        return torch.stack(all_logits, dim=1)
-
-    def _forward_one_token(self, token_emb_ids: torch.Tensor) -> torch.Tensor:
-        """处理单个 token 的完整流程，返回 logits_t (batch, vocab_size)。"""
-        # 1. 预训练 Embedding（frozen）
-        emb = self.embed_tokens(token_emb_ids)  # (batch, D)
-
-        # 2. 编码为 K 帧 spike
-        spike_frames_in = self._encode_token(emb)
-
-        # 3. SNN Blocks 处理 K 帧
-        spike_frames_out = []
-        for k in range(self.K):
-            spike = spike_frames_in[k]
-            for block in self.blocks:
-                spike = block(spike)
-            spike_frames_out.append(spike)
-
-        # 4. 二进制解码 → [0,1]^D
-        decoded = self._decode_spikes(spike_frames_out)
-
-        # 5. 投影 → RMSNorm → tied LM Head
-        h = self.decode_proj(decoded)       # (batch, D)
-        h = self.norm(h)                    # (batch, D)
-        logits_t = F.linear(h, self.embed_tokens.weight)  # (batch, vocab_size)
-        return logits_t
+        return SNNModelOutput(logits=logits)
 
     def get_param_groups(self) -> dict[str, list[nn.Parameter]]:
         """
-        按功能分组的可训练参数，供 IG-ZO 使用。
-        不包含冻结的预训练层。
+        按功能分组的可训练参数，供 SPSA 使用。
+        v7: 移除了 W_V 和 b_beta/b_alpha/b_th 中的 W^(V) 相关组。
         """
         groups = {
+            'embedding': [self.embed_tokens.weight],
+            'norm': [self.norm.weight],
             'encode': list(self.encode_proj.parameters()),
             'decode': list(self.decode_proj.parameters()),
+            # SNNBlock 参数（v7: 无 W_V）
             'W_in': [],
             'W_beta': [],
             'W_alpha': [],
@@ -262,14 +254,23 @@ class SNNLanguageModel(nn.Module):
             'W_gate': [],
             'W_skip': [],
             'W_out': [],
-            'W_V': [],
             'b_beta': [],
             'b_alpha': [],
             'b_th': [],
-            'output_neuron': [],
+            'block_output_neuron': [],
+            # SNNFFN 参数
+            'ffn_gate_proj': [],
+            'ffn_up_proj': [],
+            'ffn_down_proj': [],
+            'ffn_skip_proj': [],
+            'ffn_neurons': [],
         }
 
-        for block in self.blocks:
+        for layer_module in self.layers:
+            block = layer_module.snn_block
+            ffn = layer_module.snn_ffn
+
+            # SNNBlock 参数
             groups['W_in'].append(block.W_in.weight)
             groups['W_beta'].extend([block.W_beta_x.weight])
             groups['W_alpha'].extend([block.W_alpha_x.weight])
@@ -277,14 +278,21 @@ class SNNLanguageModel(nn.Module):
             groups['W_gate'].append(block.W_gate.weight)
             groups['W_skip'].append(block.W_skip.weight)
             groups['W_out'].append(block.W_out.weight)
-            groups['W_V'].extend([
-                block.W_beta_V.weight,
-                block.W_alpha_V.weight,
-                block.W_th_V.weight,
-            ])
+            # v7: W_V 已移除
             groups['b_beta'].append(block.b_beta)
             groups['b_alpha'].append(block.b_alpha)
             groups['b_th'].append(block.b_th)
-            groups['output_neuron'].append(block.output_neuron.w)
+            groups['block_output_neuron'].append(block.output_neuron.w)
+
+            # SNNFFN 参数
+            groups['ffn_gate_proj'].append(ffn.gate_proj.weight)
+            groups['ffn_up_proj'].append(ffn.up_proj.weight)
+            groups['ffn_down_proj'].append(ffn.down_proj.weight)
+            groups['ffn_skip_proj'].append(ffn.skip_proj.weight)
+            groups['ffn_neurons'].extend([
+                ffn.gate_neuron.w,
+                ffn.up_neuron.w,
+                ffn.output_neuron.w,
+            ])
 
         return groups

@@ -1,582 +1,404 @@
 """
-训练脚本 v3：SPSA 零阶优化 + 内存优化
+训练脚本 v7.1：SNN 语言模型预训练（Surrogate Gradient + 反向传播）
 
-数据加载模式（自动选择）：
-- 有 binary token 文件 → mmap 随机访问（零内存开销）
-- 无 binary 文件 → 直接流式读 JSONL + 实时 tokenize
+严格对齐 happy-llm 教程（/home/dgxspark/Desktop/happy-llm/docs/chapter5/code/ddp_pretrain.py），
+训练基础设施照搬教程，只有模型架构是 SNN 创新。
 
-其他特性：
-- SPSA 零阶优化（forward 直接返回 loss，无 logits 累积）
-- 完整 checkpoint 断续训练（仅存可训练参数 + 优化器状态）
-- Cosine 学习率衰减 + 梯度裁剪
-- 内存监控：每 N 步打印 CUDA 内存使用
+数据加载（对齐教程）：
+- PretrainDataset: byte-offset 随机访问 JSONL，bos_token 前缀，固定 max_length
+- loss_mask: 忽略 padding 位置的 loss
+- Loss 计算: out.last_loss * loss_mask（与教程完全一致）
+
+训练算法（v7.1: 反向传播，替代 v5 的 SPSA 零阶优化）：
+- Adam 优化器（对齐教程）
+- Warmup + Cosine LR 调度（对齐教程 get_lr()）
+- GradScaler + autocast 混合精度（对齐教程）
+- 梯度累积 accumulation_steps（对齐教程）
+- 梯度裁剪 clip_grad_norm_（对齐教程）
 
 用法：
     conda activate SNN
 
-    # 直接从 JSONL 训练（无需预处理）
-    python train.py --data_dir data/SkyPile-150B --max_steps 100000
-
-    # 或预处理后用 binary 文件训练
-    python prepare_data.py --data_dir data/SkyPile-150B --output_dir data/processed
-    python train.py --data_dir data/processed --max_steps 100000
+    python train.py \
+        --data_path data/seq-monkey/seq_monkey_datawhale.jsonl \
+        --batch_size 8 --accumulation_steps 8
 
     # 断续训练
     python train.py --resume checkpoints/latest.pt
 """
 
 import os
-import json
-import glob
 import time
 import math
 import argparse
+import warnings
 
-import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, IterableDataset
+from torch import optim
+from torch.utils.data import DataLoader
+from contextlib import nullcontext
+
+from transformers import AutoTokenizer
 
 from model import SNNLanguageModel
+from dataset import PretrainDataset
+
+# 忽略警告信息
+warnings.filterwarnings('ignore')
+
+
+def Logger(content):
+    """简单的日志记录函数"""
+    print(content)
 
 
 # ============================================================
-# 数据集
+# 学习率调度（照搬教程 get_lr）
 # ============================================================
 
-class TokenMmapDataset(Dataset):
+def get_lr(it, all):
     """
-    基于 numpy memmap 的 token 数据集。
+    计算当前迭代的学习率，使用余弦退火调度策略（对齐教程）。
 
-    从 flat binary 文件（uint32）中随机采样连续片段。
-    内存开销 ≈ 0（OS page cache 按需加载）。
+    学习率调度策略：
+    1. Warmup 阶段：学习率从 0 线性增长到目标学习率
+    2. 余弦退火阶段：学习率按余弦函数衰减到最小学习率
+    3. 超出训练步数后：保持最小学习率
+
+    Args:
+        it: 当前迭代步数
+        all: 总迭代步数
     """
+    warmup_iters = args.warmup_iters
+    lr_decay_iters = all
+    min_lr = args.learning_rate / 10  # 最小学习率 = 初始学习率的 1/10
 
-    def __init__(self, bin_path: str, seq_len: int):
-        self.seq_len = seq_len
-        self.data = np.memmap(bin_path, dtype=np.uint32, mode='r')
-        self.n_tokens = len(self.data)
-        # 每个样本需要 seq_len+1 个连续 token（input + target）
-        self.n_samples = self.n_tokens - seq_len
+    # Warmup 阶段：线性增长
+    if it < warmup_iters:
+        return args.learning_rate * it / warmup_iters
 
-    def __len__(self):
-        return self.n_samples
+    # 超出训练步数：保持最小学习率
+    if it > lr_decay_iters:
+        return min_lr
 
-    def __getitem__(self, idx):
-        chunk = self.data[idx: idx + self.seq_len + 1]
-        # np.uint32 → torch.long 需要 int64 中转，避免负数
-        chunk = torch.from_numpy(chunk.astype(np.int64))
-        return chunk[:-1], chunk[1:]
-
-
-class TokenSequenceDataset(Dataset):
-    """固定长度的 token 序列数据集（用于验证集，小数据量）。"""
-
-    def __init__(self, bin_path: str, seq_len: int):
-        self.seq_len = seq_len
-        self.data = np.memmap(bin_path, dtype=np.uint32, mode='r')
-        self.n_tokens = len(self.data)
-
-    def __len__(self):
-        return (self.n_tokens - 1) // self.seq_len
-
-    def __getitem__(self, idx):
-        start = idx * self.seq_len
-        end = start + self.seq_len + 1
-        chunk = self.data[start:end]
-        chunk = torch.from_numpy(chunk.astype(np.int64))
-        return chunk[:-1], chunk[1:]
-
-
-class StreamingJsonlDataset(IterableDataset):
-    """
-    直接从本地 JSONL 文件流式 tokenize 的数据集。
-    无需预处理，逐文件逐行读取，内存开销仅为 token_buffer。
-    """
-
-    def __init__(self, jsonl_dir: str, tokenizer, seq_len: int):
-        self.jsonl_dir = jsonl_dir
-        self.tokenizer = tokenizer
-        self.seq_len = seq_len
-        # 收集所有 JSONL 文件
-        self.files = sorted(glob.glob(os.path.join(jsonl_dir, '**/*.jsonl'), recursive=True))
-        if not self.files:
-            raise FileNotFoundError(f"No .jsonl files found in {jsonl_dir}")
-
-    def __iter__(self):
-        token_buffer = []
-        for fpath in self.files:
-            with open(fpath, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        text = json.loads(line).get('text', '')
-                    except json.JSONDecodeError:
-                        continue
-                    if not text.strip():
-                        continue
-                    tokens = self.tokenizer.encode(text, add_special_tokens=False)
-                    token_buffer.extend(tokens)
-
-                    while len(token_buffer) >= self.seq_len + 1:
-                        chunk = token_buffer[:self.seq_len + 1]
-                        token_buffer = token_buffer[self.seq_len:]
-                        x = torch.tensor(chunk[:-1], dtype=torch.long)
-                        y = torch.tensor(chunk[1:], dtype=torch.long)
-                        yield x, y
-
-
-def prepare_data(args):
-    """自动选择数据加载模式：binary mmap 或 JSONL streaming。"""
-    train_bin = os.path.join(args.data_dir, 'train_tokens.bin')
-    val_bin = os.path.join(args.data_dir, 'val_tokens.bin')
-
-    # 模式 1：预处理过的 binary 文件 → mmap 随机访问
-    if os.path.exists(train_bin):
-        print(f"  [mmap mode] Found {train_bin}")
-        train_ds = TokenMmapDataset(train_bin, args.seq_len)
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=args.batch_size,
-            shuffle=True,
-            drop_last=True,
-            num_workers=2,
-            pin_memory=True,
-        )
-        val_loader = None
-        if os.path.exists(val_bin):
-            val_ds = TokenSequenceDataset(val_bin, args.seq_len)
-            val_loader = DataLoader(
-                val_ds,
-                batch_size=args.batch_size,
-                shuffle=False,
-                drop_last=True,
-                num_workers=2,
-                pin_memory=True,
-            )
-            print(f"  Train: {train_ds.n_tokens:,} tokens ({len(train_ds):,} samples)")
-            print(f"  Val:   {val_ds.n_tokens:,} tokens ({len(val_ds):,} samples)")
-        else:
-            print(f"  Train: {train_ds.n_tokens:,} tokens ({len(train_ds):,} samples)")
-            print(f"  Val:   [not found, skipping]")
-        return train_loader, val_loader
-
-    # 模式 2：JSONL 目录 → 流式 tokenize
-    # 查找 JSONL 文件（可能在 data/ 子目录下）
-    jsonl_dir = args.data_dir
-    jsonl_files = glob.glob(os.path.join(jsonl_dir, '**/*.jsonl'), recursive=True)
-    if not jsonl_files:
-        raise FileNotFoundError(
-            f"找不到 binary 文件或 JSONL 文件。\n"
-            f"  检查的目录: {args.data_dir}\n"
-            f"  期望: train_tokens.bin 或 *.jsonl 文件"
-        )
-
-    print(f"  [streaming mode] Found {len(jsonl_files)} JSONL files in {jsonl_dir}")
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
-    train_ds = StreamingJsonlDataset(jsonl_dir, tokenizer, args.seq_len)
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        drop_last=True,
-        num_workers=0,  # streaming 不支持多 worker
-    )
-    print(f"  Tokenizer: {args.pretrained_model} (vocab={tokenizer.vocab_size})")
-    print(f"  Val: [streaming mode 暂不支持 val split]")
-    return train_loader, None
+    # 余弦退火阶段
+    decay_ratio = (it - warmup_iters) / (lr_decay_iters - warmup_iters)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (args.learning_rate - min_lr)
 
 
 # ============================================================
-# SPSA 零阶优化器
+# Checkpoint
 # ============================================================
 
-class SPSAOptimizer:
-    """
-    SPSA (Simultaneous Perturbation Stochastic Approximation) 零阶优化器。
-
-    稳定性机制：
-    - 梯度裁剪：限制单步更新幅度
-    - Cosine 学习率衰减
-    - 扰动幅度衰减
-    """
-
-    def __init__(
-        self,
-        params: list[nn.Parameter],
-        lr: float = 5e-4,
-        perturbation_scale: float = 1e-3,
-        total_steps: int = 100000,
-        lr_min_ratio: float = 0.1,
-        grad_clip: float = 0.5,
-    ):
-        self.params = [p for p in params if p.requires_grad]
-        self.lr_init = lr
-        self.lr = lr
-        self.c_init = perturbation_scale
-        self.c = perturbation_scale
-        self.total_steps = total_steps
-        self.lr_min_ratio = lr_min_ratio
-        self.grad_clip = grad_clip
-        self.current_step = 0
-
-    def _update_schedule(self):
-        """Cosine 衰减学习率和扰动幅度。"""
-        progress = min(self.current_step / max(self.total_steps, 1), 1.0)
-        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-        self.lr = self.lr_init * (self.lr_min_ratio + (1 - self.lr_min_ratio) * cosine_decay)
-        self.c = self.c_init * (0.5 + 0.5 * cosine_decay)
-
-    def generate_perturbation(self) -> list[torch.Tensor]:
-        """生成 Rademacher 随机扰动（±1）。"""
-        deltas = []
-        for p in self.params:
-            delta = torch.randint(0, 2, p.shape, device=p.device, dtype=p.dtype) * 2 - 1
-            deltas.append(delta)
-        return deltas
-
-    def perturb(self, deltas: list[torch.Tensor], sign: float = 1.0):
-        """对参数施加扰动：θ ± c·δ。"""
-        with torch.no_grad():
-            for p, d in zip(self.params, deltas):
-                p.add_(d, alpha=sign * self.c)
-
-    def step(self, loss_plus: float, loss_minus: float, deltas: list[torch.Tensor]):
-        """SPSA 梯度估计 + 参数更新。"""
-        self._update_schedule()
-        grad_scale = (loss_plus - loss_minus) / (2.0 * self.c)
-        grad_scale = max(min(grad_scale, self.grad_clip), -self.grad_clip)
-        with torch.no_grad():
-            for p, d in zip(self.params, deltas):
-                p.add_(d, alpha=-self.lr * grad_scale)
-        self.current_step += 1
-
-    def state_dict(self):
-        return {
-            'current_step': self.current_step,
-            'lr_init': self.lr_init,
-            'c_init': self.c_init,
-            'total_steps': self.total_steps,
-            'lr_min_ratio': self.lr_min_ratio,
-            'grad_clip': self.grad_clip,
-        }
-
-    def load_state_dict(self, state):
-        self.current_step = state['current_step']
-        self.lr_init = state['lr_init']
-        self.c_init = state['c_init']
-        self.total_steps = state['total_steps']
-        self.lr_min_ratio = state['lr_min_ratio']
-        self.grad_clip = state['grad_clip']
-        self._update_schedule()
-
-
-# ============================================================
-# Checkpoint（仅存可训练参数）
-# ============================================================
-
-def _trainable_state_dict(model):
-    """只提取 requires_grad=True 的参数，节省 checkpoint 空间。"""
-    return {
-        name: param.data
-        for name, param in model.named_parameters()
-        if param.requires_grad
-    }
-
-
-def save_checkpoint(path, model, optimizer, step, best_val_ppl, tokens_seen):
-    """保存训练状态（仅可训练参数）。"""
+def save_checkpoint(path, model, optimizer, scaler, step, epoch, best_loss, tokens_seen):
+    """保存训练状态（扩展教程，额外保存 optimizer/scaler 以支持断续训练）。"""
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    state_dict = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
     torch.save({
-        'trainable_state_dict': _trainable_state_dict(model),
+        'model_state_dict': state_dict,
         'optimizer_state': optimizer.state_dict(),
+        'scaler_state': scaler.state_dict(),
         'step': step,
-        'best_val_ppl': best_val_ppl,
+        'epoch': epoch,
+        'best_loss': best_loss,
         'tokens_seen': tokens_seen,
+        'model_config': {
+            'vocab_size': model.vocab_size if not isinstance(model, torch.nn.DataParallel) else model.module.vocab_size,
+            'D': model.D if not isinstance(model, torch.nn.DataParallel) else model.module.D,
+            'N': model.N if not isinstance(model, torch.nn.DataParallel) else model.module.N,
+            'K': model.K if not isinstance(model, torch.nn.DataParallel) else model.module.K,
+            'num_layers': model.num_layers if not isinstance(model, torch.nn.DataParallel) else model.module.num_layers,
+            'D_ff': model.D_ff if not isinstance(model, torch.nn.DataParallel) else model.module.D_ff,
+        },
     }, path)
-    print(f"  → Checkpoint saved: {path} (step {step}, PPL {best_val_ppl:.1f})")
+    Logger(f"  → Checkpoint saved: {path} (step {step})")
 
 
-def load_checkpoint(path, model, optimizer, device):
+def load_checkpoint(path, model, optimizer, scaler, device):
     """加载 checkpoint，恢复训练状态。"""
-    print(f"Loading checkpoint from {path}...")
+    Logger(f"Loading checkpoint from {path}...")
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
-    # 支持新格式（trainable_state_dict）和旧格式（model_state_dict）
-    if 'trainable_state_dict' in ckpt:
-        missing, unexpected = model.load_state_dict(ckpt['trainable_state_dict'], strict=False)
-        print(f"  Loaded trainable params ({len(ckpt['trainable_state_dict'])} keys)")
-    else:
+    if 'model_state_dict' in ckpt:
         model.load_state_dict(ckpt['model_state_dict'])
-        print(f"  Loaded full model state (legacy format)")
+    elif 'trainable_state_dict' in ckpt:
+        model.load_state_dict(ckpt['trainable_state_dict'], strict=False)
 
-    optimizer.load_state_dict(ckpt['optimizer_state'])
-    step = ckpt['step']
-    best_val_ppl = ckpt['best_val_ppl']
+    if 'optimizer_state' in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt['optimizer_state'])
+        except (ValueError, KeyError):
+            Logger("  Warning: Optimizer state incompatible (SPSA checkpoint?), starting fresh.")
+
+    if 'scaler_state' in ckpt:
+        scaler.load_state_dict(ckpt['scaler_state'])
+
+    step = ckpt.get('step', 0)
+    epoch = ckpt.get('epoch', 0)
+    best_loss = ckpt.get('best_loss', float('inf'))
     tokens_seen = ckpt.get('tokens_seen', 0)
-    print(f"  Resumed: step={step}, best_val_ppl={best_val_ppl:.1f}, tokens={tokens_seen:,}")
-    return step, best_val_ppl, tokens_seen
+    Logger(f"  Resumed: step={step}, epoch={epoch}, tokens={tokens_seen:,}")
+    return step, epoch, best_loss, tokens_seen
 
 
 # ============================================================
-# 评估
+# 初始化
 # ============================================================
 
-@torch.no_grad()
-def evaluate(model, dataloader, device):
-    """计算验证集 perplexity。"""
-    model.eval()
-    total_loss = 0.0
-    total_tokens = 0
-    criterion = nn.CrossEntropyLoss(reduction='sum')
+def init_model(args):
+    """
+    初始化模型和分词器（对齐教程 init_model）。
 
-    for input_ids, target_ids in dataloader:
-        input_ids = input_ids.to(device)
-        target_ids = target_ids.to(device)
+    Returns:
+        tuple: (model, tokenizer)
+    """
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-        logits = model(input_ids)
-        loss = criterion(logits.view(-1, logits.size(-1)), target_ids.view(-1))
-        total_loss += loss.item()
-        total_tokens += target_ids.numel()
-        del logits, loss
+    # 从本地路径加载自训练 tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
 
-    avg_loss = total_loss / max(total_tokens, 1)
-    ppl = math.exp(min(avg_loss, 100))
-    return avg_loss, ppl
-
-
-# ============================================================
-# 训练循环
-# ============================================================
-
-def train(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-
-    # 准备数据
-    print(f"Loading data from {args.data_dir}...")
-    train_loader, val_loader = prepare_data(args)
-
-    # 固定 vocab_size（Qwen3-0.6B）
-    vocab_size = 151936
-
-    # 构建模型
-    if args.resume:
-        model = SNNLanguageModel(
-            vocab_size=vocab_size,
-            D=1024,
-            N=args.N,
-            K=args.K,
-            num_blocks=args.num_blocks,
-            v_th_min=args.v_th_min,
-        ).to(device)
-    else:
-        model = SNNLanguageModel.from_pretrained(
-            args.pretrained_model,
-            N=args.N,
-            K=args.K,
-            num_blocks=args.num_blocks,
-            v_th_min=args.v_th_min,
-        ).to(device)
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    frozen_params = total_params - trainable_params
-    print(f"\nModel: D=1024, N={args.N}, K={args.K}, Blocks={args.num_blocks}")
-    print(f"Total params:     {total_params:,}")
-    print(f"Trainable params: {trainable_params:,}")
-    print(f"Frozen params:    {frozen_params:,}")
-
-    # 优化器
-    optimizer = SPSAOptimizer(
-        params=list(model.parameters()),
-        lr=args.lr,
-        perturbation_scale=args.perturbation_scale,
-        total_steps=args.max_steps,
-        lr_min_ratio=0.1,
-        grad_clip=args.grad_clip,
+    # 创建 SNN 语言模型
+    model = SNNLanguageModel(
+        vocab_size=args.vocab_size,
+        D=args.D,
+        N=args.N,
+        K=args.K,
+        num_layers=args.num_layers,
+        D_ff=args.D_ff,
+        v_th_min=args.v_th_min,
     )
 
-    # 恢复 checkpoint
-    start_step = 0
-    best_val_ppl = float('inf')
-    tokens_seen = 0
+    # 将模型移动到指定设备
+    model = model.to(args.device)
 
-    if args.resume:
-        start_step, best_val_ppl, tokens_seen = load_checkpoint(
-            args.resume, model, optimizer, device,
-        )
+    Logger(f'SNN LM 总参数量：{count_parameters(model) / 1e6:.3f} 百万')
+    return model, tokenizer
 
-    # 冻结预训练层
-    model.embed_tokens.weight.requires_grad = False
-    model.norm.weight.requires_grad = False
 
-    # 内存基线
-    if device.type == 'cuda':
-        torch.cuda.reset_peak_memory_stats()
-        mem_baseline = torch.cuda.memory_allocated() / 1e9
-        print(f"CUDA memory baseline: {mem_baseline:.2f} GB")
+# ============================================================
+# 训练循环（对齐教程 train_epoch）
+# ============================================================
 
-    # 训练信息
-    print(f"\n{'='*60}")
-    print(f"Training with SPSA (IG-ZO base)")
-    print(f"  Max steps:   {args.max_steps:,}")
-    print(f"  Batch size:  {args.batch_size}")
-    print(f"  Seq len:     {args.seq_len}")
-    print(f"  LR:          {args.lr} (cosine → {args.lr * 0.1})")
-    print(f"  Perturb:     {args.perturbation_scale}")
-    print(f"  Grad clip:   {args.grad_clip}")
-    print(f"  Eval every:  {args.eval_interval} steps")
-    print(f"  Save every:  {args.save_interval} steps")
-    if start_step > 0:
-        print(f"  Resuming from step {start_step}")
-    print(f"{'='*60}\n")
+def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen):
+    """
+    训练一个 epoch（对齐教程训练循环，使用标准反向传播）。
 
-    # 训练循环
-    model.train()
-    running_loss = 0.0
-    running_tokens = 0
-    t_start = time.time()
-    step = start_step
+    对齐教程 ddp_pretrain.py L86-168 的完整训练循环：
+    1. 动态学习率（get_lr warmup + cosine）
+    2. 前向传播（autocast 混合精度）
+    3. 反向传播（scaler.scale(loss).backward()）
+    4. 梯度累积（每 accumulation_steps 步更新一次）
+    5. 梯度裁剪（clip_grad_norm_）
+    6. 日志记录（额外加 PPL、TPS、显存）
+    """
+    start_time = time.time()
 
-    for input_ids, target_ids in train_loader:
-        if step >= args.max_steps:
-            break
+    for step, (X, Y, loss_mask) in enumerate(train_loader):
+        # 将数据转移到指定设备（对齐教程 L88-90）
+        X = X.to(args.device)
+        Y = Y.to(args.device)
+        loss_mask = loss_mask.to(args.device)
 
-        input_ids = input_ids.to(device)
-        target_ids = target_ids.to(device)
+        # 计算当前步骤的学习率（对齐教程 L93-96）
+        lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
 
-        # 1. 生成扰动
-        deltas = optimizer.generate_perturbation()
+        # 前向传播 + 损失计算（对齐教程 L99-107）
+        with ctx:
+            out = model(X, Y)
+            loss = out.last_loss / args.accumulation_steps
+            loss_mask_flat = loss_mask.view(-1)
+            loss = torch.sum(loss * loss_mask_flat) / loss_mask_flat.sum()
 
-        # 2. θ + c·δ → L+
-        optimizer.perturb(deltas, sign=+1.0)
-        with torch.no_grad():
-            loss_plus = model(input_ids, target_ids).item()
+        # 反向传播（对齐教程 L110）
+        scaler.scale(loss).backward()
 
-        # 3. θ - 2c·δ → L-
-        optimizer.perturb(deltas, sign=-2.0)
-        with torch.no_grad():
-            loss_minus = model(input_ids, target_ids).item()
+        # 梯度累积：每 accumulation_steps 步更新一次（对齐教程 L113-125）
+        if (step + 1) % args.accumulation_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
 
-        # 4. 恢复到 θ
-        optimizer.perturb(deltas, sign=+1.0)
-
-        # 5. SPSA 更新
-        optimizer.step(loss_plus, loss_minus, deltas)
-
-        # 6. 清理：释放扰动张量 + CUDA 缓存
-        del deltas
-        if step % 10 == 0 and device.type == 'cuda':
+        # 清理
+        if step % 10 == 0 and args.device != 'cpu':
             torch.cuda.empty_cache()
 
-        # 记录
-        batch_loss = (loss_plus + loss_minus) / 2.0
-        batch_tokens = target_ids.numel()
-        running_loss += batch_loss * batch_tokens
-        running_tokens += batch_tokens
-        tokens_seen += batch_tokens
-        step += 1
+        # 有效 token 数
+        valid_tokens = int(loss_mask_flat.sum().item())
+        tokens_seen += valid_tokens
 
-        # 日志
+        # 日志（对齐教程 L128-146，额外加 PPL、TPS、显存监控）
         if step % args.log_interval == 0:
-            avg = running_loss / running_tokens
-            ppl = math.exp(min(avg, 100))
-            elapsed = time.time() - t_start
-            tps = tokens_seen / elapsed if elapsed > 0 else 0
+            batch_loss = loss.item() * args.accumulation_steps  # 恢复真实 loss
+            batch_ppl = math.exp(min(batch_loss, 20.0))
+            spend_time = time.time() - start_time
+            tps = tokens_seen / spend_time if spend_time > 0 else 0
             mem_str = ""
-            if device.type == 'cuda':
+            if args.device != 'cpu':
                 mem_cur = torch.cuda.memory_allocated() / 1e9
                 mem_peak = torch.cuda.max_memory_allocated() / 1e9
                 mem_str = f" | Mem {mem_cur:.1f}/{mem_peak:.1f}GB"
-            print(
-                f"  Step {step}/{args.max_steps} | "
-                f"Loss {avg:.4f} | PPL {ppl:.1f} | "
-                f"LR {optimizer.lr:.2e} | "
-                f"Tokens {tokens_seen:,} | "
-                f"TPS {tps:.0f}{mem_str}"
-            )
+            Logger(
+                'Epoch:[{}/{}]({}/{}) loss:{:.3f} ppl:{:.1f} lr:{:.7f} TPS:{:.0f} epoch_Time:{}min{}'.format(
+                    epoch + 1,
+                    args.epochs,
+                    step,
+                    iter_per_epoch,
+                    batch_loss,
+                    batch_ppl,
+                    lr,
+                    tps,
+                    spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
+                    mem_str))
 
-        # 评估
-        if val_loader is not None and step % args.eval_interval == 0:
-            val_loss, val_ppl = evaluate(model, val_loader, device)
-            elapsed = time.time() - t_start
-            print(
-                f"  [Eval] Step {step} | "
-                f"Val Loss {val_loss:.4f} | Val PPL {val_ppl:.1f} | "
-                f"Time {elapsed:.0f}s"
-            )
-
-            if val_ppl < best_val_ppl:
-                best_val_ppl = val_ppl
-                save_checkpoint(
-                    os.path.join(args.save_dir, 'best_model.pt'),
-                    model, optimizer, step, best_val_ppl, tokens_seen,
-                )
-
+        # 定期保存（对齐教程 L149-157）
+        if (step + 1) % args.save_interval == 0:
+            model.eval()
+            ckp = f'{args.save_dir}/pretrain_{args.D}_{args.num_layers}_{args.vocab_size}.pth'
+            save_checkpoint(ckp, model, optimizer, scaler,
+                            epoch * iter_per_epoch + step + 1, epoch, batch_loss, tokens_seen)
             model.train()
-            running_loss = 0.0
-            running_tokens = 0
 
-        # 定期保存
-        if step % args.save_interval == 0:
-            save_checkpoint(
-                os.path.join(args.save_dir, 'latest.pt'),
-                model, optimizer, step, best_val_ppl, tokens_seen,
-            )
+        # 每 20000 步保存带步数标记的检查点（对齐教程 L160-168）
+        if (step + 1) % 20000 == 0:
+            model.eval()
+            ckp = f'{args.save_dir}/pretrain_{args.D}_{args.num_layers}_{args.vocab_size}_step{step+1}.pth'
+            save_checkpoint(ckp, model, optimizer, scaler,
+                            epoch * iter_per_epoch + step + 1, epoch, batch_loss, tokens_seen)
+            model.train()
 
-    # 训练结束
-    print(f"\nTraining finished at step {step}.")
-    print(f"Best Val PPL: {best_val_ppl:.1f}")
-    print(f"Total tokens seen: {tokens_seen:,}")
-    if device.type == 'cuda':
-        print(f"Peak CUDA memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
-
-    save_checkpoint(
-        os.path.join(args.save_dir, 'final.pt'),
-        model, optimizer, step, best_val_ppl, tokens_seen,
-    )
+    return tokens_seen
 
 
 # ============================================================
 # 入口
 # ============================================================
 
-def main():
-    parser = argparse.ArgumentParser(description='SNN Language Model Training v3')
+if __name__ == "__main__":
+    # ==================== 命令行参数解析 ====================
+    parser = argparse.ArgumentParser(description="SNN Language Model Pretraining v7.1 (Backprop)")
 
-    # 模型参数
-    parser.add_argument('--pretrained_model', type=str, default='Qwen/Qwen3-0.6B',
-                        help='预训练模型名称')
+    # SNN 模型参数（创新部分）
+    parser.add_argument('--vocab_size', type=int, default=6144, help='词表大小')
+    parser.add_argument('--D', type=int, default=1024, help='隐层维度')
     parser.add_argument('--N', type=int, default=8, help='状态扩展因子')
-    parser.add_argument('--K', type=int, default=8, help='每 token SNN 时间步数')
-    parser.add_argument('--num_blocks', type=int, default=10, help='SNN Block 层数')
+    parser.add_argument('--K', type=int, default=16, help='每 token SNN 时间步数')
+    parser.add_argument('--num_layers', type=int, default=20, help='SNN 解码层数')
+    parser.add_argument('--D_ff', type=int, default=3072, help='FFN 中间层维度')
     parser.add_argument('--v_th_min', type=float, default=0.1, help='阈值下限')
 
-    # 训练参数
-    parser.add_argument('--max_steps', type=int, default=100000, help='最大训练步数')
-    parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--seq_len', type=int, default=128, help='序列长度')
-    parser.add_argument('--lr', type=float, default=5e-4, help='SPSA 学习率')
-    parser.add_argument('--perturbation_scale', type=float, default=1e-3)
-    parser.add_argument('--grad_clip', type=float, default=0.5)
-    parser.add_argument('--log_interval', type=int, default=100, help='日志间隔（步）')
-    parser.add_argument('--eval_interval', type=int, default=1000, help='评估间隔（步）')
-    parser.add_argument('--save_interval', type=int, default=5000, help='保存间隔（步）')
+    # 基础训练参数（对齐教程）
+    parser.add_argument("--out_dir", type=str, default="checkpoints", help="模型输出目录")
+    parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
+    parser.add_argument("--batch_size", type=int, default=8, help="批次大小（反向传播需更多显存，默认 8）")
+    parser.add_argument("--device", type=str,
+                        default="cuda:0" if torch.cuda.is_available() else "cpu",
+                        help="训练设备")
+    parser.add_argument("--dtype", type=str, default="bfloat16", help="数据类型（对齐教程）")
+    parser.add_argument("--num_workers", type=int, default=8, help="数据加载的工作进程数")
+    parser.add_argument("--max_length", type=int, default=512, help="最大序列长度")
 
-    # 数据
-    parser.add_argument('--data_dir', type=str, default='data/processed',
-                        help='预处理后的 binary token 文件目录')
+    # 训练优化参数（对齐教程）
+    parser.add_argument('--learning_rate', type=float, default=2e-4, help='学习率（对齐教程）')
+    parser.add_argument('--accumulation_steps', type=int, default=8, help='梯度累积步数（对齐教程）')
+    parser.add_argument('--grad_clip', type=float, default=1.0, help='梯度裁剪阈值（对齐教程）')
+    parser.add_argument('--warmup_iters', type=int, default=0, help='学习率预热迭代次数（对齐教程）')
+
+    # 日志和保存参数（对齐教程）
+    parser.add_argument("--log_interval", type=int, default=100, help="日志记录间隔")
+    parser.add_argument("--save_interval", type=int, default=1000, help="模型保存间隔")
+
+    # 数据（对齐教程）
+    parser.add_argument("--data_path", type=str,
+                        default="data/seq-monkey/seq_monkey_datawhale.jsonl",
+                        help="预处理后的 JSONL 数据路径")
+    parser.add_argument("--tokenizer_path", type=str, default="./tokenizer_snn/",
+                        help="自训练 tokenizer 路径")
 
     # Checkpoint
-    parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--resume', type=str, default=None, help='从 checkpoint 恢复')
 
     args = parser.parse_args()
-    train(args)
 
+    # ==================== 训练环境设置 ====================
+    args.save_dir = os.path.join(args.out_dir)
+    os.makedirs(args.out_dir, exist_ok=True)
 
-if __name__ == '__main__':
-    main()
+    # 设置随机种子
+    torch.manual_seed(42)
+
+    # 混合精度上下文（对齐教程 L286-290）
+    device_type = "cuda" if "cuda" in args.device else "cpu"
+    ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast('cuda', dtype=torch.bfloat16 if args.dtype == 'bfloat16' else torch.float16)
+
+    # ==================== 模型和数据初始化 ====================
+    model, tokenizer = init_model(args)
+
+    # 创建训练数据集（对齐教程 PretrainDataset）
+    train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_length)
+
+    # 创建数据加载器（对齐教程 L300-307）
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        pin_memory=True,
+        drop_last=False,
+        shuffle=True,
+        num_workers=args.num_workers,
+    )
+
+    # ==================== 优化器和训练组件初始化 ====================
+    # GradScaler（对齐教程 L312）
+    scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype in ['float16', 'bfloat16']))
+
+    # Adam 优化器（对齐教程 L315）
+    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+
+    # 恢复 checkpoint
+    tokens_seen = 0
+    start_epoch = 0
+    if args.resume:
+        start_step, start_epoch, best_loss, tokens_seen = load_checkpoint(
+            args.resume, model, optimizer, scaler, args.device,
+        )
+
+    # ==================== 训练信息 ====================
+    iter_per_epoch = len(train_loader)
+
+    Logger(f"\n{'='*60}")
+    Logger(f"SNN Language Model Pretraining v7.1 (Backprop + Surrogate Gradient)")
+    Logger(f"  Vocab:       {args.vocab_size}")
+    Logger(f"  Model:       D={args.D}, N={args.N}, K={args.K}, Layers={args.num_layers}, D_ff={args.D_ff}")
+    Logger(f"  Data:        {args.data_path}")
+    Logger(f"  Samples:     {len(train_ds):,}")
+    Logger(f"  Max length:  {args.max_length}")
+    Logger(f"  Batch size:  {args.batch_size} × accum {args.accumulation_steps} = {args.batch_size * args.accumulation_steps} effective")
+    Logger(f"  Epochs:      {args.epochs}")
+    Logger(f"  Steps/epoch: {iter_per_epoch:,}")
+    Logger(f"  LR:          {args.learning_rate} (warmup {args.warmup_iters} → cosine → {args.learning_rate/10})")
+    Logger(f"  Grad clip:   {args.grad_clip}")
+    Logger(f"  Precision:   {args.dtype}")
+    Logger(f"  Save every:  {args.save_interval} steps")
+    if args.device != 'cpu':
+        mem_baseline = torch.cuda.memory_allocated() / 1e9
+        Logger(f"  CUDA memory: {mem_baseline:.2f} GB baseline")
+    Logger(f"{'='*60}\n")
+
+    # ==================== 开始训练 ====================
+    for epoch in range(start_epoch, args.epochs):
+        tokens_seen = train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen)
+
+    # 训练结束，保存最终 checkpoint
+    Logger(f"\nTraining finished. Total tokens seen: {tokens_seen:,}")
+    if args.device != 'cpu':
+        Logger(f"Peak CUDA memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
+    save_checkpoint(
+        os.path.join(args.save_dir, f'pretrain_{args.D}_{args.num_layers}_{args.vocab_size}_final.pth'),
+        model, optimizer, scaler, args.epochs * iter_per_epoch, args.epochs - 1, 0.0, tokens_seen,
+    )

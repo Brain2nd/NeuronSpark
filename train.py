@@ -230,6 +230,8 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
         # 梯度累积：每 accumulation_steps 步更新一次（对齐教程 L113-125）
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
+            # Natural Gradient: 补偿 b_beta/b_alpha 的 sigmoid/softplus 梯度衰减
+            model.compensate_modulation_gradients()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()

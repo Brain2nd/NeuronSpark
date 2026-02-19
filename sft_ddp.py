@@ -211,6 +211,8 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
 
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
+            raw_model = model.module if isinstance(model, DDP) else model
+            raw_model.compensate_modulation_gradients()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()

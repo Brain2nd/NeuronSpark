@@ -320,6 +320,38 @@ class SNNLanguageModel(nn.Module):
 
         return SNNModelOutput(logits=logits)
 
+    def compensate_modulation_gradients(self, max_comp: float = 100.0):
+        """
+        Natural Gradient 补偿：消除 sigmoid/softplus 激活函数对 b_beta/b_alpha 的梯度衰减。
+
+        问题：β = sigmoid(W·x + b_beta)，sigmoid 在高 β 区（β=0.99, sigmoid'=0.01）
+        梯度衰减 100x，导致长期记忆神经元（高 β）几乎无法训练。
+
+        补偿：∂L/∂b_compensated = ∂L/∂b / activation'(b)
+        等价于在 β/α 空间做梯度下降，而非在 logit/pre-softplus 空间。
+
+        Args:
+            max_comp: 补偿因子上限（防止极端值导致不稳定）
+        """
+        for layer_module in self.layers:
+            block = layer_module.snn_block
+
+            # b_beta: sigmoid 饱和补偿
+            # sigmoid'(z) = sigmoid(z) · (1 - sigmoid(z)) = β · (1-β)
+            if block.b_beta.grad is not None:
+                with torch.no_grad():
+                    beta = torch.sigmoid(block.b_beta.data)
+                    sigmoid_deriv = (beta * (1.0 - beta)).clamp(min=1.0 / max_comp)
+                    block.b_beta.grad.div_(sigmoid_deriv)
+
+            # b_alpha: softplus 补偿（较温和，softplus'(z) = sigmoid(z)）
+            if block.b_alpha.grad is not None:
+                with torch.no_grad():
+                    softplus_deriv = torch.sigmoid(block.b_alpha.data).clamp(min=0.1)
+                    block.b_alpha.grad.div_(softplus_deriv)
+
+            # b_th: |·| 导数为 ±1，无衰减，不需要补偿
+
     def get_param_groups(self) -> dict[str, list[nn.Parameter]]:
         """
         按功能分组的可训练参数。

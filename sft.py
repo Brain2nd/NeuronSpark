@@ -198,6 +198,7 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
         # 梯度累积
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
+            model.compensate_modulation_gradients()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()

@@ -180,6 +180,105 @@ class SNNLanguageModel(nn.Module):
         h = self.norm(h)                                   # (batch, seq_len, D)
         return F.linear(h, self.embed_tokens.weight)       # (batch, seq_len, vocab)
 
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt_ids: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        eos_token_id: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        自回归生成（SNN 神经元状态跨 token 连续维护）。
+
+        1. Prefill: forward_parallel 并行处理 prompt，建立所有神经元 V 状态
+        2. Autoregressive: 逐 token 生成，每 token 用 forward_parallel 处理 K=16 帧
+           复用 Triton parallel scan kernel，神经元 V 状态跨 token 连续传递
+
+        Args:
+            prompt_ids: (batch, prompt_len) token IDs
+            max_new_tokens: 最大生成 token 数
+            temperature: 采样温度（<=0 = greedy）
+            top_k: top-k 采样（None/0 = 不限制）
+            eos_token_id: 遇到此 token 停止生成
+
+        Returns:
+            (batch, prompt_len + generated_len) 完整序列
+        """
+        batch, prompt_len = prompt_ids.shape
+
+        # 重置所有神经元（新序列的初始条件 V=0）
+        for layer_module in self.layers:
+            functional.reset_net(layer_module)
+        functional.reset_net(self.output_neuron)
+
+        # ====== Prefill: parallel 处理整个 prompt ======
+        spike_seq = self.encode(prompt_ids)  # (prompt_len*K, batch, D)
+        h = spike_seq
+        for layer_module in self.layers:
+            h = layer_module.forward_parallel(h)
+        # 此时所有层的所有神经元 .v 状态 = prompt 末尾状态
+
+        # Output path: norm → output_neuron → fp16_decode → proj → norm → logits
+        h_norm = self.output_norm(h)
+        output_spikes = self._output_neuron_parallel(h_norm)
+        decoded = fp16_decode(output_spikes, prompt_len, K=self.K)
+        h_dec = self.decode_proj(decoded)
+        h_dec = self.norm(h_dec)
+        logits = F.linear(h_dec, self.embed_tokens.weight)
+
+        # 采样第一个新 token
+        next_token = self._sample(logits[:, -1, :], temperature, top_k)
+        generated = [next_token]
+
+        # ====== Autoregressive: 逐 token，forward_parallel 处理 K 帧 ======
+        # 等价性证明：layer-by-layer forward_parallel ≡ frame-by-frame single_step
+        #   因为层间无反馈（Layer i 的输出不影响 Layer j<i 的状态），
+        #   每层内的时间递推 V[t]=β·V[t-1]+(1-β)·x[t] 与处理顺序无关。
+        # 优势：复用 Triton parallel scan kernel，避免 K×L 次 Python 循环。
+        for _ in range(max_new_tokens - 1):
+            if eos_token_id is not None and (next_token == eos_token_id).all():
+                break
+
+            # 编码单 token → K 帧 spike
+            emb = self.embed_tokens(next_token)       # (batch, 1, D)
+            spike_frames = fp16_encode(emb, K=self.K)  # (K, batch, D)
+
+            # K 帧通过 SNN（forward_parallel 复用 Triton parallel scan）
+            # 不 reset — 神经元 .v 从上一 token 末尾状态继续
+            h = spike_frames
+            for layer_module in self.layers:
+                h = layer_module.forward_parallel(h)
+
+            # Output path: norm → output_neuron → fp16_decode → proj → logits
+            h_norm = self.output_norm(h)
+            output_spikes = self._output_neuron_parallel(h_norm)
+            decoded = fp16_decode(output_spikes, 1, K=self.K)  # (batch, 1, D)
+            h_dec = self.decode_proj(decoded)
+            h_dec = self.norm(h_dec)
+            logits = F.linear(h_dec, self.embed_tokens.weight)
+
+            next_token = self._sample(logits[:, -1, :], temperature, top_k)
+            generated.append(next_token)
+
+        return torch.cat([prompt_ids, torch.cat(generated, dim=1)], dim=1)
+
+    def _sample(self, logits: torch.Tensor, temperature: float = 1.0, top_k: int = None) -> torch.Tensor:
+        """从 logits 采样（temperature + top-k）。
+
+        Returns: (batch, 1)
+        """
+        if temperature <= 0:
+            return logits.argmax(dim=-1, keepdim=True)
+        logits = logits / temperature
+        if top_k is not None and top_k > 0:
+            top_k = min(top_k, logits.size(-1))
+            v, _ = torch.topk(logits, top_k)
+            logits[logits < v[:, [-1]]] = float('-inf')
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1)
+
     def forward(
         self,
         token_ids: torch.Tensor,

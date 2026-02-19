@@ -167,13 +167,13 @@ class SNNDecoderLayer(base.MemoryModule):
         """
         # 子层 1: SNNBlock — RMSNorm → PLIFNode → SNNBlock → out_proj → 残差(中心化)
         spike_in = self.input_neuron1(self.block_norm(h))
-        spike_block = self.snn_block(spike_in)
+        spike_block = self.snn_block.single_step_forward(spike_in)
         res_block = self.block_out_proj(spike_block)
         h = h + res_block - res_block.mean(dim=-1, keepdim=True)
 
         # 子层 2: SNNFFN — RMSNorm → PLIFNode → SNNFFN → out_proj → 残差(中心化)
         spike_in2 = self.input_neuron2(self.ffn_norm(h))
-        spike_ffn = self.snn_ffn(spike_in2)
+        spike_ffn = self.snn_ffn.single_step_forward(spike_in2)
         res_ffn = self.ffn_out_proj(spike_ffn)
         h = h + res_ffn - res_ffn.mean(dim=-1, keepdim=True)
 

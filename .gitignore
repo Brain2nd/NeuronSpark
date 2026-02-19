@@ -9,6 +9,11 @@ build/
 checkpoints/
 *.pt
 train_log*.txt
+train_v75.log
+train*.log
+
+# Data (too large for git)
+data/
 
 # IDE
 .vscode/

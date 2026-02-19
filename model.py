@@ -1,18 +1,19 @@
 """
-SNNLanguageModel v7: SNN 隐状态空间语言模型（Parallel Scan 版本）
+SNNLanguageModel v7.5: SNN 隐状态空间语言模型（连续残差流版本）
 
-v6 → v7 变更：
-  - K: 8 → 16 (16-bit 二进制编码精度)
-  - 移除 W^(V)（见文档第 7.2 节）
-  - 前向传播：parallel scan 并行处理全序列
-  - 编码/解码：批量处理所有 token
+v7 → v7.5 变更：
+  - 引入连续残差流（Continuous Residual Stream）解决 20 层梯度消失
+  - 每层: 侧抑制 → PLIFNode → SNN子层 → out_proj → 残差连接（×2: Block + FFN）
+  - 层间传递连续值 h，仅在 SNN 子层内部转换为 spike
+  - 侧抑制 (LateralInhibition) 替代 RMSNorm: 基于 divisive normalization
+  - 新增参数: LateralInhibition×2×L + Linear(D,D)×2×L ≈ +3.8%
 
 架构：
   token → Embedding (trainable, D-dim)
-  → encode_proj → sigmoid → K-bit 二进制编码 → K 帧 spike
-  → L 个 SNNDecoderLayer（SNNBlock + SNNFFN，parallel scan）
-  → K 帧 spike 二进制解码 → [0,1]^D
-  → decode_proj → RMSNorm (trainable) → Embedding^T (tied) → logits
+  → encode_proj → sigmoid → K-bit 二进制编码 → K 帧 spike (也是合法连续值)
+  → L 个 SNNDecoderLayer（连续 h → 侧抑制 → PLIFNode → spike → SNN → proj → 残差）
+  → K 帧连续值加权求和 → [0,1]^D
+  → decode_proj → LateralInhibition (trainable) → Embedding^T (tied) → logits
 
 数学原理见 SNN_SELECTIVE_STATE_SPACE.md 第 7 节。
 """
@@ -27,6 +28,7 @@ from spikingjelly.activation_based import functional
 from torch.utils.checkpoint import checkpoint
 
 from atomic_ops import SNNDecoderLayer
+from atomic_ops.lateral_inhibition import LateralInhibition
 
 
 @dataclass
@@ -34,20 +36,6 @@ class SNNModelOutput:
     """模型输出容器，对齐教程 CausalLMOutputWithPast 接口。"""
     last_loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
-
-
-class RMSNorm(nn.Module):
-    """RMSNorm 归一化层。"""
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return self.weight * x
 
 
 class SNNLanguageModel(nn.Module):
@@ -84,7 +72,7 @@ class SNNLanguageModel(nn.Module):
 
         # ====== Embedding + Norm（全部可训练）======
         self.embed_tokens = nn.Embedding(vocab_size, D)
-        self.norm = RMSNorm(D)
+        self.norm = LateralInhibition(D)
 
         # ====== 可训练编码/解码投影 ======
         self.encode_proj = nn.Linear(D, D)
@@ -202,22 +190,25 @@ class SNNLanguageModel(nn.Module):
             functional.reset_net(layer_module)
 
         # ====== 1. 编码全部 token ======
-        spike_seq = self._encode_all_tokens(token_ids)  # (seq_len*K, batch, D)
+        # spike_seq 值域 {0,1}，也是合法的连续值，直接作为残差流初始值
+        h = self._encode_all_tokens(token_ids)  # (seq_len*K, batch, D)
 
         # ====== 2. 逐层并行处理（梯度检查点：按层重计算，省显存） ======
         # 注意：checkpoint 反向时重跑 forward，必须先重置神经元状态回 0.0
+        # 连续残差流: h (连续值) → 每层内部转 spike → SNN → proj → 残差 → h
         def _layer_forward(layer_mod, x):
             functional.reset_net(layer_mod)
             return layer_mod.forward_parallel(x)
 
         for layer_module in self.layers:
-            spike_seq = checkpoint(
-                _layer_forward, layer_module, spike_seq,
+            h = checkpoint(
+                _layer_forward, layer_module, h,
                 use_reentrant=False,
             )
 
         # ====== 3. 解码全部 token ======
-        decoded = self._decode_all_tokens(spike_seq, seq_len)  # (batch, seq_len, D)
+        # h 是连续值，_decode_all_tokens 的 einsum 加权求和对连续值同样有效
+        decoded = self._decode_all_tokens(h, seq_len)  # (batch, seq_len, D)
 
         # ====== 4. 投影 → RMSNorm → tied LM Head ======
         h = self.decode_proj(decoded)  # (batch, seq_len, D)
@@ -238,14 +229,18 @@ class SNNLanguageModel(nn.Module):
 
     def get_param_groups(self) -> dict[str, list[nn.Parameter]]:
         """
-        按功能分组的可训练参数，供 SPSA 使用。
-        v7: 移除了 W_V 和 b_beta/b_alpha/b_th 中的 W^(V) 相关组。
+        按功能分组的可训练参数。
+        v7.5: 新增 residual_projs 和 input_neurons 组。
+        v7.5b: 移除层内 LateralInhibition，仅保留输出 LI。
         """
         groups = {
             'embedding': [self.embed_tokens.weight],
-            'norm': [self.norm.weight],
+            'norm': [self.norm.gain],
             'encode': list(self.encode_proj.parameters()),
             'decode': list(self.decode_proj.parameters()),
+            # 残差流组件（v7.5 新增）
+            'residual_projs': [],
+            'input_neurons': [],
             # SNNBlock 参数（v7: 无 W_V）
             'W_in': [],
             'W_beta': [],
@@ -270,6 +265,18 @@ class SNNLanguageModel(nn.Module):
             block = layer_module.snn_block
             ffn = layer_module.snn_ffn
 
+            # 残差流组件（v7.5: 残差投影 + 输入神经元，无层内归一化）
+            groups['residual_projs'].extend([
+                layer_module.block_out_proj.weight,
+                layer_module.ffn_out_proj.weight,
+            ])
+            groups['input_neurons'].extend([
+                layer_module.input_neuron1.w,
+                layer_module.input_neuron1.v_th,
+                layer_module.input_neuron2.w,
+                layer_module.input_neuron2.v_th,
+            ])
+
             # SNNBlock 参数
             groups['W_in'].append(block.W_in.weight)
             groups['W_beta'].extend([block.W_beta_x.weight])
@@ -282,7 +289,10 @@ class SNNLanguageModel(nn.Module):
             groups['b_beta'].append(block.b_beta)
             groups['b_alpha'].append(block.b_alpha)
             groups['b_th'].append(block.b_th)
-            groups['block_output_neuron'].append(block.output_neuron.w)
+            groups['block_output_neuron'].extend([
+                block.output_neuron.w,
+                block.output_neuron.v_th,
+            ])
 
             # SNNFFN 参数
             groups['ffn_gate_proj'].append(ffn.gate_proj.weight)
@@ -290,9 +300,9 @@ class SNNLanguageModel(nn.Module):
             groups['ffn_down_proj'].append(ffn.down_proj.weight)
             groups['ffn_skip_proj'].append(ffn.skip_proj.weight)
             groups['ffn_neurons'].extend([
-                ffn.gate_neuron.w,
-                ffn.up_neuron.w,
-                ffn.output_neuron.w,
+                ffn.gate_neuron.w, ffn.gate_neuron.v_th,
+                ffn.up_neuron.w, ffn.up_neuron.v_th,
+                ffn.output_neuron.w, ffn.output_neuron.v_th,
             ])
 
         return groups

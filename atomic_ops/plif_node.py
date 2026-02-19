@@ -41,10 +41,16 @@ class PLIFNode(base.MemoryModule):
         surrogate_function=surrogate.Sigmoid(alpha=4.0),
     ):
         super().__init__()
-        # D 维可学习参数
+        # D 维可学习参数（随机初始化，每个维度独立）
+        # w: 控制 β=sigmoid(w)，随机产生不同时间常数
+        #    init_w ± 0.5 → β ∈ ~[sigmoid(w-0.5), sigmoid(w+0.5)]
+        #    tau=2.0 时 w=0, β ∈ ~[0.38, 0.62]
         init_w = -math.log(init_tau - 1.0)
-        self.w = nn.Parameter(torch.full((dim,), init_w))
-        self.v_th = nn.Parameter(torch.full((dim,), float(v_threshold)))
+        self.w = nn.Parameter(torch.empty(dim).normal_(init_w, 0.5))
+        # v_th: 发放阈值，U[0.5x, 1.5x] 均匀分布产生维度间多样性
+        self.v_th = nn.Parameter(torch.empty(dim).uniform_(
+            v_threshold * 0.5, v_threshold * 1.5,
+        ))
         self.surrogate_function = surrogate_function
         # 膜电位状态（functional.reset_net 时重置为 0.）
         self.register_memory('v', 0.)

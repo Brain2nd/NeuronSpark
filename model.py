@@ -1,19 +1,16 @@
 """
-SNNLanguageModel v7.5: SNN 隐状态空间语言模型（连续残差流版本）
+SNNLanguageModel v7.5b: SNN 隐状态空间语言模型（连续残差流 + FP16 边界编码）
 
-v7 → v7.5 变更：
-  - 引入连续残差流（Continuous Residual Stream）解决 20 层梯度消失
-  - 每层: 侧抑制 → PLIFNode → SNN子层 → out_proj → 残差连接（×2: Block + FFN）
-  - 层间传递连续值 h，仅在 SNN 子层内部转换为 spike
-  - 侧抑制 (LateralInhibition) 替代 RMSNorm: 基于 divisive normalization
-  - 新增参数: LateralInhibition×2×L + Linear(D,D)×2×L ≈ +3.8%
+v7.5 → v7.5b 变更：
+  - 编码层改为 FP16 二进制编码（IEEE 754 位模式，固定预处理，无可训练参数）
+  - 解码层改为时间步均值池化（SNN rate coding 自然解码）
+  - 删除 encode_proj, bit_weights, bit_scales（共减少 ~590K 参数）
+  - 编码/解码作为模型边界操作，不内嵌在模型中
 
-架构：
-  token → Embedding (trainable, D-dim)
-  → encode_proj → sigmoid → K-bit 二进制编码 → K 帧 spike (也是合法连续值)
-  → L 个 SNNDecoderLayer（连续 h → 侧抑制 → PLIFNode → spike → SNN → proj → 残差）
-  → K 帧连续值加权求和 → [0,1]^D
-  → decode_proj → LateralInhibition (trainable) → Embedding^T (tied) → logits
+架构（三段式边界）：
+  model.encode(token_ids)    → spike_seq       # 输入边界：embed + fp16 位提取
+  model.snn_forward(spike)   → h_out           # 纯 SNN 核心（连续残差流）
+  model.decode(h_out, seq)   → logits          # 输出边界：均值池化 + proj + norm + tied LM head
 
 数学原理见 SNN_SELECTIVE_STATE_SPACE.md 第 7 节。
 """
@@ -28,6 +25,7 @@ from spikingjelly.activation_based import functional
 from torch.utils.checkpoint import checkpoint
 
 from atomic_ops import SNNDecoderLayer
+from atomic_ops.fp16_codec import fp16_encode, fp16_decode
 from atomic_ops.lateral_inhibition import LateralInhibition
 
 
@@ -74,128 +72,49 @@ class SNNLanguageModel(nn.Module):
         self.embed_tokens = nn.Embedding(vocab_size, D)
         self.norm = LateralInhibition(D)
 
-        # ====== 可训练编码/解码投影 ======
-        self.encode_proj = nn.Linear(D, D)
+        # ====== 解码投影（编码已改为 FP16 边界操作，无可训练参数）======
         self.decode_proj = nn.Linear(D, D)
 
         # ====== SNN Decoder Layers ======
         self.layers = nn.ModuleList([
             SNNDecoderLayer(
                 D=D, N=N, D_ff=D_ff, v_th_min=v_th_min,
-                block_output_v_threshold=0.3 if i == 0 else 0.05,
-                ffn_output_v_threshold=0.5 if i == 0 else 0.15,
+                block_output_v_threshold=0.05,
+                ffn_output_v_threshold=0.15,
                 num_layers=num_layers,
                 layer_idx=i,
             )
             for i in range(num_layers)
         ])
 
-        # ====== K-bit 二进制权重 ======
-        self.register_buffer(
-            'bit_weights',
-            torch.tensor([2.0 ** (-(k + 1)) for k in range(K)]),
-        )
-        # ====== K-bit 编码缩放因子（并行编码用） ======
-        self.register_buffer(
-            'bit_scales',
-            torch.tensor([2.0 ** (k + 1) for k in range(K)]),
-        )
-
         self._init_weights()
 
     def _init_weights(self):
         """初始化所有可训练权重（从零训练）。"""
         nn.init.normal_(self.embed_tokens.weight, mean=0.0, std=0.02)
-        nn.init.xavier_uniform_(self.encode_proj.weight)
-        nn.init.zeros_(self.encode_proj.bias)
         nn.init.xavier_uniform_(self.decode_proj.weight)
         nn.init.zeros_(self.decode_proj.bias)
 
-    def _encode_all_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
+    def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """输入边界：token_ids → spike_seq。
+
+        Embedding lookup + FP16 二进制编码，作为完整的输入边界操作。
+        输出 detached，编码不参与梯度计算。
+
+        Returns: (seq_len*K, batch, D), detached binary {0,1}
         """
-        将所有 token 编码为 spike 帧序列。
+        emb = self.embed_tokens(token_ids)       # (batch, seq_len, D)
+        return fp16_encode(emb, K=self.K)         # (seq_len*K, batch, D), detached
 
-        Args:
-            token_ids: (batch, seq_len)
+    def snn_forward(self, spike_seq: torch.Tensor) -> torch.Tensor:
+        """SNN 核心：spike_seq → h_out。
 
-        Returns:
-            spike_seq: (seq_len * K, batch, D) — 全部 T×K 帧的 spike
+        纯 SNN 层计算，带梯度检查点。
+
+        Returns: (seq_len*K, batch, D), 连续值
         """
-        batch, seq_len = token_ids.shape
+        h = spike_seq
 
-        # 1. Embedding: (batch, seq_len, D)
-        emb = self.embed_tokens(token_ids)
-
-        # 2. 编码: (batch, seq_len, D) → (batch, seq_len, D)
-        h = torch.sigmoid(self.encode_proj(emb))
-
-        # 3. K-bit 并行二进制编码 → (batch, seq_len, K, D)
-        #    数学：h ∈ [0,1] 的二进制小数展开 bit_k = ⌊2^{k+1}·h⌋ mod 2
-        #    STE: forward = bit_hard (二值 {0,1}), backward = ∂/∂h = 1（恒等）
-        #    等价于逐位展开，但全部 K 位同时计算，无循环
-        scaled = h.unsqueeze(2) * self.bit_scales.view(1, 1, self.K, 1)  # (batch, seq_len, K, D)
-        bit_hard = torch.floor(scaled) % 2  # {0.0, 1.0}
-        h_k = h.unsqueeze(2)  # (batch, seq_len, 1, D), broadcasts to (batch, seq_len, K, D)
-        bits = h_k + (bit_hard - h_k).detach()  # STE: forward=bit_hard, backward=∂/∂h=1
-
-        # 4. (batch, seq_len, K, D) → (seq_len*K, batch, D)
-        spike_seq = bits.reshape(batch, seq_len * self.K, self.D)
-        spike_seq = spike_seq.permute(1, 0, 2)  # (seq_len*K, batch, D)
-
-        return spike_seq
-
-    def _decode_all_tokens(self, spike_seq: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """
-        将 spike 帧序列解码为所有 token 的实数表示。
-
-        Args:
-            spike_seq: (seq_len * K, batch, D)
-            seq_len: token 序列长度
-
-        Returns:
-            decoded: (batch, seq_len, D)
-        """
-        batch = spike_seq.shape[1]
-
-        # (seq_len*K, batch, D) → (batch, seq_len, K, D)
-        spike_seq = spike_seq.permute(1, 0, 2)  # (batch, seq_len*K, D)
-        spike_seq = spike_seq.reshape(batch, seq_len, self.K, self.D)
-
-        # 二进制加权求和: sum(spike * 2^{-k})
-        decoded = torch.einsum('bskd,k->bsd', spike_seq, self.bit_weights)
-
-        return decoded  # (batch, seq_len, D)
-
-    def forward(
-        self,
-        token_ids: torch.Tensor,
-        target_ids: torch.Tensor = None,
-    ) -> SNNModelOutput:
-        """
-        前向传播（v7: parallel scan 并行处理全序列）。
-
-        Args:
-            token_ids: (batch, seq_len) 的 token ID 序列
-            target_ids: (batch, seq_len) 的目标 ID
-
-        Returns:
-            SNNModelOutput:
-                若 target_ids 提供: .last_loss = mean cross-entropy loss
-                若 target_ids is None: .logits = (batch, seq_len, vocab_size)
-        """
-        batch, seq_len = token_ids.shape
-
-        # 重置所有 Layer 内部的神经元状态
-        for layer_module in self.layers:
-            functional.reset_net(layer_module)
-
-        # ====== 1. 编码全部 token ======
-        # spike_seq 值域 {0,1}，也是合法的连续值，直接作为残差流初始值
-        h = self._encode_all_tokens(token_ids)  # (seq_len*K, batch, D)
-
-        # ====== 2. 逐层并行处理（梯度检查点：按层重计算，省显存） ======
-        # 注意：checkpoint 反向时重跑 forward，必须先重置神经元状态回 0.0
-        # 连续残差流: h (连续值) → 每层内部转 spike → SNN → proj → 残差 → h
         def _layer_forward(layer_mod, x):
             functional.reset_net(layer_mod)
             return layer_mod.forward_parallel(x)
@@ -205,18 +124,50 @@ class SNNLanguageModel(nn.Module):
                 _layer_forward, layer_module, h,
                 use_reentrant=False,
             )
+        return h
 
-        # ====== 3. 解码全部 token ======
-        # h 是连续值，_decode_all_tokens 的 einsum 加权求和对连续值同样有效
-        decoded = self._decode_all_tokens(h, seq_len)  # (batch, seq_len, D)
+    def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """输出边界：最后一层输出 → logits。
 
-        # ====== 4. 投影 → RMSNorm → tied LM Head ======
-        h = self.decode_proj(decoded)  # (batch, seq_len, D)
-        h = self.norm(h)               # (batch, seq_len, D)
-        logits = F.linear(h, self.embed_tokens.weight)  # (batch, seq_len, vocab)
+        fp16 均值池化 + 投影 + 归一化 + tied LM head，
+        作为完整的输出边界操作。
+
+        Returns: (batch, seq_len, vocab_size)
+        """
+        decoded = fp16_decode(h_out, seq_len, K=self.K)  # (batch, seq_len, D)
+        h = self.decode_proj(decoded)                     # (batch, seq_len, D)
+        h = self.norm(h)                                  # (batch, seq_len, D)
+        return F.linear(h, self.embed_tokens.weight)      # (batch, seq_len, vocab)
+
+    def forward(
+        self,
+        token_ids: torch.Tensor,
+        target_ids: torch.Tensor = None,
+    ) -> SNNModelOutput:
+        """
+        前向传播（v7.5b: 三段式边界架构）。
+
+        encode(token_ids) → spike_seq           # 输入边界（embed + fp16 位提取）
+        snn_forward(spike_seq) → h_out          # 纯 SNN 核心
+        decode(h_out, seq_len) → logits         # 输出边界（decode + proj + norm + tied logits）
+
+        梯度流:
+          emb ──[detach]──→ spike_seq → SNN layers → h_out → mean_pool → decode_proj → norm → logits
+          embed_tokens.weight 通过 tied LM head 获得梯度
+          SNN 参数通过 surrogate gradient 从 loss 反传获得梯度
+        """
+        batch, seq_len = token_ids.shape
+
+        # 重置所有 Layer 内部的神经元状态
+        for layer_module in self.layers:
+            functional.reset_net(layer_module)
+
+        # 三段式
+        spike_seq = self.encode(token_ids)        # 输入边界
+        h_out = self.snn_forward(spike_seq)       # SNN 核心
+        logits = self.decode(h_out, seq_len)      # 输出边界
 
         if target_ids is not None:
-            # 计算 loss
             logits_flat = logits.reshape(-1, self.vocab_size)
             targets_flat = target_ids.reshape(-1)
             self.last_loss = F.cross_entropy(
@@ -236,7 +187,6 @@ class SNNLanguageModel(nn.Module):
         groups = {
             'embedding': [self.embed_tokens.weight],
             'norm': [self.norm.gain],
-            'encode': list(self.encode_proj.parameters()),
             'decode': list(self.decode_proj.parameters()),
             # 残差流组件（v7.5 新增）
             'residual_projs': [],

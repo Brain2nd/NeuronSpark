@@ -122,7 +122,7 @@ def load_checkpoint(path, model, optimizer, scaler, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
     if 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'])
+        model.load_state_dict(ckpt['model_state_dict'], strict=False)
     elif 'trainable_state_dict' in ckpt:
         model.load_state_dict(ckpt['trainable_state_dict'], strict=False)
 
@@ -202,10 +202,10 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
 
-        # 计算当前步骤的学习率（对齐教程 L93-96）
+        # 计算当前步骤的学习率（对齐教程 L93-96，扩展：按 lr_mult 分组缩放）
         lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch)
         for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+            param_group['lr'] = lr * param_group.get('lr_mult', 1.0)
 
         # 前向传播 + 损失计算（对齐教程 L99-107）
         with ctx:
@@ -309,6 +309,7 @@ if __name__ == "__main__":
     parser.add_argument('--accumulation_steps', type=int, default=8, help='梯度累积步数（对齐教程）')
     parser.add_argument('--grad_clip', type=float, default=1.0, help='梯度裁剪阈值（对齐教程）')
     parser.add_argument('--warmup_iters', type=int, default=0, help='学习率预热迭代次数（对齐教程）')
+    parser.add_argument('--neuron_lr_mult', type=float, default=10.0, help='神经元参数学习率倍率（相对 base lr）')
 
     # 日志和保存参数（对齐教程）
     parser.add_argument("--log_interval", type=int, default=100, help="日志记录间隔")
@@ -357,8 +358,19 @@ if __name__ == "__main__":
     # GradScaler（对齐教程 L312）
     scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype in ['float16', 'bfloat16']))
 
-    # Adam 优化器（对齐教程 L315）
-    optimizer = optim.Adam(model.parameters(), lr=args.learning_rate)
+    # Adam 优化器（分组学习率：神经元参数 neuron_lr_mult × base_lr）
+    # 神经元参数（PLIFNode w/v_th, 调制偏置 b_beta/b_alpha/b_th）梯度天然较弱
+    # （surrogate sigmoid 窗口窄），需要更高 lr 才能跟上权重矩阵的漂移速度。
+    _pg = model.get_param_groups()
+    _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th',
+                    'block_output_neuron', 'ffn_neurons'}
+    neuron_params = [p for k in _neuron_keys for p in _pg[k]]
+    other_params = [p for k, ps in _pg.items() if k not in _neuron_keys for p in ps]
+    optimizer = optim.Adam([
+        {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0},
+        {'params': neuron_params, 'lr': args.learning_rate * args.neuron_lr_mult,
+         'lr_mult': float(args.neuron_lr_mult)},
+    ])
 
     # 恢复 checkpoint
     tokens_seen = 0
@@ -382,6 +394,7 @@ if __name__ == "__main__":
     Logger(f"  Epochs:      {args.epochs}")
     Logger(f"  Steps/epoch: {iter_per_epoch:,}")
     Logger(f"  LR:          {args.learning_rate} (warmup {args.warmup_iters} → cosine → {args.learning_rate/10})")
+    Logger(f"  Neuron LR:   {args.learning_rate * args.neuron_lr_mult} ({args.neuron_lr_mult}× base)")
     Logger(f"  Grad clip:   {args.grad_clip}")
     Logger(f"  Precision:   {args.dtype}")
     Logger(f"  Save every:  {args.save_interval} steps")

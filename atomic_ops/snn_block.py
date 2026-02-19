@@ -117,12 +117,15 @@ class SNNBlock(base.MemoryModule):
         # 目标 β 分布：多时间尺度 [0.80, 0.99]
         beta_values = torch.linspace(0.80, 0.99, N)
 
-        # ====== 1. β 偏置：logit-spaced ======
+        # ====== 1. β 偏置：logit-spaced + 维度间随机扰动 ======
         b_beta_per_n = torch.log(beta_values / (1.0 - beta_values))
+        # 以 per_n 值为均值，加 N(0, 0.1) 扰动打破 D 个通道的对称性
         self.b_beta.data.copy_(b_beta_per_n.repeat(D))
+        self.b_beta.data.add_(torch.empty_like(self.b_beta).normal_(0, 0.1))
 
-        # ====== 2. α 偏置：softplus(0.5413) ≈ 1.0（单位写入增益） ======
-        self.b_alpha.data.fill_(0.5413)
+        # ====== 2. α 偏置：softplus(0.5413) ≈ 1.0 + 维度间随机扰动 ======
+        # 以 0.5413 为均值，N(0, 0.1) 扰动 → α ∈ ~[0.7, 1.3]
+        self.b_alpha.data.normal_(0.5413, 0.1)
 
         # ====== 3. W^(x) 权重 ======
         for lin in [self.W_in, self.W_gate, self.W_skip, self.W_out]:
@@ -138,7 +141,12 @@ class SNNBlock(base.MemoryModule):
             self.W_in.weight.mul_(scale_DN.unsqueeze(1))
 
         # ====== 5. b_th：σ_V 校准 ======
-        sigma_I_base = math.sqrt(1.0 / 6.0)
+        # σ_V = sqrt(p/3) * sqrt(1 - β^{2K})
+        # 其中 p 是输入 firing rate。旧版假设 p=0.5（σ_I=0.408），
+        # 但实际 input_neuron firing rate 约 0.07~0.45，深层更低。
+        # 用 p=0.15 保守估计，避免 v_th 过高导致死神经元。
+        p_assumed = 0.15
+        sigma_I_base = math.sqrt(p_assumed / 3.0)
         sigma_V_per_n = sigma_I_base * torch.sqrt(
             1.0 - beta_values ** (2 * K_ref)
         )
@@ -148,7 +156,9 @@ class SNNBlock(base.MemoryModule):
         )
         target_V_th = sigma_V_per_n * z_scores
         b_th_per_n = torch.clamp(target_V_th - self.v_th_min, min=0.05)
+        # 以 per_n 值为均值，加 N(0, 0.02) 扰动打破 D 个通道的对称性
         self.b_th.data.copy_(b_th_per_n.repeat(D))
+        self.b_th.data.add_(torch.empty_like(self.b_th).normal_(0, 0.02))
 
         # ====== 6. W_out 发放率均衡缩放 ======
         out_scale_per_n = 1.0 / torch.sqrt(target_p_fire)

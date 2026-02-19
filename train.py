@@ -28,6 +28,7 @@
 """
 
 import os
+import glob
 import time
 import math
 import argparse
@@ -92,12 +93,14 @@ def get_lr(it, all):
 # Checkpoint
 # ============================================================
 
-def save_checkpoint(path, model, optimizer, scaler, step, epoch, best_loss, tokens_seen):
-    """保存训练状态（扩展教程，额外保存 optimizer/scaler 以支持断续训练）。"""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    state_dict = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, tokens_seen,
+                    max_keep=5):
+    """保存训练状态，每次不覆盖（带步数），仅保留最新 max_keep 个。"""
+    os.makedirs(save_dir, exist_ok=True)
+    raw = model.module if isinstance(model, torch.nn.DataParallel) else model
+    path = os.path.join(save_dir, f'ckpt_step{step}.pth')
     torch.save({
-        'model_state_dict': state_dict,
+        'model_state_dict': raw.state_dict(),
         'optimizer_state': optimizer.state_dict(),
         'scaler_state': scaler.state_dict(),
         'step': step,
@@ -105,15 +108,22 @@ def save_checkpoint(path, model, optimizer, scaler, step, epoch, best_loss, toke
         'best_loss': best_loss,
         'tokens_seen': tokens_seen,
         'model_config': {
-            'vocab_size': model.vocab_size if not isinstance(model, torch.nn.DataParallel) else model.module.vocab_size,
-            'D': model.D if not isinstance(model, torch.nn.DataParallel) else model.module.D,
-            'N': model.N if not isinstance(model, torch.nn.DataParallel) else model.module.N,
-            'K': model.K if not isinstance(model, torch.nn.DataParallel) else model.module.K,
-            'num_layers': model.num_layers if not isinstance(model, torch.nn.DataParallel) else model.module.num_layers,
-            'D_ff': model.D_ff if not isinstance(model, torch.nn.DataParallel) else model.module.D_ff,
+            'vocab_size': raw.vocab_size,
+            'D': raw.D,
+            'N': raw.N,
+            'K': raw.K,
+            'num_layers': raw.num_layers,
+            'D_ff': raw.D_ff,
         },
     }, path)
-    Logger(f"  → Checkpoint saved: {path} (step {step})")
+    Logger(f"  → Checkpoint saved: {path}")
+
+    # 清理旧 checkpoint，仅保留最新 max_keep 个
+    ckpts = sorted(glob.glob(os.path.join(save_dir, 'ckpt_step*.pth')))
+    while len(ckpts) > max_keep:
+        old = ckpts.pop(0)
+        os.remove(old)
+        Logger(f"  → Removed old checkpoint: {old}")
 
 
 def load_checkpoint(path, model, optimizer, scaler, device):
@@ -257,20 +267,12 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
                     spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
                     mem_str))
 
-        # 定期保存（对齐教程 L149-157）
+        # 定期保存（带步数，自动清理保留最新 5 个）
         if (step + 1) % args.save_interval == 0:
             model.eval()
-            ckp = f'{args.save_dir}/pretrain_{args.D}_{args.num_layers}_{args.vocab_size}.pth'
-            save_checkpoint(ckp, model, optimizer, scaler,
-                            epoch * iter_per_epoch + step + 1, epoch, batch_loss, tokens_seen)
-            model.train()
-
-        # 每 20000 步保存带步数标记的检查点（对齐教程 L160-168）
-        if (step + 1) % 20000 == 0:
-            model.eval()
-            ckp = f'{args.save_dir}/pretrain_{args.D}_{args.num_layers}_{args.vocab_size}_step{step+1}.pth'
-            save_checkpoint(ckp, model, optimizer, scaler,
-                            epoch * iter_per_epoch + step + 1, epoch, batch_loss, tokens_seen)
+            global_step = epoch * iter_per_epoch + step + 1
+            save_checkpoint(args.save_dir, model, optimizer, scaler,
+                            global_step, epoch, batch_loss, tokens_seen)
             model.train()
 
     return tokens_seen
@@ -411,7 +413,5 @@ if __name__ == "__main__":
     Logger(f"\nTraining finished. Total tokens seen: {tokens_seen:,}")
     if args.device != 'cpu':
         Logger(f"Peak CUDA memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
-    save_checkpoint(
-        os.path.join(args.save_dir, f'pretrain_{args.D}_{args.num_layers}_{args.vocab_size}_final.pth'),
-        model, optimizer, scaler, args.epochs * iter_per_epoch, args.epochs - 1, 0.0, tokens_seen,
-    )
+    save_checkpoint(args.save_dir, model, optimizer, scaler,
+                    args.epochs * iter_per_epoch, args.epochs - 1, 0.0, tokens_seen)

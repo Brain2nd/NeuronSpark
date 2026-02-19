@@ -21,6 +21,7 @@
 """
 
 import os
+import glob
 import time
 import math
 import argparse
@@ -94,11 +95,12 @@ def get_lr(it, total_iters, learning_rate, warmup_iters):
 # Checkpoint
 # ============================================================
 
-def save_checkpoint(path, model, optimizer, scaler, step, epoch, best_loss, tokens_seen):
-    """保存训练状态（仅主进程调用）。"""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    # DDP 模型需要通过 .module 访问原始模型
+def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, tokens_seen,
+                    max_keep=5):
+    """保存训练状态，每次不覆盖（带步数），仅保留最新 max_keep 个。"""
+    os.makedirs(save_dir, exist_ok=True)
     raw_model = model.module if isinstance(model, DDP) else model
+    path = os.path.join(save_dir, f'ckpt_step{step}.pth')
     torch.save({
         'model_state_dict': raw_model.state_dict(),
         'optimizer_state': optimizer.state_dict(),
@@ -116,7 +118,14 @@ def save_checkpoint(path, model, optimizer, scaler, step, epoch, best_loss, toke
             'D_ff': raw_model.D_ff,
         },
     }, path)
-    print(f"  → Checkpoint saved: {path} (step {step})")
+    print(f"  → Checkpoint saved: {path}")
+
+    # 清理旧 checkpoint，仅保留最新 max_keep 个
+    ckpts = sorted(glob.glob(os.path.join(save_dir, 'ckpt_step*.pth')))
+    while len(ckpts) > max_keep:
+        old = ckpts.pop(0)
+        os.remove(old)
+        print(f"  → Removed old checkpoint: {old}")
 
 
 def load_checkpoint(path, model, optimizer, scaler, device, rank):
@@ -243,24 +252,14 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
                     spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
                     mem_cur, mem_peak, world_size))
 
-        # 定期保存（仅主进程）
-        if (step + 1) % args.save_interval == 0 and is_main_process(rank):
-            model.eval()
-            ckp = f'{args.save_dir}/pretrain_{args.D}_{args.num_layers}_{args.vocab_size}.pth'
-            save_checkpoint(ckp, model, optimizer, scaler,
-                            epoch * iter_per_epoch + step + 1, epoch, batch_loss, tokens_seen)
-            model.train()
-
-        # 里程碑保存
-        if (step + 1) % 20000 == 0 and is_main_process(rank):
-            model.eval()
-            ckp = f'{args.save_dir}/pretrain_{args.D}_{args.num_layers}_{args.vocab_size}_step{step+1}.pth'
-            save_checkpoint(ckp, model, optimizer, scaler,
-                            epoch * iter_per_epoch + step + 1, epoch, batch_loss, tokens_seen)
-            model.train()
-
-        # 同步所有进程（保存后）
-        if (step + 1) % args.save_interval == 0 or (step + 1) % 20000 == 0:
+        # 定期保存（仅主进程，带步数，保留最新 5 个）
+        if (step + 1) % args.save_interval == 0:
+            if is_main_process(rank):
+                model.eval()
+                global_step = epoch * iter_per_epoch + step + 1
+                save_checkpoint(args.save_dir, model, optimizer, scaler,
+                                global_step, epoch, batch_loss, tokens_seen)
+                model.train()
             if world_size > 1:
                 dist.barrier()
 
@@ -404,9 +403,7 @@ if __name__ == "__main__":
     if is_main_process(rank):
         Logger(f"\nTraining finished. Total tokens seen: {tokens_seen:,}", rank)
         Logger(f"Peak CUDA memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB", rank)
-        save_checkpoint(
-            os.path.join(args.save_dir, f'pretrain_{args.D}_{args.num_layers}_{args.vocab_size}_final.pth'),
-            model, optimizer, scaler, args.epochs * iter_per_epoch, args.epochs - 1, 0.0, tokens_seen,
-        )
+        save_checkpoint(args.save_dir, model, optimizer, scaler,
+                        args.epochs * iter_per_epoch, args.epochs - 1, 0.0, tokens_seen)
 
     cleanup_distributed()

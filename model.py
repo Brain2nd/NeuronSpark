@@ -24,6 +24,7 @@ from torch.utils.checkpoint import checkpoint
 
 from atomic_ops import SNNDecoderLayer
 from atomic_ops.plif_node import PLIFNode
+from atomic_ops.rms_norm import RMSNorm
 from atomic_ops.parallel_scan import plif_rowparam_forward
 from atomic_ops.fp16_codec import fp16_encode, fp16_decode
 from atomic_ops.lateral_inhibition import LateralInhibition
@@ -75,7 +76,8 @@ class SNNLanguageModel(nn.Module):
         # ====== 解码投影 ======
         self.decode_proj = nn.Linear(D, D)
 
-        # ====== 输出神经元：连续 h → binary spike（用于 FP16 位重建）======
+        # ====== 输出 RMSNorm + 输出神经元 ======
+        self.output_norm = RMSNorm(D)
         self.output_neuron = PLIFNode(
             dim=D,
             init_tau=2.0,
@@ -171,6 +173,7 @@ class SNNLanguageModel(nn.Module):
 
         Returns: (batch, seq_len, vocab_size)
         """
+        h_out = self.output_norm(h_out)                    # RMSNorm: 控制 scale
         spikes = self._output_neuron_parallel(h_out)   # (TK, batch, D), binary {0,1}
         decoded = fp16_decode(spikes, seq_len, K=self.K)  # IEEE 754 位重建 → (batch, seq_len, D)
         h = self.decode_proj(decoded)                      # (batch, seq_len, D)
@@ -227,8 +230,10 @@ class SNNLanguageModel(nn.Module):
             'embedding': [self.embed_tokens.weight],
             'norm': [self.norm.gain],
             'decode': list(self.decode_proj.parameters()),
-            # 输出神经元（v7.5b 新增：FP16 位重建前的 spike 转换）
+            # 输出神经元
             'output_neuron': [self.output_neuron.w, self.output_neuron.v_th],
+            # RMSNorm（Pre-LN 分支归一化）
+            'rms_norms': [self.output_norm.weight],
             # 残差流组件
             'residual_projs': [],
             'input_neurons': [],
@@ -266,6 +271,10 @@ class SNNLanguageModel(nn.Module):
                 layer_module.input_neuron1.v_th,
                 layer_module.input_neuron2.w,
                 layer_module.input_neuron2.v_th,
+            ])
+            groups['rms_norms'].extend([
+                layer_module.block_norm.weight,
+                layer_module.ffn_norm.weight,
             ])
 
             # SNNBlock 参数

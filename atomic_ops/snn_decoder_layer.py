@@ -1,20 +1,18 @@
 """
-SNNDecoderLayer: 单个 SNN 解码层 = 输入PLIF → SNNBlock → out_proj → 残差
-                                  → 输入PLIF → SNNFFN  → out_proj → 残差
+SNNDecoderLayer: 单个 SNN 解码层（Pre-LN 连续残差流）
 
-v7.5 变更：引入连续残差流（Continuous Residual Stream）
-  - 层间传递连续值 h，通过完整 PLIF 神经元转换为 spike 输入 SNN 子层
-  - 输入PLIF神经元 + SNN子层 + 输出投影 + 残差连接（无层内归一化）
-  - PLIFNode 直接接收原始 h — 保留幅度信息，V_th 作为 SNN 原生归一化机制
-  - 所有 spike 生成都经过完整 PLIF 动力学: V[t]=β·V[t-1]+(1-β)·x[t], 阈值发放, 软重置
-  - 所有普通 SNN 神经元均为 PLIFNode（D 维可学习 β 和 V_th，符合设计文档 5.5）
-  - 解决 20 层梯度消失: ∂h_out/∂h_in = I + ∂(out_proj·snn(plif(h)))/∂h
-  - 残差增长有界: spike ∈ {0,1}, out_proj 初始化小 → h 增长可控，V_th 自适应
+  RMSNorm → PLIF → SNNBlock → out_proj → 残差
+  RMSNorm → PLIF → SNNFFN   → out_proj → 残差
 
-对标 Qwen3DecoderLayer:
-  Qwen3:  LayerNorm → Attention → residual → LayerNorm → MLP → residual
-  SNN:    PLIF → SNNBlock → out_proj → residual
-        → PLIF → SNNFFN   → out_proj → residual
+v7.5c 变更：引入 Pre-LN 式分支归一化
+  - RMSNorm 仅归一化分支输入（送入 PLIFNode 之前），残差流 h 本身不被归一化
+  - 解决 h 系统性漂负 + std 爆炸：out_proj 列和训练成负 → 每层残差偏负 → 20 层累加
+  - RMSNorm 控制分支输入 scale → PLIFNode V_th 恢复意义 → 打破漂移正反馈
+
+对标 Qwen3DecoderLayer（Pre-LN 模式完全等价）:
+  Qwen3:  RMSNorm → Attention → residual → RMSNorm → MLP → residual
+  SNN:    RMSNorm → PLIF → SNNBlock → out_proj → residual
+        → RMSNorm → PLIF → SNNFFN   → out_proj → residual
 """
 
 import math
@@ -24,6 +22,7 @@ import torch.nn as nn
 from spikingjelly.activation_based import base, surrogate
 
 from .plif_node import PLIFNode
+from .rms_norm import RMSNorm
 from .snn_block import SNNBlock
 from .snn_ffn import SNNFFN
 from .parallel_scan import plif_rowparam_forward
@@ -72,8 +71,11 @@ class SNNDecoderLayer(base.MemoryModule):
             layer_idx=layer_idx,
         )
 
-        # 输入神经元: continuous → spike（D 维可学习 β 和 V_th）
-        # PLIFNode 直接接收原始 h，V_th 作为 SNN 原生归一化机制
+        # Pre-LN 分支归一化: h → RMSNorm → PLIFNode
+        self.block_norm = RMSNorm(D)
+        self.ffn_norm = RMSNorm(D)
+
+        # 输入神经元: RMSNorm(h) → spike（D 维可学习 β 和 V_th）
         self.input_neuron1 = PLIFNode(
             dim=D,
             init_tau=2.0,
@@ -139,15 +141,17 @@ class SNNDecoderLayer(base.MemoryModule):
         Returns:
             h: (TK, batch, D) — 连续值输出
         """
-        # 子层 1: SNNBlock（注意力等价）— PLIFNode 直接看原始 h
-        spike_in = self._input_neuron_parallel(self.input_neuron1, h)
+        # 子层 1: SNNBlock — RMSNorm → PLIFNode → SNNBlock → out_proj → 残差(中心化)
+        spike_in = self._input_neuron_parallel(self.input_neuron1, self.block_norm(h))
         spike_block = self.snn_block.forward_parallel(spike_in)
-        h = h + self.block_out_proj(spike_block)
+        res_block = self.block_out_proj(spike_block)
+        h = h + res_block - res_block.mean(dim=-1, keepdim=True)
 
-        # 子层 2: SNNFFN（前馈等价）— PLIFNode 直接看原始 h
-        spike_in2 = self._input_neuron_parallel(self.input_neuron2, h)
+        # 子层 2: SNNFFN — RMSNorm → PLIFNode → SNNFFN → out_proj → 残差(中心化)
+        spike_in2 = self._input_neuron_parallel(self.input_neuron2, self.ffn_norm(h))
         spike_ffn = self.snn_ffn.forward_parallel(spike_in2)
-        h = h + self.ffn_out_proj(spike_ffn)
+        res_ffn = self.ffn_out_proj(spike_ffn)
+        h = h + res_ffn - res_ffn.mean(dim=-1, keepdim=True)
 
         return h
 
@@ -161,14 +165,16 @@ class SNNDecoderLayer(base.MemoryModule):
         Returns:
             h: (batch, D) — 连续值输出
         """
-        # 子层 1: SNNBlock — PLIFNode 直接看原始 h
-        spike_in = self.input_neuron1(h)
+        # 子层 1: SNNBlock — RMSNorm → PLIFNode → SNNBlock → out_proj → 残差(中心化)
+        spike_in = self.input_neuron1(self.block_norm(h))
         spike_block = self.snn_block(spike_in)
-        h = h + self.block_out_proj(spike_block)
+        res_block = self.block_out_proj(spike_block)
+        h = h + res_block - res_block.mean(dim=-1, keepdim=True)
 
-        # 子层 2: SNNFFN — PLIFNode 直接看原始 h
-        spike_in2 = self.input_neuron2(h)
+        # 子层 2: SNNFFN — RMSNorm → PLIFNode → SNNFFN → out_proj → 残差(中心化)
+        spike_in2 = self.input_neuron2(self.ffn_norm(h))
         spike_ffn = self.snn_ffn(spike_in2)
-        h = h + self.ffn_out_proj(spike_ffn)
+        res_ffn = self.ffn_out_proj(spike_ffn)
+        h = h + res_ffn - res_ffn.mean(dim=-1, keepdim=True)
 
         return h

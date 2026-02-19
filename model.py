@@ -1,16 +1,14 @@
 """
-SNNLanguageModel v7.5b: SNN 隐状态空间语言模型（连续残差流 + FP16 边界编码）
-
-v7.5 → v7.5b 变更：
-  - 编码层改为 FP16 二进制编码（IEEE 754 位模式，固定预处理，无可训练参数）
-  - 解码层改为时间步均值池化（SNN rate coding 自然解码）
-  - 删除 encode_proj, bit_weights, bit_scales（共减少 ~590K 参数）
-  - 编码/解码作为模型边界操作，不内嵌在模型中
+SNNLanguageModel v7.5b: SNN 隐状态空间语言模型（连续残差流 + FP16 边界编解码）
 
 架构（三段式边界）：
-  model.encode(token_ids)    → spike_seq       # 输入边界：embed + fp16 位提取
-  model.snn_forward(spike)   → h_out           # 纯 SNN 核心（连续残差流）
-  model.decode(h_out, seq)   → logits          # 输出边界：均值池化 + proj + norm + tied LM head
+  model.encode(token_ids)    → spike_seq       # 输入边界：embed → FP16 位提取 → 16帧 spike
+  model.snn_forward(spike)   → h_out           # 纯 SNN 核心（连续残差流，20 层）
+  model.decode(h_out, seq)   → logits          # 输出边界：PLIFNode → spike → FP16 位重建 → proj → norm → tied head
+
+编解码对称性：
+  encode: 连续值 → IEEE 754 float16 位提取 → 16 帧 binary {0,1}（detach，固定预处理）
+  decode: 16 帧 binary {0,1} ← 输出神经元 ← 连续 h → IEEE 754 位重建 → 连续值（可微分）
 
 数学原理见 SNN_SELECTIVE_STATE_SPACE.md 第 7 节。
 """
@@ -21,10 +19,12 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from spikingjelly.activation_based import functional
+from spikingjelly.activation_based import functional, surrogate
 from torch.utils.checkpoint import checkpoint
 
 from atomic_ops import SNNDecoderLayer
+from atomic_ops.plif_node import PLIFNode
+from atomic_ops.parallel_scan import plif_rowparam_forward
 from atomic_ops.fp16_codec import fp16_encode, fp16_decode
 from atomic_ops.lateral_inhibition import LateralInhibition
 
@@ -72,8 +72,16 @@ class SNNLanguageModel(nn.Module):
         self.embed_tokens = nn.Embedding(vocab_size, D)
         self.norm = LateralInhibition(D)
 
-        # ====== 解码投影（编码已改为 FP16 边界操作，无可训练参数）======
+        # ====== 解码投影 ======
         self.decode_proj = nn.Linear(D, D)
+
+        # ====== 输出神经元：连续 h → binary spike（用于 FP16 位重建）======
+        self.output_neuron = PLIFNode(
+            dim=D,
+            init_tau=2.0,
+            v_threshold=0.3,
+            surrogate_function=surrogate.Sigmoid(alpha=4.0),
+        )
 
         # ====== SNN Decoder Layers ======
         self.layers = nn.ModuleList([
@@ -126,18 +134,48 @@ class SNNLanguageModel(nn.Module):
             )
         return h
 
-    def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """输出边界：最后一层输出 → logits。
+    def _output_neuron_parallel(self, h: torch.Tensor) -> torch.Tensor:
+        """输出 PLIF 神经元的 parallel scan 前向：连续 h → binary spike。
 
-        fp16 均值池化 + 投影 + 归一化 + tied LM head，
-        作为完整的输出边界操作。
+        Args:
+            h: (TK, batch, D) 连续值（SNN 最后一层输出）
+
+        Returns:
+            spike: (TK, batch, D) 二值 {0, 1}
+        """
+        TK, batch, D = h.shape
+
+        beta = self.output_neuron.beta  # (D,)
+        u = (1.0 - beta) * h  # PLIF: u = (1-β) · x
+
+        v_init = self.output_neuron.v
+        if isinstance(v_init, float):
+            v_init = torch.zeros(batch, D, device=h.device, dtype=h.dtype)
+
+        beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
+        v_th_row = self.output_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
+
+        spike, V_post = plif_rowparam_forward(
+            beta_row, u, v_th_row, v_init,
+            surrogate_function=self.output_neuron.surrogate_function,
+        )
+
+        self.output_neuron.v = V_post[-1].detach()
+        return spike
+
+    def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """输出边界：连续 h → 输出神经元 → spike → FP16 位重建 → logits。
+
+        梯度流: loss → logits → norm → decode_proj → fp16_reconstruct
+                → surrogate_grad(output_neuron) → h_out → SNN layers
 
         Returns: (batch, seq_len, vocab_size)
         """
-        decoded = fp16_decode(h_out, seq_len, K=self.K)  # (batch, seq_len, D)
-        h = self.decode_proj(decoded)                     # (batch, seq_len, D)
-        h = self.norm(h)                                  # (batch, seq_len, D)
-        return F.linear(h, self.embed_tokens.weight)      # (batch, seq_len, vocab)
+        spikes = self._output_neuron_parallel(h_out)   # (TK, batch, D), binary {0,1}
+        decoded = fp16_decode(spikes, seq_len, K=self.K)  # IEEE 754 位重建 → (batch, seq_len, D)
+        h = self.decode_proj(decoded)                      # (batch, seq_len, D)
+        h = self.norm(h)                                   # (batch, seq_len, D)
+        return F.linear(h, self.embed_tokens.weight)       # (batch, seq_len, vocab)
 
     def forward(
         self,
@@ -147,20 +185,22 @@ class SNNLanguageModel(nn.Module):
         """
         前向传播（v7.5b: 三段式边界架构）。
 
-        encode(token_ids) → spike_seq           # 输入边界（embed + fp16 位提取）
-        snn_forward(spike_seq) → h_out          # 纯 SNN 核心
-        decode(h_out, seq_len) → logits         # 输出边界（decode + proj + norm + tied logits）
+        encode → spike_seq           # 输入边界（embed → FP16 位提取）
+        snn_forward → h_out          # 纯 SNN 核心（连续残差流）
+        decode → logits              # 输出边界（PLIFNode → spike → FP16 位重建 → proj → logits）
 
         梯度流:
-          emb ──[detach]──→ spike_seq → SNN layers → h_out → mean_pool → decode_proj → norm → logits
+          emb ──[detach]──→ spike_seq → SNN layers → h_out
+            → output_neuron(surrogate) → spike → fp16_reconstruct → decode_proj → norm → logits
           embed_tokens.weight 通过 tied LM head 获得梯度
           SNN 参数通过 surrogate gradient 从 loss 反传获得梯度
         """
         batch, seq_len = token_ids.shape
 
-        # 重置所有 Layer 内部的神经元状态
+        # 重置所有神经元状态
         for layer_module in self.layers:
             functional.reset_net(layer_module)
+        functional.reset_net(self.output_neuron)
 
         # 三段式
         spike_seq = self.encode(token_ids)        # 输入边界
@@ -181,14 +221,15 @@ class SNNLanguageModel(nn.Module):
     def get_param_groups(self) -> dict[str, list[nn.Parameter]]:
         """
         按功能分组的可训练参数。
-        v7.5: 新增 residual_projs 和 input_neurons 组。
-        v7.5b: 移除层内 LateralInhibition，仅保留输出 LI。
+        v7.5b: output_neuron 归入 neuron 组。
         """
         groups = {
             'embedding': [self.embed_tokens.weight],
             'norm': [self.norm.gain],
             'decode': list(self.decode_proj.parameters()),
-            # 残差流组件（v7.5 新增）
+            # 输出神经元（v7.5b 新增：FP16 位重建前的 spike 转换）
+            'output_neuron': [self.output_neuron.w, self.output_neuron.v_th],
+            # 残差流组件
             'residual_projs': [],
             'input_neurons': [],
             # SNNBlock 参数（v7: 无 W_V）
@@ -215,7 +256,7 @@ class SNNLanguageModel(nn.Module):
             block = layer_module.snn_block
             ffn = layer_module.snn_ffn
 
-            # 残差流组件（v7.5: 残差投影 + 输入神经元，无层内归一化）
+            # 残差流组件
             groups['residual_projs'].extend([
                 layer_module.block_out_proj.weight,
                 layer_module.ffn_out_proj.weight,
@@ -235,7 +276,6 @@ class SNNLanguageModel(nn.Module):
             groups['W_gate'].append(block.W_gate.weight)
             groups['W_skip'].append(block.W_skip.weight)
             groups['W_out'].append(block.W_out.weight)
-            # v7: W_V 已移除
             groups['b_beta'].append(block.b_beta)
             groups['b_alpha'].append(block.b_alpha)
             groups['b_th'].append(block.b_th)

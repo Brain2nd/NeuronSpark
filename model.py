@@ -18,6 +18,7 @@ v8.0 核心变更：
 数学原理见 SNN_SELECTIVE_STATE_SPACE.md 第 7 节。
 """
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -51,7 +52,8 @@ class SNNLanguageModel(nn.Module):
         vocab_size: 词表大小（默认 6144，自训练 BPE）
         D: 可见维度
         N: 状态扩展因子
-        K: 每 token 的 SNN 时间步数（v7 默认 16）
+        K: 每 token 最大 SNN 时间步数（K_max）。PonderNet 动态决定有效步数 ∈ [1, K]。
+           K 越大 → 复杂 token 可用更多步数，但计算量和显存线性增长。
         num_layers: SNN 解码层数
         D_ff: FFN 中间层维度
         v_th_min: 动态阈值下限
@@ -62,7 +64,7 @@ class SNNLanguageModel(nn.Module):
         vocab_size: int = 6144,
         D: int = 1024,
         N: int = 8,
-        K: int = 16,
+        K: int = 32,
         num_layers: int = 20,
         D_ff: int = 3072,
         v_th_min: float = 0.1,
@@ -211,7 +213,7 @@ class SNNLanguageModel(nn.Module):
         自回归生成（SNN 神经元状态跨 token 连续维护）。
 
         1. Prefill: forward_parallel 并行处理 prompt，建立所有神经元 V 状态
-        2. Autoregressive: 逐 token 生成，每 token 用 forward_parallel 处理 K=16 帧
+        2. Autoregressive: 逐 token 生成，每 token 用 forward_parallel 处理 K 帧
            复用 Triton parallel scan kernel，神经元 V 状态跨 token 连续传递
 
         Args:
@@ -324,17 +326,23 @@ class SNNLanguageModel(nn.Module):
 
     def compensate_modulation_gradients(self, max_comp: float = 100.0):
         """
-        Natural Gradient 补偿：消除 sigmoid/softplus 激活函数对 b_beta/b_alpha 的梯度衰减。
+        Natural Gradient 补偿（两阶段）。
 
-        问题：β = sigmoid(W·x + b_beta)，sigmoid 在高 β 区（β=0.99, sigmoid'=0.01）
-        梯度衰减 100x，导致长期记忆神经元（高 β）几乎无法训练。
+        Phase 1: Sigmoid/softplus 饱和补偿
+          β = sigmoid(b_beta), sigmoid 在高 β 区（β=0.99, sigmoid'=0.01）梯度衰减 100x。
+          补偿: grad /= activation'(b)，等价于在 β/α 空间做梯度下降。
 
-        补偿：∂L/∂b_compensated = ∂L/∂b / activation'(b)
-        等价于在 β/α 空间做梯度下降，而非在 logit/pre-softplus 空间。
+        Phase 2: 层间梯度均衡
+          残差链反向传播每层放大 ~1.17×，20 层累积 ~20× L0/L19 比。
+          深层选择性参数（b_beta/b_alpha/b_th）梯度被压制，无法有效学习。
+          修复: 将每层调制参数梯度 norm 归一化到所有层的几何均值。
+
+        调用时机: scaler.unscale_(optimizer) 之后、clip_grad_norm_ 之前。
 
         Args:
             max_comp: 补偿因子上限（防止极端值导致不稳定）
         """
+        # ====== Phase 1: Sigmoid/softplus 饱和补偿 ======
         for layer_module in self.layers:
             block = layer_module.snn_block
 
@@ -353,6 +361,31 @@ class SNNLanguageModel(nn.Module):
                     block.b_alpha.grad.div_(softplus_deriv)
 
             # b_th: |·| 导数为 ±1，无衰减，不需要补偿
+
+        # ====== Phase 2: 层间梯度均衡 ======
+        # 残差链 h = h + sublayer(h) 的反向路径 ∂h_{l+1}/∂h_l = I + ∂sublayer/∂h_l
+        # 每层放大 ~1.17×, 20 层累积 ~20× → L0 梯度远大于 L19
+        # 用几何均值归一化每层调制参数梯度 norm，消除残差放大效应
+        with torch.no_grad():
+            for param_name in ['b_beta', 'b_alpha', 'b_th']:
+                norms = []
+                params_list = []
+                for layer_module in self.layers:
+                    p = getattr(layer_module.snn_block, param_name)
+                    if p.grad is not None:
+                        n = p.grad.norm().item()
+                        if n > 1e-12:
+                            norms.append(n)
+                            params_list.append(p)
+
+                if len(norms) >= 2:
+                    # 几何均值: exp(mean(log(norms))) — 对数尺度均衡，不受极端值影响
+                    log_mean = sum(math.log(n) for n in norms) / len(norms)
+                    geo_mean = math.exp(log_mean)
+                    for p, n in zip(params_list, norms):
+                        scale = geo_mean / n
+                        scale = max(min(scale, max_comp), 1.0 / max_comp)
+                        p.grad.mul_(scale)
 
     def get_param_groups(self) -> dict[str, list[nn.Parameter]]:
         """

@@ -7,7 +7,7 @@
 
 SNN 生成核心机制：
   - Prefill: forward_parallel 并行处理 prompt，建立所有神经元膜电位状态
-  - Autoregressive: 逐 token 生成，每 token K=16 次 single_step_forward
+  - Autoregressive: 逐 token 生成，每 token K 次 forward_parallel（K 由 checkpoint 配置）
   - 神经元 V 状态跨 token 连续传递，不 reset
 
 用法：

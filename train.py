@@ -259,10 +259,18 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
                 mem_cur = torch.cuda.memory_allocated() / 1e9
                 mem_peak = torch.cuda.max_memory_allocated() / 1e9
                 mem_str = f" | Mem {mem_cur:.1f}/{mem_peak:.1f}GB"
-            # 动态 K: 报告期望步数
+            # 动态 K: 报告期望步数（E[K] 均值 + per-token 范围 [min~max]）
             ponder_str = ""
             if out.ponder_cost is not None:
-                ponder_str = f" | E[K]:{out.ponder_cost.item():.1f}"
+                ek_mean = out.ponder_cost.item()
+                # 从层属性读取 per-token E[K] 范围
+                raw_model = model.module if hasattr(model, 'module') else model
+                ek_mins = [l._ek_min for l in raw_model.layers if hasattr(l, '_ek_min')]
+                ek_maxs = [l._ek_max for l in raw_model.layers if hasattr(l, '_ek_max')]
+                if ek_mins:
+                    ponder_str = f" | E[K]:{ek_mean:.1f} [{min(ek_mins):.1f}~{max(ek_maxs):.1f}]"
+                else:
+                    ponder_str = f" | E[K]:{ek_mean:.1f}"
             Logger(
                 'Epoch:[{}/{}]({}/{}) loss:{:.3f} ppl:{:.1f} lr:{:.7f} TPS:{:.0f} epoch_Time:{}min{}{}'.format(
                     epoch + 1,
@@ -300,7 +308,7 @@ if __name__ == "__main__":
     parser.add_argument('--vocab_size', type=int, default=6144, help='词表大小')
     parser.add_argument('--D', type=int, default=1024, help='隐层维度')
     parser.add_argument('--N', type=int, default=8, help='状态扩展因子')
-    parser.add_argument('--K', type=int, default=16, help='每 token SNN 时间步数')
+    parser.add_argument('--K', type=int, default=32, help='每 token 最大 SNN 时间步数（K_max），PonderNet 动态决定有效步数')
     parser.add_argument('--num_layers', type=int, default=20, help='SNN 解码层数')
     parser.add_argument('--D_ff', type=int, default=3072, help='FFN 中间层维度')
     parser.add_argument('--v_th_min', type=float, default=0.1, help='阈值下限')

@@ -250,7 +250,7 @@ if __name__ == "__main__":
     parser.add_argument('--vocab_size', type=int, default=6144)
     parser.add_argument('--D', type=int, default=1024)
     parser.add_argument('--N', type=int, default=8)
-    parser.add_argument('--K', type=int, default=16)
+    parser.add_argument('--K', type=int, default=32)
     parser.add_argument('--num_layers', type=int, default=20)
     parser.add_argument('--D_ff', type=int, default=3072)
     parser.add_argument('--v_th_min', type=float, default=0.1)

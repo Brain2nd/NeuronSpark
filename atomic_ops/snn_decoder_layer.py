@@ -5,6 +5,7 @@ SNNDecoderLayer: 单个 SNN 解码层（Pre-LN 连续残差流 + 动态 K 帧聚
   RMSNorm → PLIF → SNNFFN   → 动态K聚合 → out_proj → 残差
 
 v8.0 动态 K（对标 Mamba Δ 选择性机制）：
+  - K 是最大步数（K_max），不是固定步数。不同 token 有效步数 ∈ [1, K_max]。
   - 每个 token 的 K 帧 SNN 输出，学习自适应停止概率 p_halt
   - PonderNet 几何分布加权：λ_k = p_k · ∏_{j<k}(1-p_j)，归一化后加权聚合
   - 不同 token 有效步数不同：简单 token 早停（E[K]小），复杂 token 用满步数
@@ -17,6 +18,11 @@ v8.0 动态 K（对标 Mamba Δ 选择性机制）：
     归一化:   λ̂_k = λ_k / Σ_k λ_k                   — 确保权重和为 1
     聚合:     output = Σ_k λ̂_k · frame_k
     代价:     E[K] = Σ_k k · λ̂_k                    — 期望步数
+
+  K_max 设计原则：
+    K_max 越大，模型对复杂 token 的处理能力越强（更多步数可用），
+    但计算量和显存线性增长。K_max=32 允许 token 使用 1~32 步。
+    PonderNet 的 ponder_cost 正则化确保简单 token 不浪费步数。
 
 v7.6 变更：K 帧层间聚合
   - SNN 子层输出 K 帧连续值（V_post 经投影），mean 聚合为 1 per token
@@ -226,12 +232,12 @@ class SNNDecoderLayer(base.MemoryModule):
         # (seq_len, K, batch, 1) × (seq_len, K, batch, D) → sum → (seq_len, batch, D)
         aggregated = (frames * halt_weights.unsqueeze(-1)).sum(dim=1)
 
-        # ====== 3. Ponder cost: E[K] ======
+        # ====== 3. Ponder cost: E[K] per token ======
         steps = torch.arange(1, K + 1, device=frames.device, dtype=frames.dtype)
         expected_k = (halt_weights * steps[None, :, None]).sum(dim=1)  # (seq_len, batch)
         ponder_cost = expected_k.mean()               # scalar
 
-        return aggregated, ponder_cost
+        return aggregated, ponder_cost, expected_k.detach()
 
     def forward_parallel(self, h):
         """
@@ -258,7 +264,7 @@ class SNNDecoderLayer(base.MemoryModule):
 
         # 动态 K 帧聚合（PonderNet）: (TK, batch, D) → (seq_len, K, batch, D) → 加权 → (seq_len, batch, D)
         frames_block = cont_block.view(seq_len, K, batch, D)
-        combined_block, pc_block = self._adaptive_aggregate(frames_block, self.block_halt)
+        combined_block, pc_block, ek_block = self._adaptive_aggregate(frames_block, self.block_halt)
         res_block = self.block_out_proj(combined_block)  # (seq_len, batch, D)
         res_block = res_block - res_block.mean(dim=-1, keepdim=True)  # 残差中心化
 
@@ -270,13 +276,20 @@ class SNNDecoderLayer(base.MemoryModule):
         cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D), 连续值
 
         frames_ffn = cont_ffn.view(seq_len, K, batch, D)
-        combined_ffn, pc_ffn = self._adaptive_aggregate(frames_ffn, self.ffn_halt)
+        combined_ffn, pc_ffn, ek_ffn = self._adaptive_aggregate(frames_ffn, self.ffn_halt)
         res_ffn = self.ffn_out_proj(combined_ffn)
         res_ffn = res_ffn - res_ffn.mean(dim=-1, keepdim=True)
 
         h = h + res_ffn.repeat_interleave(K, dim=0)
 
         ponder_cost = (pc_block + pc_ffn) / 2.0  # 两个子层平均
+
+        # 存储 per-token E[K] 范围（诊断用，不影响计算图）
+        # ek_block/ek_ffn: (seq_len, batch), detached
+        with torch.no_grad():
+            all_ek = torch.cat([ek_block.flatten(), ek_ffn.flatten()])
+            self._ek_min = all_ek.min().item()
+            self._ek_max = all_ek.max().item()
 
         return h, ponder_cost
 

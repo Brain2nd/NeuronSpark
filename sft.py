@@ -6,9 +6,9 @@ SFT 训练脚本：SNN 语言模型监督微调（单卡）
   2. 加载预训练 checkpoint 权重（--pretrained_ckpt）
   3. Optimizer 状态不继承（微调从头开始优化）
 
-数据格式：JSONL，每行一个 JSON 对象，格式如下：
-  {"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}
-  tokenizer 必须配置 chat_template（ChatML 格式）。
+数据格式：JSONL，每行一个 JSON list（由 deal_dataset.py 生成），格式如下：
+  [{"role": "system", "content": "你是一个AI助手"}, {"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
+  tokenizer 必须配置 chat_template（ChatML 格式，已内置于 tokenizer_config.json）。
 
 用法：
     conda activate SNN
@@ -204,9 +204,6 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        if step % 10 == 0 and args.device != 'cpu':
-            torch.cuda.empty_cache()
-
         valid_tokens = int(loss_mask_flat.sum().item())
         tokens_seen += valid_tokens
 
@@ -321,17 +318,18 @@ if __name__ == "__main__":
     )
 
     # ==================== 优化器 ====================
-    scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype in ['float16', 'bfloat16']))
+    scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
 
     _pg = model.get_param_groups()
     _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th',
                     'block_output_neuron', 'ffn_neurons', 'output_neuron'}
     neuron_params = [p for k in _neuron_keys for p in _pg[k]]
     other_params = [p for k, ps in _pg.items() if k not in _neuron_keys for p in ps]
-    optimizer = optim.Adam([
-        {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0},
+    optimizer = optim.AdamW([
+        {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0,
+         'weight_decay': 0.01},
         {'params': neuron_params, 'lr': args.learning_rate * args.neuron_lr_mult,
-         'lr_mult': float(args.neuron_lr_mult)},
+         'lr_mult': float(args.neuron_lr_mult), 'weight_decay': 0.0},
     ])
 
     # 恢复 SFT checkpoint

@@ -218,9 +218,6 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        if step % 10 == 0:
-            torch.cuda.empty_cache()
-
         valid_tokens = loss_mask_flat.sum()
         if world_size > 1:
             dist.all_reduce(valid_tokens, op=dist.ReduceOp.SUM)
@@ -335,17 +332,18 @@ if __name__ == "__main__":
     )
 
     # ==================== 优化器 ====================
-    scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype in ['float16', 'bfloat16']))
+    scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
 
     _pg = model.module.get_param_groups()
     _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th',
                     'block_output_neuron', 'ffn_neurons', 'output_neuron'}
     neuron_params = [p for k in _neuron_keys for p in _pg[k]]
     other_params = [p for k, ps in _pg.items() if k not in _neuron_keys for p in ps]
-    optimizer = optim.Adam([
-        {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0},
+    optimizer = optim.AdamW([
+        {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0,
+         'weight_decay': 0.01},
         {'params': neuron_params, 'lr': args.learning_rate * args.neuron_lr_mult,
-         'lr_mult': float(args.neuron_lr_mult)},
+         'lr_mult': float(args.neuron_lr_mult), 'weight_decay': 0.0},
     ])
 
     # 恢复 SFT checkpoint

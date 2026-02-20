@@ -84,7 +84,10 @@ def pretrain_sample(model, tokenizer, prompt, max_new_tokens=256,
 def sft_sample(model, tokenizer, prompt, max_new_tokens=256,
                temperature=0.8, top_k=50, device='cuda'):
     """SFT 模型对话生成。"""
-    messages = [{"role": "user", "content": prompt}]
+    messages = [
+        {"role": "system", "content": "你是一个AI助手"},
+        {"role": "user", "content": prompt},
+    ]
     text = tokenizer.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True,
     )
@@ -154,6 +157,58 @@ def interactive_mode(model, tokenizer, args):
         print(f"\n{response}\n")
 
 
+PRETRAIN_TEST_PROMPTS = [
+    "北京大学是",
+    "人工智能的发展",
+    "中国的四大发明包括",
+    "在自然语言处理领域",
+]
+
+SFT_TEST_PROMPTS = [
+    "你好呀",
+    "中国的首都是哪里？",
+    "1+12等于多少？",
+    "什么是脉冲神经网络？",
+    "请用一句话介绍你自己。",
+]
+
+
+def run_pretrain_test(model, tokenizer, args):
+    """预训练模型批量续写测试。"""
+    print(f"\n{'='*50}")
+    print(f"预训练续写测试 | temp={args.temperature} top_k={args.top_k}")
+    print(f"{'='*50}")
+    for i, prompt in enumerate(PRETRAIN_TEST_PROMPTS, 1):
+        response = pretrain_sample(
+            model, tokenizer, prompt,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            device=args.device,
+        )
+        print(f"\n[{i}/{len(PRETRAIN_TEST_PROMPTS)}] Prompt: {prompt}")
+        print(f"Output: {response}")
+        print("-" * 40)
+
+
+def run_sft_test(model, tokenizer, args):
+    """SFT 模型批量对话测试。"""
+    print(f"\n{'='*50}")
+    print(f"SFT 对话测试 | temp={args.temperature} top_k={args.top_k}")
+    print(f"{'='*50}")
+    for i, prompt in enumerate(SFT_TEST_PROMPTS, 1):
+        response = sft_sample(
+            model, tokenizer, prompt,
+            max_new_tokens=args.max_new_tokens,
+            temperature=args.temperature,
+            top_k=args.top_k,
+            device=args.device,
+        )
+        print(f"\n[{i}/{len(SFT_TEST_PROMPTS)}] Q: {prompt}")
+        print(f"A: {response}")
+        print("-" * 40)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SNN Language Model Text Generation")
 
@@ -192,4 +247,8 @@ if __name__ == "__main__":
         )
         print(f"\n{response}")
     else:
-        print("Please specify --prompt or --interactive")
+        # 无 prompt 时自动跑内置测试
+        if args.mode == 'pretrain':
+            run_pretrain_test(model, tokenizer, args)
+        else:
+            run_sft_test(model, tokenizer, args)

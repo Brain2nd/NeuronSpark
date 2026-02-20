@@ -229,10 +229,6 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        # 清理
-        if step % 10 == 0:
-            torch.cuda.empty_cache()
-
         # 有效 token 数（汇总所有卡）
         valid_tokens = loss_mask_flat.sum()
         if world_size > 1:
@@ -349,7 +345,7 @@ if __name__ == "__main__":
     )
 
     # ==================== 优化器 ====================
-    scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype in ['float16', 'bfloat16']))
+    scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
 
     # 通过 .module 访问原始模型方法
     _pg = model.module.get_param_groups()

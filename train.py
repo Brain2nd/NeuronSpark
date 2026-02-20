@@ -240,10 +240,6 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-        # 清理
-        if step % 10 == 0 and args.device != 'cpu':
-            torch.cuda.empty_cache()
-
         # 有效 token 数
         valid_tokens = int(loss_mask_flat.sum().item())
         tokens_seen += valid_tokens
@@ -377,7 +373,7 @@ if __name__ == "__main__":
 
     # ==================== 优化器和训练组件初始化 ====================
     # GradScaler（对齐教程 L312）
-    scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype in ['float16', 'bfloat16']))
+    scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
 
     # Adam 优化器（分组学习率：神经元参数 neuron_lr_mult × base_lr）
     # 神经元参数（PLIFNode w/v_th, 调制偏置 b_beta/b_alpha/b_th）梯度天然较弱

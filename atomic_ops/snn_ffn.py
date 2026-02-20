@@ -3,16 +3,17 @@ SNNFFN: SNN 等价的 Feed-Forward Network
 
 对标 Qwen3MLP 的 SwiGLU 结构：
   Qwen3 MLP:  down_proj( SiLU(gate_proj(x)) * up_proj(x) )
-  SNN  FFN:   down_proj( gate_spike AND up_spike ) + skip → output_neuron
+  SNN  FFN:   down_proj( gate_V_post * up_V_post ) + skip
 
-SiLU gating → spike 巧合检测（AND 门）：
-  只有当 gate 和 up 通道同时发放时，信号才传递，实现非线性选择。
+膜电位门控（对标 SiLU gating）：
+  gate/up 神经元完整 PLIF 动力学（积分+阈值+重置），
+  输出膜电位 V_post 做连续乘法门控，替代 binary AND 门。
 
 信号流：
-  spike_in (p~20%) → gate_proj → gate_neuron → gate_spike (p~30%)
-  spike_in (p~20%) → up_proj   → up_neuron   → up_spike (p~30%)
-                      gate_spike AND up_spike → gated (p~9%)
-                      down_proj(gated) + skip_proj(spike_in) → 连续输出
+  x → gate_proj → gate_neuron → V_post_gate
+  x → up_proj   → up_neuron   → V_post_up
+                   V_post_gate × V_post_up → gated
+                   down_proj(gated) + skip_proj(x) → 连续输出
 """
 
 import math
@@ -144,13 +145,14 @@ class SNNFFN(base.MemoryModule):
             surrogate_function=surr,
         )
 
-        gate_spike = spike_merged[:, :, :D_ff]
-        up_spike = spike_merged[:, :, D_ff:]
+        # 用 V_post（膜电位）作为激活值，非 spike
+        gate_v = V_post_merged[:, :, :D_ff]
+        up_v = V_post_merged[:, :, D_ff:]
         self.gate_neuron.v = V_post_merged[-1, :, :D_ff].detach()
         self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
 
-        # ====== Phase 3: AND 门 + 降维 ======
-        gated = gate_spike * up_spike  # (TK, batch, D_ff)
+        # ====== Phase 3: 连续门控（V_post × V_post，对标 SwiGLU）+ 降维 ======
+        gated = gate_v * up_v  # (TK, batch, D_ff)
         gated_flat = gated.reshape(TK * batch, D_ff)
         I_out = F.linear(gated_flat, self.down_proj.weight).reshape(TK, batch, D) + I_skip
 
@@ -167,14 +169,16 @@ class SNNFFN(base.MemoryModule):
         Returns:
             continuous_out: 连续输出, shape (batch, D)
         """
-        # 门控路径
-        gate_spike = self.gate_neuron(self.gate_proj(spike_in))  # {0,1}^D_ff
+        # 门控路径 — V_post 膜电位激活
+        _ = self.gate_neuron(self.gate_proj(spike_in))
+        gate_v = self.gate_neuron.v  # V_post
 
-        # 值路径
-        up_spike = self.up_neuron(self.up_proj(spike_in))  # {0,1}^D_ff
+        # 值路径 — V_post 膜电位激活
+        _ = self.up_neuron(self.up_proj(spike_in))
+        up_v = self.up_neuron.v  # V_post
 
-        # AND 门：巧合检测
-        gated = gate_spike * up_spike  # {0,1}^D_ff
+        # 连续门控（对标 SwiGLU）
+        gated = gate_v * up_v
 
         # 降维 + 残差
         I_out = self.down_proj(gated) + self.skip_proj(spike_in)  # R^D

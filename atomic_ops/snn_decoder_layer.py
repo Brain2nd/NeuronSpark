@@ -83,7 +83,7 @@ class SNNDecoderLayer(base.MemoryModule):
         self.block_norm = RMSNorm(D)
         self.ffn_norm = RMSNorm(D)
 
-        # 输入神经元: RMSNorm(h) → spike（D 维可学习 β 和 V_th）
+        # 输入神经元: RMSNorm(h) → V_post 膜电位激活（D 维可学习 β 和 V_th）
         self.input_neuron1 = PLIFNode(
             dim=D,
             init_tau=2.0,
@@ -111,13 +111,14 @@ class SNNDecoderLayer(base.MemoryModule):
         输入 PLIF 神经元的 parallel scan 前向传播。
 
         完整 PLIF 动力学: V[t] = β·V[t-1] + (1-β)·x[t], spike = Θ(V-V_th), 软重置。
+        输出膜电位 V_post 作为激活值（保留完整 SNN 动力学，但传递连续信号）。
 
         Args:
             input_neuron: PLIFNode 实例（D 维可学习 β 和 V_th）
-            x: (TK, batch, D) — 原始连续值（未归一化，保留幅度信息）
+            x: (TK, batch, D) — 连续值输入
 
         Returns:
-            spike: (TK, batch, D) — 二值 spike {0, 1}
+            V_post: (TK, batch, D) — 膜电位（连续激活值）
         """
         TK, batch, D = x.shape
 
@@ -137,7 +138,7 @@ class SNNDecoderLayer(base.MemoryModule):
         )
 
         input_neuron.v = V_post[-1].detach()
-        return spike
+        return V_post  # 膜电位作为激活值
 
     def forward_parallel(self, h):
         """
@@ -156,9 +157,9 @@ class SNNDecoderLayer(base.MemoryModule):
         K = self.K
         seq_len = TK // K
 
-        # 子层 1: SNNBlock — RMSNorm → PLIFNode → SNNBlock → K聚合 → out_proj → 残差
-        spike_in = self._input_neuron_parallel(self.input_neuron1, self.block_norm(h))
-        cont_block = self.snn_block.forward_parallel(spike_in)  # (TK, batch, D), 连续值
+        # 子层 1: SNNBlock — RMSNorm → PLIFNode(V_post) → SNNBlock → K聚合 → out_proj → 残差
+        v_in = self._input_neuron_parallel(self.input_neuron1, self.block_norm(h))
+        cont_block = self.snn_block.forward_parallel(v_in)  # (TK, batch, D), 连续值
 
         # K 帧聚合：(TK, batch, D) → (seq_len, K, batch, D) → mean → (seq_len, batch, D)
         combined_block = cont_block.view(seq_len, K, batch, D).mean(dim=1)
@@ -168,9 +169,9 @@ class SNNDecoderLayer(base.MemoryModule):
         # 广播回 TK：每 token 的残差复制 K 份
         h = h + res_block.repeat_interleave(K, dim=0)
 
-        # 子层 2: SNNFFN — RMSNorm → PLIFNode → SNNFFN → K聚合 → out_proj → 残差
-        spike_in2 = self._input_neuron_parallel(self.input_neuron2, self.ffn_norm(h))
-        cont_ffn = self.snn_ffn.forward_parallel(spike_in2)  # (TK, batch, D), 连续值
+        # 子层 2: SNNFFN — RMSNorm → PLIFNode(V_post) → SNNFFN → K聚合 → out_proj → 残差
+        v_in2 = self._input_neuron_parallel(self.input_neuron2, self.ffn_norm(h))
+        cont_ffn = self.snn_ffn.forward_parallel(v_in2)  # (TK, batch, D), 连续值
 
         combined_ffn = cont_ffn.view(seq_len, K, batch, D).mean(dim=1)
         res_ffn = self.ffn_out_proj(combined_ffn)
@@ -194,15 +195,17 @@ class SNNDecoderLayer(base.MemoryModule):
         Returns:
             h: (batch, D) — 连续值输出
         """
-        # 子层 1: SNNBlock — RMSNorm → PLIFNode → SNNBlock → out_proj → 残差(中心化)
-        spike_in = self.input_neuron1(self.block_norm(h))
-        cont_block = self.snn_block.single_step_forward(spike_in)
+        # 子层 1: SNNBlock — RMSNorm → PLIFNode(V_post) → SNNBlock → out_proj → 残差
+        _ = self.input_neuron1(self.block_norm(h))  # 触发 PLIF 动力学，更新 .v
+        v_in = self.input_neuron1.v                  # V_post 膜电位作为激活值
+        cont_block = self.snn_block.single_step_forward(v_in)
         res_block = self.block_out_proj(cont_block)
         h = h + res_block - res_block.mean(dim=-1, keepdim=True)
 
-        # 子层 2: SNNFFN — RMSNorm → PLIFNode → SNNFFN → out_proj → 残差(中心化)
-        spike_in2 = self.input_neuron2(self.ffn_norm(h))
-        cont_ffn = self.snn_ffn.single_step_forward(spike_in2)
+        # 子层 2: SNNFFN — RMSNorm → PLIFNode(V_post) → SNNFFN → out_proj → 残差
+        _ = self.input_neuron2(self.ffn_norm(h))
+        v_in2 = self.input_neuron2.v
+        cont_ffn = self.snn_ffn.single_step_forward(v_in2)
         res_ffn = self.ffn_out_proj(cont_ffn)
         h = h + res_ffn - res_ffn.mean(dim=-1, keepdim=True)
 

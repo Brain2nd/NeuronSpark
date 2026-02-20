@@ -1,15 +1,16 @@
 """
-SNNLanguageModel v7.6: SNN 隐状态空间语言模型（连续残差流 + K 帧聚合 + FP16 边界编解码）
+SNNLanguageModel v8.0: SNN 隐状态空间语言模型（全膜电位架构）
 
-架构（三段式边界）：
-  model.encode(token_ids)    → spike_seq       # 输入边界：embed → FP16 位提取 → 16帧 spike
-  model.snn_forward(spike)   → h_out           # 纯 SNN 核心（连续残差流，20 层，含 K 帧聚合）
-  model.decode(h_out, seq)   → logits          # 输出边界：PLIFNode → spike → FP16 位重建 → proj → norm → tied head
+架构（三段式）：
+  model.encode(token_ids)    → h_seq           # 输入: embed → repeat K 次（可微分）
+  model.snn_forward(h_seq)   → h_out           # SNN 核心: 20 层，全膜电位激活 + K 帧聚合
+  model.decode(h_out, seq)   → logits          # 输出: output_neuron(V_post) → K帧mean → proj → logits
 
-v7.6 核心变更：
-  - SNNBlock/SNNFFN 输出连续值（V_post 经 W_out，非 spike），移除 output_neuron
-  - 每层 K 帧聚合：SNN 子层输出 K 帧 mean → out_proj → 广播回 K 帧 → 残差
-  - β 梯度通过 V_post 直接传播（无 surrogate 瓶颈）+ K 帧聚合提供 token 级信号
+v8.0 核心变更（全膜电位）：
+  - 所有神经元保留完整 PLIF 动力学（积分+阈值+重置），但输出 V_post 而非 spike
+  - fp16 encode/decode 移除: 输入直接用连续 embedding，输出直接用 V_post
+  - embedding 梯度双通道: input path + tied LM head
+  - FFN gate×up: binary AND → 连续 V_post 乘法（对标 SwiGLU）
 
 数学原理见 SNN_SELECTIVE_STATE_SPACE.md 第 7 节。
 """
@@ -27,7 +28,7 @@ from atomic_ops import SNNDecoderLayer
 from atomic_ops.plif_node import PLIFNode
 from atomic_ops.rms_norm import RMSNorm
 from atomic_ops.parallel_scan import plif_rowparam_forward
-from atomic_ops.fp16_codec import fp16_encode, fp16_decode
+# fp16_encode/fp16_decode 已移除: 全膜电位架构不需要 spike 编解码
 from atomic_ops.lateral_inhibition import LateralInhibition
 
 
@@ -107,15 +108,18 @@ class SNNLanguageModel(nn.Module):
         nn.init.zeros_(self.decode_proj.bias)
 
     def encode(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """输入边界：token_ids → spike_seq。
+        """输入边界：token_ids → 连续值序列。
 
-        Embedding lookup + FP16 二进制编码，作为完整的输入边界操作。
-        输出 detached，编码不参与梯度计算。
+        Embedding lookup，每 token 重复 K 次作为 SNN 时间步输入。
+        梯度可通过 embedding 直接反传。
 
-        Returns: (seq_len*K, batch, D), detached binary {0,1}
+        Returns: (seq_len*K, batch, D), 连续值
         """
         emb = self.embed_tokens(token_ids)       # (batch, seq_len, D)
-        return fp16_encode(emb, K=self.K)         # (seq_len*K, batch, D), detached
+        batch, seq_len, D = emb.shape
+        # 每 token 重复 K 次: (batch, seq_len, D) → (batch, seq_len*K, D) → (TK, batch, D)
+        emb_k = emb.unsqueeze(2).expand(-1, -1, self.K, -1).reshape(batch, seq_len * self.K, D)
+        return emb_k.permute(1, 0, 2).contiguous()  # (TK, batch, D)
 
     def snn_forward(self, spike_seq: torch.Tensor) -> torch.Tensor:
         """SNN 核心：spike_seq → h_out。
@@ -138,13 +142,13 @@ class SNNLanguageModel(nn.Module):
         return h
 
     def _output_neuron_parallel(self, h: torch.Tensor) -> torch.Tensor:
-        """输出 PLIF 神经元的 parallel scan 前向：连续 h → binary spike。
+        """输出 PLIF 神经元的 parallel scan 前向：连续 h → V_post 膜电位。
 
         Args:
             h: (TK, batch, D) 连续值（SNN 最后一层输出）
 
         Returns:
-            spike: (TK, batch, D) 二值 {0, 1}
+            V_post: (TK, batch, D) 膜电位（连续激活值）
         """
         TK, batch, D = h.shape
 
@@ -164,19 +168,21 @@ class SNNLanguageModel(nn.Module):
         )
 
         self.output_neuron.v = V_post[-1].detach()
-        return spike
+        return V_post  # 膜电位作为激活值
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """输出边界：连续 h → 输出神经元 → spike → FP16 位重建 → logits。
+        """输出边界：连续 h → 输出神经元(V_post) → K 帧聚合 → logits。
 
-        梯度流: loss → logits → norm → decode_proj → fp16_reconstruct
-                → surrogate_grad(output_neuron) → h_out → SNN layers
+        梯度流: loss → logits → norm → decode_proj → K帧mean
+                → V_post(output_neuron) → h_out → SNN layers
 
         Returns: (batch, seq_len, vocab_size)
         """
         h_out = self.output_norm(h_out)                    # RMSNorm: 控制 scale
-        spikes = self._output_neuron_parallel(h_out)   # (TK, batch, D), binary {0,1}
-        decoded = fp16_decode(spikes, seq_len, K=self.K)  # IEEE 754 位重建 → (batch, seq_len, D)
+        v_out = self._output_neuron_parallel(h_out)    # (TK, batch, D), V_post 膜电位
+        # K 帧聚合: (TK, batch, D) → (seq_len, K, batch, D) → mean → (seq_len, batch, D)
+        decoded = v_out.view(seq_len, self.K, -1, self.D).mean(dim=1)
+        decoded = decoded.permute(1, 0, 2)                 # (batch, seq_len, D)
         h = self.decode_proj(decoded)                      # (batch, seq_len, D)
         h = self.norm(h)                                   # (batch, seq_len, D)
         return F.linear(h, self.embed_tokens.weight)       # (batch, seq_len, vocab)
@@ -215,50 +221,32 @@ class SNNLanguageModel(nn.Module):
         functional.reset_net(self.output_neuron)
 
         # ====== Prefill: parallel 处理整个 prompt ======
-        spike_seq = self.encode(prompt_ids)  # (prompt_len*K, batch, D)
-        h = spike_seq
+        h_seq = self.encode(prompt_ids)  # (prompt_len*K, batch, D), 连续值
+        h = h_seq
         for layer_module in self.layers:
             h = layer_module.forward_parallel(h)
         # 此时所有层的所有神经元 .v 状态 = prompt 末尾状态
 
-        # Output path: norm → output_neuron → fp16_decode → proj → norm → logits
-        h_norm = self.output_norm(h)
-        output_spikes = self._output_neuron_parallel(h_norm)
-        decoded = fp16_decode(output_spikes, prompt_len, K=self.K)
-        h_dec = self.decode_proj(decoded)
-        h_dec = self.norm(h_dec)
-        logits = F.linear(h_dec, self.embed_tokens.weight)
+        logits = self.decode(h, prompt_len)
 
         # 采样第一个新 token
         next_token = self._sample(logits[:, -1, :], temperature, top_k)
         generated = [next_token]
 
         # ====== Autoregressive: 逐 token，forward_parallel 处理 K 帧 ======
-        # 等价性证明：layer-by-layer forward_parallel ≡ frame-by-frame single_step
-        #   因为层间无反馈（Layer i 的输出不影响 Layer j<i 的状态），
-        #   每层内的时间递推 V[t]=β·V[t-1]+(1-β)·x[t] 与处理顺序无关。
-        # 优势：复用 Triton parallel scan kernel，避免 K×L 次 Python 循环。
         for _ in range(max_new_tokens - 1):
             if eos_token_id is not None and (next_token == eos_token_id).all():
                 break
 
-            # 编码单 token → K 帧 spike
-            emb = self.embed_tokens(next_token)       # (batch, 1, D)
-            spike_frames = fp16_encode(emb, K=self.K)  # (K, batch, D)
+            # 编码单 token → K 帧连续值（复用 encode）
+            frames = self.encode(next_token)  # (K, batch, D)
 
-            # K 帧通过 SNN（forward_parallel 复用 Triton parallel scan）
-            # 不 reset — 神经元 .v 从上一 token 末尾状态继续
-            h = spike_frames
+            # K 帧通过 SNN — 不 reset，神经元 .v 跨 token 连续传递
+            h = frames
             for layer_module in self.layers:
                 h = layer_module.forward_parallel(h)
 
-            # Output path: norm → output_neuron → fp16_decode → proj → logits
-            h_norm = self.output_norm(h)
-            output_spikes = self._output_neuron_parallel(h_norm)
-            decoded = fp16_decode(output_spikes, 1, K=self.K)  # (batch, 1, D)
-            h_dec = self.decode_proj(decoded)
-            h_dec = self.norm(h_dec)
-            logits = F.linear(h_dec, self.embed_tokens.weight)
+            logits = self.decode(h, 1)
 
             next_token = self._sample(logits[:, -1, :], temperature, top_k)
             generated.append(next_token)
@@ -286,17 +274,16 @@ class SNNLanguageModel(nn.Module):
         target_ids: torch.Tensor = None,
     ) -> SNNModelOutput:
         """
-        前向传播（v7.6: 三段式边界架构 + K 帧聚合）。
+        前向传播（v8.0: 全膜电位架构）。
 
-        encode → spike_seq           # 输入边界（embed → FP16 位提取）
-        snn_forward → h_out          # 纯 SNN 核心（连续残差流）
-        decode → logits              # 输出边界（PLIFNode → spike → FP16 位重建 → proj → logits）
+        encode → h_seq               # 输入（embed repeat K 次，可微分）
+        snn_forward → h_out          # SNN 核心（全膜电位激活 + K 帧聚合）
+        decode → logits              # 输出（V_post → K帧mean → proj → logits）
 
         梯度流:
-          emb ──[detach]──→ spike_seq → SNN layers → h_out
-            → output_neuron(surrogate) → spike → fp16_reconstruct → decode_proj → norm → logits
-          embed_tokens.weight 通过 tied LM head 获得梯度
-          SNN 参数通过 surrogate gradient 从 loss 反传获得梯度
+          embed_tokens → repeat K → SNN layers(V_post激活) → output_neuron(V_post)
+            → K帧mean → decode_proj → norm → logits(tied head)
+          embed_tokens.weight 获得双通道梯度: input path + tied LM head
         """
         batch, seq_len = token_ids.shape
 

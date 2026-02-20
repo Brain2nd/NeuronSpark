@@ -1,16 +1,19 @@
 """
-SNNLanguageModel v8.0: SNN 隐状态空间语言模型（全膜电位架构）
+SNNLanguageModel v8.0: SNN 隐状态空间语言模型（全膜电位 + 动态 K）
 
 架构（三段式）：
   model.encode(token_ids)    → h_seq           # 输入: embed → repeat K 次（可微分）
-  model.snn_forward(h_seq)   → h_out           # SNN 核心: 20 层，全膜电位激活 + K 帧聚合
+  model.snn_forward(h_seq)   → h_out, pc       # SNN 核心: 20 层，全膜电位 + 动态 K 聚合
   model.decode(h_out, seq)   → logits          # 输出: output_neuron(V_post) → K帧mean → proj → logits
 
-v8.0 核心变更（全膜电位）：
-  - 所有神经元保留完整 PLIF 动力学（积分+阈值+重置），但输出 V_post 而非 spike
-  - fp16 encode/decode 移除: 输入直接用连续 embedding，输出直接用 V_post
-  - embedding 梯度双通道: input path + tied LM head
-  - FFN gate×up: binary AND → 连续 V_post 乘法（对标 SwiGLU）
+v8.0 核心变更：
+  1. 全膜电位：所有神经元输出 V_post 而非 spike
+  2. 动态 K（对标 Mamba Δ）：PonderNet 自适应停止，不同 token 不同有效步数
+     - 每层每子层学习 halt_proj(D→1)，从 SNN 输出逐步计算停止概率
+     - 几何分布权重加权聚合，替代 uniform mean
+     - ponder_cost 正则化鼓励早停
+  3. fp16 编解码移除
+  4. embedding 梯度双通道
 
 数学原理见 SNN_SELECTIVE_STATE_SPACE.md 第 7 节。
 """
@@ -37,6 +40,7 @@ class SNNModelOutput:
     """模型输出容器，对齐教程 CausalLMOutputWithPast 接口。"""
     last_loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
+    ponder_cost: Optional[torch.Tensor] = None  # 动态 K: 平均期望步数
 
 
 class SNNLanguageModel(nn.Module):
@@ -121,25 +125,32 @@ class SNNLanguageModel(nn.Module):
         emb_k = emb.unsqueeze(2).expand(-1, -1, self.K, -1).reshape(batch, seq_len * self.K, D)
         return emb_k.permute(1, 0, 2).contiguous()  # (TK, batch, D)
 
-    def snn_forward(self, spike_seq: torch.Tensor) -> torch.Tensor:
-        """SNN 核心：spike_seq → h_out。
+    def snn_forward(self, spike_seq: torch.Tensor):
+        """SNN 核心：spike_seq → (h_out, ponder_cost)。
 
         纯 SNN 层计算，带梯度检查点。
+        每层返回 (h, ponder_cost)，ponder_cost 作为 checkpoint 输出保留梯度图。
 
-        Returns: (seq_len*K, batch, D), 连续值
+        Returns:
+            h: (seq_len*K, batch, D), 连续值
+            total_ponder_cost: scalar, 所有层平均期望步数
         """
         h = spike_seq
+        ponder_costs = []
 
         def _layer_forward(layer_mod, x):
             functional.reset_net(layer_mod)
-            return layer_mod.forward_parallel(x)
+            return layer_mod.forward_parallel(x)  # returns (h, ponder_cost)
 
         for layer_module in self.layers:
-            h = checkpoint(
+            h, pc = checkpoint(
                 _layer_forward, layer_module, h,
                 use_reentrant=False,
             )
-        return h
+            ponder_costs.append(pc)
+
+        total_ponder_cost = sum(ponder_costs) / len(ponder_costs)
+        return h, total_ponder_cost
 
     def _output_neuron_parallel(self, h: torch.Tensor) -> torch.Tensor:
         """输出 PLIF 神经元的 parallel scan 前向：连续 h → V_post 膜电位。
@@ -224,7 +235,7 @@ class SNNLanguageModel(nn.Module):
         h_seq = self.encode(prompt_ids)  # (prompt_len*K, batch, D), 连续值
         h = h_seq
         for layer_module in self.layers:
-            h = layer_module.forward_parallel(h)
+            h, _ = layer_module.forward_parallel(h)  # 推理忽略 ponder_cost
         # 此时所有层的所有神经元 .v 状态 = prompt 末尾状态
 
         logits = self.decode(h, prompt_len)
@@ -244,7 +255,7 @@ class SNNLanguageModel(nn.Module):
             # K 帧通过 SNN — 不 reset，神经元 .v 跨 token 连续传递
             h = frames
             for layer_module in self.layers:
-                h = layer_module.forward_parallel(h)
+                h, _ = layer_module.forward_parallel(h)
 
             logits = self.decode(h, 1)
 
@@ -274,16 +285,16 @@ class SNNLanguageModel(nn.Module):
         target_ids: torch.Tensor = None,
     ) -> SNNModelOutput:
         """
-        前向传播（v8.0: 全膜电位架构）。
+        前向传播（v8.0: 全膜电位 + 动态 K）。
 
         encode → h_seq               # 输入（embed repeat K 次，可微分）
-        snn_forward → h_out          # SNN 核心（全膜电位激活 + K 帧聚合）
+        snn_forward → h_out, pc      # SNN 核心（全膜电位 + 动态 K 聚合）
         decode → logits              # 输出（V_post → K帧mean → proj → logits）
 
         梯度流:
-          embed_tokens → repeat K → SNN layers(V_post激活) → output_neuron(V_post)
-            → K帧mean → decode_proj → norm → logits(tied head)
-          embed_tokens.weight 获得双通道梯度: input path + tied LM head
+          embed_tokens → repeat K → SNN layers(V_post + 动态K)
+            → output_neuron(V_post) → K帧mean → decode_proj → logits(tied head)
+          ponder_cost: 动态 K 正则化，鼓励用更少步数处理简单 token
         """
         batch, seq_len = token_ids.shape
 
@@ -293,9 +304,9 @@ class SNNLanguageModel(nn.Module):
         functional.reset_net(self.output_neuron)
 
         # 三段式
-        spike_seq = self.encode(token_ids)        # 输入边界
-        h_out = self.snn_forward(spike_seq)       # SNN 核心
-        logits = self.decode(h_out, seq_len)      # 输出边界
+        spike_seq = self.encode(token_ids)            # 输入边界
+        h_out, ponder_cost = self.snn_forward(spike_seq)  # SNN 核心 + ponder cost
+        logits = self.decode(h_out, seq_len)          # 输出边界
 
         if target_ids is not None:
             logits_flat = logits.reshape(-1, self.vocab_size)
@@ -304,9 +315,12 @@ class SNNLanguageModel(nn.Module):
                 logits_flat, targets_flat,
                 ignore_index=0, reduction='none',
             )
-            return SNNModelOutput(last_loss=self.last_loss)
+            return SNNModelOutput(
+                last_loss=self.last_loss,
+                ponder_cost=ponder_cost,
+            )
 
-        return SNNModelOutput(logits=logits)
+        return SNNModelOutput(logits=logits, ponder_cost=ponder_cost)
 
     def compensate_modulation_gradients(self, max_comp: float = 100.0):
         """
@@ -343,7 +357,7 @@ class SNNLanguageModel(nn.Module):
     def get_param_groups(self) -> dict[str, list[nn.Parameter]]:
         """
         按功能分组的可训练参数。
-        v7.5b: output_neuron 归入 neuron 组。
+        v8.0: 新增 halt_projs（动态 K 停止投影）。
         """
         groups = {
             'embedding': [self.embed_tokens.weight],
@@ -356,6 +370,8 @@ class SNNLanguageModel(nn.Module):
             # 残差流组件
             'residual_projs': [],
             'input_neurons': [],
+            # 动态 K: 停止投影
+            'halt_projs': [],
             # SNNBlock 参数（v7: 无 W_V）
             'W_in': [],
             'W_beta': [],
@@ -396,6 +412,10 @@ class SNNLanguageModel(nn.Module):
                 layer_module.ffn_norm.weight,
             ])
 
+            # 动态 K: 停止投影参数
+            groups['halt_projs'].extend(list(layer_module.block_halt.parameters()))
+            groups['halt_projs'].extend(list(layer_module.ffn_halt.parameters()))
+
             # SNNBlock 参数
             groups['W_in'].append(block.W_in.weight)
             groups['W_beta'].extend([block.W_beta_x.weight])
@@ -407,7 +427,6 @@ class SNNLanguageModel(nn.Module):
             groups['b_beta'].append(block.b_beta)
             groups['b_alpha'].append(block.b_alpha)
             groups['b_th'].append(block.b_th)
-            # block.output_neuron 已移除（v7.6: V_post 输出 + K 帧聚合）
 
             # SNNFFN 参数
             groups['ffn_gate_proj'].append(ffn.gate_proj.weight)
@@ -417,7 +436,6 @@ class SNNLanguageModel(nn.Module):
             groups['ffn_neurons'].extend([
                 ffn.gate_neuron.w, ffn.gate_neuron.v_th,
                 ffn.up_neuron.w, ffn.up_neuron.v_th,
-                # ffn.output_neuron 已移除（v7.6）
             ])
 
         return groups

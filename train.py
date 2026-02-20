@@ -223,6 +223,9 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
             loss = out.last_loss / args.accumulation_steps
             loss_mask_flat = loss_mask.view(-1)
             loss = torch.sum(loss * loss_mask_flat) / loss_mask_flat.sum()
+            # 动态 K: ponder cost 正则化（鼓励用更少步数处理简单 token）
+            if out.ponder_cost is not None and args.ponder_weight > 0:
+                loss = loss + args.ponder_weight * out.ponder_cost / args.accumulation_steps
 
         # 反向传播（对齐教程 L110）
         scaler.scale(loss).backward()
@@ -256,8 +259,12 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
                 mem_cur = torch.cuda.memory_allocated() / 1e9
                 mem_peak = torch.cuda.max_memory_allocated() / 1e9
                 mem_str = f" | Mem {mem_cur:.1f}/{mem_peak:.1f}GB"
+            # 动态 K: 报告期望步数
+            ponder_str = ""
+            if out.ponder_cost is not None:
+                ponder_str = f" | E[K]:{out.ponder_cost.item():.1f}"
             Logger(
-                'Epoch:[{}/{}]({}/{}) loss:{:.3f} ppl:{:.1f} lr:{:.7f} TPS:{:.0f} epoch_Time:{}min{}'.format(
+                'Epoch:[{}/{}]({}/{}) loss:{:.3f} ppl:{:.1f} lr:{:.7f} TPS:{:.0f} epoch_Time:{}min{}{}'.format(
                     epoch + 1,
                     args.epochs,
                     step,
@@ -267,7 +274,8 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
                     lr,
                     tps,
                     spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
-                    mem_str))
+                    mem_str,
+                    ponder_str))
 
         # 定期保存（带步数，自动清理保留最新 5 个）
         if (step + 1) % args.save_interval == 0:
@@ -314,6 +322,7 @@ if __name__ == "__main__":
     parser.add_argument('--grad_clip', type=float, default=1.0, help='梯度裁剪阈值（对齐教程）')
     parser.add_argument('--warmup_iters', type=int, default=0, help='学习率预热迭代次数（对齐教程）')
     parser.add_argument('--neuron_lr_mult', type=float, default=10.0, help='神经元参数学习率倍率（相对 base lr）')
+    parser.add_argument('--ponder_weight', type=float, default=0.01, help='动态 K ponder cost 正则化权重')
 
     # 日志和保存参数（对齐教程）
     parser.add_argument("--log_interval", type=int, default=100, help="日志记录间隔")

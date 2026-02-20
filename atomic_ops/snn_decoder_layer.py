@@ -43,6 +43,32 @@ from .snn_ffn import SNNFFN
 from .parallel_scan import plif_rowparam_forward
 
 
+# ====== Fused halt weight computation (torch.compile) ======
+# 7-8 个独立 element-wise kernel → 单 fused kernel
+# sigmoid + clamp + log1p + cumsum + exp + normalize
+# 首次调用触发 JIT 编译（~秒级），后续调用走缓存
+
+@torch.compile(backend='inductor', fullgraph=True)
+def _fused_geometric_halt(halt_logits):
+    """融合计算 PonderNet 几何分布停止权重。
+
+    输入: halt_logits (seq_len, K, batch) — halt_proj 的原始输出
+    输出: halt_weights (seq_len, K, batch) — 归一化几何分布权重，sum=1
+
+    数学: p_k = σ(logit_k), S_k = ∏_{j<k}(1-p_j), λ_k = p_k·S_k, λ̂_k = λ_k/Σλ
+    """
+    p_halt = torch.sigmoid(halt_logits).clamp(min=1e-7, max=1.0 - 1e-7)
+    log_1_minus_p = torch.log1p(-p_halt)               # (seq_len, K, batch)
+    # Exclusive cumsum: log_survive[:, k, :] = Σ_{j<k} log(1-p_j)
+    # 避免 torch.cat: 用 cumsum([:, :-1]) 填充 [:, 1:]
+    log_survive = torch.zeros_like(log_1_minus_p)
+    log_survive[:, 1:, :] = torch.cumsum(log_1_minus_p[:, :-1, :], dim=1)
+    survive = torch.exp(log_survive)                    # (seq_len, K, batch)
+    halt_weights = p_halt * survive                     # λ_k = p_k · S_k
+    halt_weights = halt_weights / (halt_weights.sum(dim=1, keepdim=True) + 1e-8)
+    return halt_weights
+
+
 class SNNDecoderLayer(base.MemoryModule):
     """
     单个 SNN 解码层（连续残差流 + K 帧聚合版本）。
@@ -166,10 +192,13 @@ class SNNDecoderLayer(base.MemoryModule):
 
     def _adaptive_aggregate(self, frames, halt_proj):
         """
-        PonderNet 式自适应 K 帧聚合（动态 K 核心）。
+        PonderNet 式自适应 K 帧聚合（动态 K 核心，torch.compile 融合优化）。
 
         每步计算停止概率 p_k，用几何分布权重加权聚合，
         使不同 token 有不同的有效步数。
+
+        优化: _fused_geometric_halt 将 sigmoid+log1p+cumsum+exp+normalize
+        融合为单 inductor kernel（参见 snn_block._fused_modulation 同一模式）。
 
         数学:
           p_k = σ(halt_proj(frame_k))                 — 停止概率
@@ -189,34 +218,15 @@ class SNNDecoderLayer(base.MemoryModule):
         """
         seq_len, K, batch, D = frames.shape
 
-        # ====== 1. 停止概率 ======
-        halt_logits = halt_proj(frames).squeeze(-1)  # (seq_len, K, batch)
-        p_halt = torch.sigmoid(halt_logits)           # (seq_len, K, batch) ∈ (0,1)
-        # 数值安全: 防止 log(0)
-        p_halt = p_halt.clamp(min=1e-7, max=1.0 - 1e-7)
+        # ====== 1. halt_proj matmul（cuBLAS）+ 融合几何权重（inductor） ======
+        halt_logits = halt_proj(frames).squeeze(-1)    # (seq_len, K, batch)
+        halt_weights = _fused_geometric_halt(halt_logits)  # (seq_len, K, batch), 归一化
 
-        # ====== 2. 几何分布权重 ======
-        # 生存概率 S_k = ∏_{j<k}(1-p_j), 用 log-space 累加
-        log_1_minus_p = torch.log1p(-p_halt)          # (seq_len, K, batch)
-        # exclusive cumsum: S_1=1, S_2=1-p_1, S_3=(1-p_1)(1-p_2), ...
-        log_survive = torch.cumsum(log_1_minus_p, dim=1)
-        log_survive = torch.cat([
-            torch.zeros(seq_len, 1, batch, device=frames.device, dtype=frames.dtype),
-            log_survive[:, :-1, :],
-        ], dim=1)                                     # (seq_len, K, batch)
-        survive = torch.exp(log_survive)              # (seq_len, K, batch)
-
-        # λ_k = p_k · S_k
-        halt_weights = p_halt * survive               # (seq_len, K, batch)
-
-        # 归一化: Σ λ̂_k = 1
-        halt_weights = halt_weights / (halt_weights.sum(dim=1, keepdim=True) + 1e-8)
-
-        # ====== 3. 加权聚合 ======
+        # ====== 2. 加权聚合 ======
         # (seq_len, K, batch, 1) × (seq_len, K, batch, D) → sum → (seq_len, batch, D)
         aggregated = (frames * halt_weights.unsqueeze(-1)).sum(dim=1)
 
-        # ====== 4. Ponder cost: E[K] ======
+        # ====== 3. Ponder cost: E[K] ======
         steps = torch.arange(1, K + 1, device=frames.device, dtype=frames.dtype)
         expected_k = (halt_weights * steps[None, :, None]).sum(dim=1)  # (seq_len, batch)
         ponder_cost = expected_k.mean()               # scalar

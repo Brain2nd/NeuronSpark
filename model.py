@@ -1,14 +1,15 @@
 """
-SNNLanguageModel v7.5b: SNN 隐状态空间语言模型（连续残差流 + FP16 边界编解码）
+SNNLanguageModel v7.6: SNN 隐状态空间语言模型（连续残差流 + K 帧聚合 + FP16 边界编解码）
 
 架构（三段式边界）：
   model.encode(token_ids)    → spike_seq       # 输入边界：embed → FP16 位提取 → 16帧 spike
-  model.snn_forward(spike)   → h_out           # 纯 SNN 核心（连续残差流，20 层）
+  model.snn_forward(spike)   → h_out           # 纯 SNN 核心（连续残差流，20 层，含 K 帧聚合）
   model.decode(h_out, seq)   → logits          # 输出边界：PLIFNode → spike → FP16 位重建 → proj → norm → tied head
 
-编解码对称性：
-  encode: 连续值 → IEEE 754 float16 位提取 → 16 帧 binary {0,1}（detach，固定预处理）
-  decode: 16 帧 binary {0,1} ← 输出神经元 ← 连续 h → IEEE 754 位重建 → 连续值（可微分）
+v7.6 核心变更：
+  - SNNBlock/SNNFFN 输出连续值（V_post 经 W_out，非 spike），移除 output_neuron
+  - 每层 K 帧聚合：SNN 子层输出 K 帧 mean → out_proj → 广播回 K 帧 → 残差
+  - β 梯度通过 V_post 直接传播（无 surrogate 瓶颈）+ K 帧聚合提供 token 级信号
 
 数学原理见 SNN_SELECTIVE_STATE_SPACE.md 第 7 节。
 """
@@ -89,8 +90,8 @@ class SNNLanguageModel(nn.Module):
         self.layers = nn.ModuleList([
             SNNDecoderLayer(
                 D=D, N=N, D_ff=D_ff, v_th_min=v_th_min,
-                block_output_v_threshold=0.05,
-                ffn_output_v_threshold=0.15,
+                ffn_v_threshold=0.15,
+                K=K,
                 num_layers=num_layers,
                 layer_idx=i,
             )
@@ -285,7 +286,7 @@ class SNNLanguageModel(nn.Module):
         target_ids: torch.Tensor = None,
     ) -> SNNModelOutput:
         """
-        前向传播（v7.5b: 三段式边界架构）。
+        前向传播（v7.6: 三段式边界架构 + K 帧聚合）。
 
         encode → spike_seq           # 输入边界（embed → FP16 位提取）
         snn_forward → h_out          # 纯 SNN 核心（连续残差流）
@@ -419,10 +420,7 @@ class SNNLanguageModel(nn.Module):
             groups['b_beta'].append(block.b_beta)
             groups['b_alpha'].append(block.b_alpha)
             groups['b_th'].append(block.b_th)
-            groups['block_output_neuron'].extend([
-                block.output_neuron.w,
-                block.output_neuron.v_th,
-            ])
+            # block.output_neuron 已移除（v7.6: V_post 输出 + K 帧聚合）
 
             # SNNFFN 参数
             groups['ffn_gate_proj'].append(ffn.gate_proj.weight)
@@ -432,7 +430,7 @@ class SNNLanguageModel(nn.Module):
             groups['ffn_neurons'].extend([
                 ffn.gate_neuron.w, ffn.gate_neuron.v_th,
                 ffn.up_neuron.w, ffn.up_neuron.v_th,
-                ffn.output_neuron.w, ffn.output_neuron.v_th,
+                # ffn.output_neuron 已移除（v7.6）
             ])
 
         return groups

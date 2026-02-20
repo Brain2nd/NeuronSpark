@@ -12,7 +12,7 @@ SiLU gating → spike 巧合检测（AND 门）：
   spike_in (p~20%) → gate_proj → gate_neuron → gate_spike (p~30%)
   spike_in (p~20%) → up_proj   → up_neuron   → up_spike (p~30%)
                       gate_spike AND up_spike → gated (p~9%)
-                      down_proj(gated) + skip_proj(spike_in) → output_neuron → spike_out
+                      down_proj(gated) + skip_proj(spike_in) → 连续输出
 """
 
 import math
@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from spikingjelly.activation_based import base, layer, surrogate
 
 from .plif_node import PLIFNode
-from .parallel_scan import plif_fixed_param_forward, plif_parallel_forward, plif_rowparam_forward
+from .parallel_scan import plif_rowparam_forward
 
 
 class SNNFFN(base.MemoryModule):
@@ -74,14 +74,6 @@ class SNNFFN(base.MemoryModule):
             v_threshold=output_v_threshold,
             surrogate_function=surrogate_function,
         )
-        # output_neuron: 输出发放
-        self.output_neuron = PLIFNode(
-            dim=D,
-            init_tau=2.0,
-            v_threshold=output_v_threshold,
-            surrogate_function=surrogate_function,
-        )
-
         # ====== 参数初始化 ======
         self._initialize_parameters(num_layers)
 
@@ -110,7 +102,7 @@ class SNNFFN(base.MemoryModule):
             spike_in_seq: (TK, batch, D) — 全部 T×K 帧的输入 spike
 
         Returns:
-            spike_out_seq: (TK, batch, D) — 全部 T×K 帧的输出 spike
+            continuous_out: (TK, batch, D) — 全部 T×K 帧的连续输出
         """
         TK, batch, D = spike_in_seq.shape
         D_ff = self.D_ff
@@ -162,23 +154,8 @@ class SNNFFN(base.MemoryModule):
         gated_flat = gated.reshape(TK * batch, D_ff)
         I_out = F.linear(gated_flat, self.down_proj.weight).reshape(TK, batch, D) + I_skip
 
-        # ====== Phase 4: 输出神经元 parallel scan（D 维可学习 β 和 V_th） ======
-        beta_out = self.output_neuron.beta  # (D,)
-        v_init_out = self.output_neuron.v
-        if isinstance(v_init_out, float):
-            v_init_out = torch.zeros(batch, D, device=flat.device, dtype=flat.dtype)
-        u_out = (1.0 - beta_out) * I_out  # (D,) broadcast → (TK, batch, D)
-
-        beta_out_row = beta_out.unsqueeze(0).expand(batch, D).contiguous()
-        v_th_out_row = self.output_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
-
-        spike_out, V_post_out = plif_rowparam_forward(
-            beta_out_row, u_out, v_th_out_row, v_init_out,
-            surrogate_function=self.output_neuron.surrogate_function,
-        )
-        self.output_neuron.v = V_post_out[-1].detach()
-
-        return spike_out  # (TK, batch, D)
+        # output_neuron 已移除：连续值由层级 K 帧聚合处理
+        return I_out  # (TK, batch, D), 连续值
 
     def single_step_forward(self, spike_in: torch.Tensor) -> torch.Tensor:
         """
@@ -188,7 +165,7 @@ class SNNFFN(base.MemoryModule):
             spike_in: 二值脉冲输入, shape (batch, D), 值域 {0, 1}
 
         Returns:
-            spike_out: 二值脉冲输出, shape (batch, D), 值域 {0, 1}
+            continuous_out: 连续输出, shape (batch, D)
         """
         # 门控路径
         gate_spike = self.gate_neuron(self.gate_proj(spike_in))  # {0,1}^D_ff
@@ -199,6 +176,6 @@ class SNNFFN(base.MemoryModule):
         # AND 门：巧合检测
         gated = gate_spike * up_spike  # {0,1}^D_ff
 
-        # 降维 + 残差 → 输出神经元
+        # 降维 + 残差
         I_out = self.down_proj(gated) + self.skip_proj(spike_in)  # R^D
-        return self.output_neuron(I_out)  # {0,1}^D
+        return I_out  # 连续值

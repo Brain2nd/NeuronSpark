@@ -35,7 +35,6 @@ import argparse
 import warnings
 
 import torch
-from torch import optim
 from torch.utils.data import DataLoader
 from contextlib import nullcontext
 
@@ -43,6 +42,7 @@ from transformers import AutoTokenizer
 
 from model import SNNLanguageModel
 from dataset import PretrainDataset
+from atomic_ops import SNNAdamW
 
 # 忽略警告信息
 warnings.filterwarnings('ignore')
@@ -230,10 +230,7 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
         # 梯度累积：每 accumulation_steps 步更新一次（对齐教程 L113-125）
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
-            # Natural Gradient: 补偿 b_beta/b_alpha 的 sigmoid/softplus 梯度衰减
-            model.compensate_modulation_gradients()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
+            scaler.step(optimizer)     # 内部自动：补偿 → 裁剪 → AdamW → Lyapunov → 多样性
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
@@ -358,19 +355,52 @@ if __name__ == "__main__":
     # GradScaler（对齐教程 L312）
     scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
 
-    # Adam 优化器（分组学习率：神经元参数 neuron_lr_mult × base_lr）
+    # SNNAdamW 优化器（分组 weight_decay + 神经动力学增强）
     # 神经元参数（PLIFNode w/v_th, 调制偏置 b_beta/b_alpha/b_th）梯度天然较弱
     # （surrogate sigmoid 窗口窄），需要更高 lr 才能跟上权重矩阵的漂移速度。
     _pg = model.get_param_groups()
-    _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th',
+
+    # 设计文档 9.3 的分组 weight_decay
+    _wd_groups = {
+        'embedding': 0.1, 'decode': 0.1,
+        'W_in': 0.1, 'W_beta': 0.1, 'W_alpha': 0.1, 'W_th': 0.1, 'W_omega': 0.1,
+        'W_gate': 0.1, 'W_skip': 0.1, 'W_out': 0.1,
+        'residual_projs': 0.1,
+        'ffn_gate_proj': 0.1, 'ffn_up_proj': 0.1, 'ffn_down_proj': 0.1, 'ffn_skip_proj': 0.1,
+        # wd=0 组
+        'b_beta': 0.0, 'b_alpha': 0.0, 'b_th': 0.0, 'b_omega': 0.0,
+        'input_neurons': 0.0, 'block_output_neuron': 0.0, 'ffn_neurons': 0.0, 'output_neuron': 0.0,
+        'norm': 0.0, 'rms_norms': 0.0,
+    }
+
+    # dynamics 标记（b_th 用于 V_th 上界钳制）
+    _dynamics_map = {'b_beta': 'b_beta', 'b_alpha': 'b_alpha', 'b_omega': 'b_omega',
+                     'b_th': 'b_th'}
+
+    # 神经元参数 lr_mult
+    _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th', 'b_omega',
                     'block_output_neuron', 'ffn_neurons', 'output_neuron'}
-    neuron_params = [p for k in _neuron_keys for p in _pg[k]]
-    other_params = [p for k, ps in _pg.items() if k not in _neuron_keys for p in ps]
-    optimizer = optim.Adam([
-        {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0},
-        {'params': neuron_params, 'lr': args.learning_rate * args.neuron_lr_mult,
-         'lr_mult': float(args.neuron_lr_mult)},
-    ])
+
+    param_groups = []
+    for key, params in _pg.items():
+        if not params:
+            continue
+        lr_mult = float(args.neuron_lr_mult) if key in _neuron_keys else 1.0
+        param_groups.append({
+            'params': params,
+            'lr': args.learning_rate * lr_mult,
+            'lr_mult': lr_mult,
+            'weight_decay': _wd_groups.get(key, 0.1),
+            'dynamics': _dynamics_map.get(key),
+            'N': args.N if key in ('b_beta', 'b_alpha', 'b_omega') else None,
+        })
+
+    optimizer = SNNAdamW(
+        param_groups,
+        lr=args.learning_rate,
+        betas=(0.9, 0.95),
+        grad_clip=args.grad_clip,
+    )
 
     # 恢复 checkpoint
     tokens_seen = 0

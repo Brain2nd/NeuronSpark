@@ -555,6 +555,221 @@ if _HAS_TRITON:
 
             return grad_beta, grad_u, grad_v_th, grad_v_init, None
 
+    # ============================================================
+    # Fused RF (Resonate-and-Fire) PLIF kernels
+    # ============================================================
+    # 二阶耦合动力学: V_pre = β·V_post_prev - ω·W_prev + u
+    #                 W_new = ω·V_post_prev + β·W_prev
+    # spike/reset 仅作用于 V, W 不 reset
+
+    @triton.jit
+    def _fused_rf_plif_fwd_kernel(
+        BETA_ptr, OMEGA_ptr, U_ptr, VTH_ptr, VINIT_ptr, WINIT_ptr,
+        SPIKE_ptr, VPOST_ptr, W_ptr,
+        K, num_cols,
+        BLOCK: tl.constexpr,
+    ):
+        """Fused Resonate-and-Fire PLIF forward.
+
+        Per column:
+          v, w = v_init, w_init
+          for k = 0..K-1:
+            v_pre = beta[k]*v - omega[k]*w + u[k]
+            w_new = omega[k]*v + beta[k]*w
+            spike[k] = Θ(v_pre - v_th[k])
+            v = v_pre - v_th[k]*spike[k]
+            w = w_new
+        """
+        pid = tl.program_id(0)
+        cols = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < num_cols
+
+        v = tl.load(VINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(WINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+        for k in range(K):
+            off = k * num_cols + cols
+            beta = tl.load(BETA_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            omega = tl.load(OMEGA_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            u = tl.load(U_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            vth = tl.load(VTH_ptr + off, mask=mask, other=0.0).to(tl.float32)
+
+            v_pre = beta * v - omega * w + u
+            w_new = omega * v + beta * w
+
+            spike = tl.where(v_pre >= vth, 1.0, 0.0)
+            v = v_pre - vth * spike  # soft reset V
+            w = w_new               # W not reset
+
+            tl.store(SPIKE_ptr + off, spike, mask=mask)
+            tl.store(VPOST_ptr + off, v, mask=mask)
+            tl.store(W_ptr + off, w, mask=mask)
+
+    @triton.jit
+    def _fused_rf_plif_bwd_kernel(
+        BETA_ptr, OMEGA_ptr, VTH_ptr, VINIT_ptr, WINIT_ptr,
+        VPOST_ptr, W_ptr, SPIKE_ptr,
+        GRAD_SPIKE_ptr, GRAD_VPOST_ptr,
+        GRAD_BETA_ptr, GRAD_OMEGA_ptr, GRAD_U_ptr, GRAD_VTH_ptr,
+        GRAD_VINIT_ptr, GRAD_WINIT_ptr,
+        K, num_cols, ALPHA,
+        BLOCK: tl.constexpr,
+    ):
+        """Fused RF PLIF backward with dual accumulators (V, W chains).
+
+        Reverse accumulation:
+          acc_v, acc_w = 0, 0
+          for k = K-1 downto 0:
+            total_gV = grad_V_post[k] + acc_v
+            total_gW = acc_w
+            grad_v_pre = grad_spike[k]*sg + total_gV
+            grad_beta[k] = grad_v_pre*V_post[k-1] + total_gW*W[k-1]
+            grad_omega[k] = grad_v_pre*(-W[k-1]) + total_gW*V_post[k-1]
+            grad_u[k] = grad_v_pre
+            grad_v_th[k] = -grad_spike[k]*sg - total_gV*spike[k]
+            acc_v = grad_v_pre*beta[k] + total_gW*omega[k]
+            acc_w = grad_v_pre*(-omega[k]) + total_gW*beta[k]
+          grad_v_init = acc_v
+          grad_w_init = acc_w
+        """
+        pid = tl.program_id(0)
+        cols = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < num_cols
+
+        acc_v = tl.zeros([BLOCK], dtype=tl.float32)
+        acc_w = tl.zeros([BLOCK], dtype=tl.float32)
+
+        for k_rev in range(K):
+            k = K - 1 - k_rev
+            off = k * num_cols + cols
+
+            beta = tl.load(BETA_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            omega = tl.load(OMEGA_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            vth = tl.load(VTH_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            v_post = tl.load(VPOST_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            w_cur = tl.load(W_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            spike = tl.load(SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
+
+            g_s = tl.load(GRAD_SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            g_V = tl.load(GRAD_VPOST_ptr + off, mask=mask, other=0.0).to(tl.float32)
+
+            # Previous states
+            if k > 0:
+                v_prev = tl.load(
+                    VPOST_ptr + (k - 1) * num_cols + cols,
+                    mask=mask, other=0.0,
+                ).to(tl.float32)
+                w_prev = tl.load(
+                    W_ptr + (k - 1) * num_cols + cols,
+                    mask=mask, other=0.0,
+                ).to(tl.float32)
+            else:
+                v_prev = tl.load(VINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+                w_prev = tl.load(WINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+            # Sigmoid surrogate gradient
+            x = v_post - vth * (1.0 - spike)  # = V_pre - v_th
+            neg_ax = -ALPHA * x
+            neg_ax = tl.where(neg_ax > 88.0, 88.0, neg_ax)
+            sig = 1.0 / (1.0 + tl.exp(neg_ax))
+            sg = ALPHA * sig * (1.0 - sig)
+
+            total_gV = g_V + acc_v
+            total_gW = acc_w
+            grad_v_pre = g_s * sg + total_gV
+
+            # Parameter gradients
+            tl.store(GRAD_BETA_ptr + off, grad_v_pre * v_prev + total_gW * w_prev, mask=mask)
+            tl.store(GRAD_OMEGA_ptr + off, grad_v_pre * (-w_prev) + total_gW * v_prev, mask=mask)
+            tl.store(GRAD_U_ptr + off, grad_v_pre, mask=mask)
+            tl.store(GRAD_VTH_ptr + off, -g_s * sg - total_gV * spike, mask=mask)
+
+            # Propagate accumulators (transpose of forward transition matrix)
+            acc_v = grad_v_pre * beta + total_gW * omega
+            acc_w = grad_v_pre * (-omega) + total_gW * beta
+
+        tl.store(GRAD_VINIT_ptr + cols, acc_v, mask=mask)
+        tl.store(GRAD_WINIT_ptr + cols, acc_w, mask=mask)
+
+    class _TritonRFPLIFForward(torch.autograd.Function):
+        """Fused Triton Resonate-and-Fire PLIF forward + backward."""
+
+        _BLOCK = 128
+
+        @staticmethod
+        def forward(ctx, beta, omega, u, v_th, v_init, w_init, alpha):
+            beta_c = beta.contiguous()
+            omega_c = omega.contiguous()
+            u_c = u.contiguous()
+            v_th_c = v_th.contiguous()
+            v_init_c = v_init.contiguous()
+            w_init_c = w_init.contiguous()
+
+            K = beta_c.shape[0]
+            num_cols = beta_c[0].numel()
+
+            spike = torch.empty_like(u_c)
+            V_post = torch.empty_like(u_c)
+            W = torch.empty_like(u_c)
+
+            BLOCK = _TritonRFPLIFForward._BLOCK
+            grid = ((num_cols + BLOCK - 1) // BLOCK,)
+
+            _fused_rf_plif_fwd_kernel[grid](
+                beta_c, omega_c, u_c, v_th_c, v_init_c, w_init_c,
+                spike, V_post, W,
+                K, num_cols,
+                BLOCK=BLOCK,
+            )
+
+            if any(ctx.needs_input_grad[:6]):
+                ctx.save_for_backward(
+                    beta_c, omega_c, v_th_c, v_init_c, w_init_c,
+                    V_post, W, spike,
+                )
+            ctx.K = K
+            ctx.num_cols = num_cols
+            ctx.alpha = alpha
+
+            return spike, V_post, W
+
+        @staticmethod
+        def backward(ctx, grad_spike, grad_V_post, grad_W):
+            beta, omega, v_th, v_init, w_init, V_post, W, spike = ctx.saved_tensors
+            K = ctx.K
+            num_cols = ctx.num_cols
+            alpha = ctx.alpha
+
+            if grad_spike is None:
+                grad_spike = torch.zeros_like(spike)
+            if grad_V_post is None:
+                grad_V_post = torch.zeros_like(V_post)
+
+            grad_spike_c = grad_spike.contiguous()
+            grad_V_post_c = grad_V_post.contiguous()
+
+            grad_beta = torch.empty_like(beta)
+            grad_omega = torch.empty_like(omega)
+            grad_u = torch.empty_like(beta)
+            grad_v_th = torch.empty_like(v_th)
+            grad_v_init = torch.empty_like(v_init)
+            grad_w_init = torch.empty_like(w_init)
+
+            BLOCK = _TritonRFPLIFForward._BLOCK
+            grid = ((num_cols + BLOCK - 1) // BLOCK,)
+
+            _fused_rf_plif_bwd_kernel[grid](
+                beta, omega, v_th, v_init, w_init,
+                V_post, W, spike,
+                grad_spike_c, grad_V_post_c,
+                grad_beta, grad_omega, grad_u, grad_v_th,
+                grad_v_init, grad_w_init,
+                K, num_cols, float(alpha),
+                BLOCK=BLOCK,
+            )
+
+            return grad_beta, grad_omega, grad_u, grad_v_th, grad_v_init, grad_w_init, None
+
 
 # ============================================================
 # Hillis-Steele parallel prefix scan (CPU fallback)
@@ -844,3 +1059,83 @@ def plif_fixed_param_forward(
         beta, u, v_th, v_init, max_iter, surrogate_function,
     )
     return spike, V_post
+
+
+# ============================================================
+# RF PLIF parallel forward (Resonate-and-Fire)
+# ============================================================
+
+def rf_plif_parallel_forward(
+    beta: torch.Tensor,
+    omega: torch.Tensor,
+    u: torch.Tensor,
+    v_th: torch.Tensor,
+    v_init: torch.Tensor,
+    w_init: torch.Tensor,
+    surrogate_function=None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Resonate-and-Fire PLIF 并行前向：二阶耦合 V/W 动力学。
+
+    求解:
+      V_pre[k] = β[k]·V_post[k-1] - ω[k]·W[k-1] + u[k]
+      W[k]     = ω[k]·V_post[k-1] + β[k]·W[k-1]
+      s[k]     = Θ(V_pre[k] - V_th[k])
+      V_post[k]= V_pre[k] - V_th[k]·s[k]
+
+    物理直觉：V = 位移, W = 速度, ω = 弹簧刚度。
+    脉冲响应 V[t] ∝ r^t·cos(θt)，阻尼振荡（共振效应）。
+
+    Args:
+        beta:  (K, *shape) — 衰减/阻尼系数
+        omega: (K, *shape) — 振荡频率
+        u:     (K, *shape) — 输入电流 α·I
+        v_th:  (K, *shape) — 动态阈值
+        v_init: (*shape) — 初始膜电位 V[0]
+        w_init: (*shape) — 初始振荡状态 W[0]
+        surrogate_function: surrogate gradient 函数
+
+    Returns:
+        spike:  (K, *shape) — 二值 spike
+        V_post: (K, *shape) — 发放后膜电位
+        W:      (K, *shape) — 振荡状态
+    """
+    # Fused Triton path
+    if (_HAS_TRITON and beta.is_cuda and surrogate_function is not None
+            and hasattr(surrogate_function, 'alpha')
+            and type(surrogate_function).__name__ == 'Sigmoid'):
+        alpha = float(surrogate_function.alpha)
+        spike, V_post, W = _TritonRFPLIFForward.apply(
+            beta, omega, u, v_th, v_init, w_init, alpha,
+        )
+        return spike, V_post, W
+
+    # CPU / non-Sigmoid fallback: sequential loop
+    K = beta.shape[0]
+    device = beta.device
+    dtype = beta.dtype
+
+    spike_list = []
+    V_post_list = []
+    W_list = []
+
+    v = v_init
+    w = w_init
+
+    for k in range(K):
+        v_pre = beta[k] * v - omega[k] * w + u[k]
+        w_new = omega[k] * v + beta[k] * w
+
+        if surrogate_function is not None:
+            s = surrogate_function(v_pre - v_th[k])
+        else:
+            s = (v_pre >= v_th[k]).float()
+
+        v = v_pre - v_th[k] * s
+        w = w_new
+
+        spike_list.append(s)
+        V_post_list.append(v)
+        W_list.append(w)
+
+    return torch.stack(spike_list), torch.stack(V_post_list), torch.stack(W_list)

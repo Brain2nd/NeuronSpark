@@ -88,7 +88,7 @@ class SNNLanguageModel(nn.Module):
         # ====== SNN Decoder Layers ======
         self.layers = nn.ModuleList([
             SNNDecoderLayer(
-                D=D, N=N, D_ff=D_ff, v_th_min=v_th_min,
+                D=D, N=N, K=K, D_ff=D_ff, v_th_min=v_th_min,
                 block_output_v_threshold=0.05,
                 ffn_output_v_threshold=0.15,
                 num_layers=num_layers,
@@ -152,14 +152,14 @@ class SNNLanguageModel(nn.Module):
 
         v_init = self.output_neuron.v
         if isinstance(v_init, float):
-            v_init = torch.zeros(batch, D, device=h.device, dtype=h.dtype)
+            v_init = self.output_neuron.expand_v_init(batch, h.device, h.dtype)
 
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = self.output_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
 
         spike, V_post = plif_rowparam_forward(
             beta_row, u, v_th_row, v_init,
-            surrogate_function=self.output_neuron.surrogate_function,
+            surrogate_function=self.output_neuron.get_surrogate(u),
         )
 
         self.output_neuron.v = V_post[-1].detach()
@@ -350,6 +350,12 @@ class SNNLanguageModel(nn.Module):
                     softplus_deriv = torch.sigmoid(block.b_alpha.data).clamp(min=0.1)
                     block.b_alpha.grad.div_(softplus_deriv)
 
+            # b_omega: softplus 补偿（同 b_alpha）
+            if block.b_omega.grad is not None:
+                with torch.no_grad():
+                    softplus_deriv = torch.sigmoid(block.b_omega.data).clamp(min=0.1)
+                    block.b_omega.grad.div_(softplus_deriv)
+
             # b_th: |·| 导数为 ±1，无衰减，不需要补偿
 
     def get_param_groups(self) -> dict[str, list[nn.Parameter]]:
@@ -362,23 +368,26 @@ class SNNLanguageModel(nn.Module):
             'norm': [self.norm.gain],
             'decode': list(self.decode_proj.parameters()),
             # 输出神经元
-            'output_neuron': [self.output_neuron.w, self.output_neuron.v_th],
+            'output_neuron': [self.output_neuron.w, self.output_neuron.v_th,
+                              self.output_neuron.v_init],
             # RMSNorm（Pre-LN 分支归一化）
             'rms_norms': [self.output_norm.weight],
             # 残差流组件
             'residual_projs': [],
             'input_neurons': [],
-            # SNNBlock 参数（v7: 无 W_V）
+            # SNNBlock 参数（v7.8: +W_omega/b_omega）
             'W_in': [],
             'W_beta': [],
             'W_alpha': [],
             'W_th': [],
+            'W_omega': [],
             'W_gate': [],
             'W_skip': [],
             'W_out': [],
             'b_beta': [],
             'b_alpha': [],
             'b_th': [],
+            'b_omega': [],
             'block_output_neuron': [],
             # SNNFFN 参数
             'ffn_gate_proj': [],
@@ -400,8 +409,10 @@ class SNNLanguageModel(nn.Module):
             groups['input_neurons'].extend([
                 layer_module.input_neuron1.w,
                 layer_module.input_neuron1.v_th,
+                layer_module.input_neuron1.v_init,
                 layer_module.input_neuron2.w,
                 layer_module.input_neuron2.v_th,
+                layer_module.input_neuron2.v_init,
             ])
             groups['rms_norms'].extend([
                 layer_module.block_norm.weight,
@@ -413,15 +424,20 @@ class SNNLanguageModel(nn.Module):
             groups['W_beta'].extend([block.W_beta_x.weight])
             groups['W_alpha'].extend([block.W_alpha_x.weight])
             groups['W_th'].extend([block.W_th_x.weight])
+            groups['W_omega'].extend([block.W_omega_x.weight])
             groups['W_gate'].append(block.W_gate.weight)
             groups['W_skip'].append(block.W_skip.weight)
             groups['W_out'].append(block.W_out.weight)
             groups['b_beta'].append(block.b_beta)
             groups['b_alpha'].append(block.b_alpha)
             groups['b_th'].append(block.b_th)
+            groups['b_omega'].append(block.b_omega)
             groups['block_output_neuron'].extend([
                 block.output_neuron.w,
                 block.output_neuron.v_th,
+                block.output_neuron.v_init,
+                block.hidden_neuron.v_init,
+                block.hidden_neuron.w_init,
             ])
 
             # SNNFFN 参数
@@ -430,9 +446,9 @@ class SNNLanguageModel(nn.Module):
             groups['ffn_down_proj'].append(ffn.down_proj.weight)
             groups['ffn_skip_proj'].append(ffn.skip_proj.weight)
             groups['ffn_neurons'].extend([
-                ffn.gate_neuron.w, ffn.gate_neuron.v_th,
-                ffn.up_neuron.w, ffn.up_neuron.v_th,
-                ffn.output_neuron.w, ffn.output_neuron.v_th,
+                ffn.gate_neuron.w, ffn.gate_neuron.v_th, ffn.gate_neuron.v_init,
+                ffn.up_neuron.w, ffn.up_neuron.v_th, ffn.up_neuron.v_init,
+                ffn.output_neuron.w, ffn.output_neuron.v_th, ffn.output_neuron.v_init,
             ])
 
         return groups

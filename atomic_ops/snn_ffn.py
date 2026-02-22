@@ -116,15 +116,17 @@ class SNNFFN(base.MemoryModule):
         D_ff = self.D_ff
         flat = spike_in_seq.reshape(TK * batch, D)
 
-        # ====== Phase 1: 批量投影（gate+up 合并为 1 次 matmul） ======
-        W_gate_up = torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0)
-        I_gate_up = F.linear(flat, W_gate_up).reshape(TK, batch, 2 * D_ff)
-        I_skip = F.linear(flat, self.skip_proj.weight).reshape(TK, batch, D)
+        # ====== Phase 1: 批量投影（gate+up+skip 合并为 1 次 GEMM: 3 launch → 1） ======
+        W_all = torch.cat([
+            self.gate_proj.weight, self.up_proj.weight, self.skip_proj.weight,
+        ], dim=0)  # (2*D_ff + D, D)
+        proj_all = F.linear(flat, W_all)  # (TK*B, 2*D_ff + D)
+        I_gate_up = proj_all[:, :2 * D_ff].reshape(TK, batch, 2 * D_ff)
+        I_skip = proj_all[:, 2 * D_ff:].reshape(TK, batch, D)
 
         # ====== Phase 2: Gate+Up 合并 PLIF scan（row-param kernel） ======
         beta_gate = self.gate_neuron.beta  # (D_ff,)
         beta_up = self.up_neuron.beta      # (D_ff,)
-        surr = self.gate_neuron.surrogate_function
 
         # u_merged: 向量缩放（D_ff 维 β 直接 cat，无需 expand）
         scale_row = torch.cat([1.0 - beta_gate, 1.0 - beta_up])  # (2*D_ff,)
@@ -137,16 +139,18 @@ class SNNFFN(base.MemoryModule):
         v_th_row = torch.cat([self.gate_neuron.v_th, self.up_neuron.v_th])  # (2*D_ff,)
         v_th_row = v_th_row.unsqueeze(0).expand(batch, 2 * D_ff).contiguous()
 
-        # v_init_merged: (batch, 2*D_ff)
+        # v_init_merged: (batch, 2*D_ff) — 可学习初始膜电位
         v_init_gate = self.gate_neuron.v
         if isinstance(v_init_gate, float):
-            v_init_gate = torch.zeros(batch, D_ff, device=flat.device, dtype=flat.dtype)
+            v_init_gate = self.gate_neuron.expand_v_init(batch, flat.device, flat.dtype)
         v_init_up = self.up_neuron.v
         if isinstance(v_init_up, float):
-            v_init_up = torch.zeros(batch, D_ff, device=flat.device, dtype=flat.dtype)
+            v_init_up = self.up_neuron.expand_v_init(batch, flat.device, flat.dtype)
         v_init_merged = torch.cat([v_init_gate, v_init_up], dim=-1)
 
         # Row-param PLIF scan: beta/v_th 从寄存器读取，不占显存带宽
+        # 自适应 surrogate: 根据 u_merged 的分布动态调整 alpha
+        surr = self.gate_neuron.get_surrogate(u_merged)
         spike_merged, V_post_merged = plif_rowparam_forward(
             beta_row, u_merged, v_th_row, v_init_merged,
             surrogate_function=surr,
@@ -166,7 +170,7 @@ class SNNFFN(base.MemoryModule):
         beta_out = self.output_neuron.beta  # (D,)
         v_init_out = self.output_neuron.v
         if isinstance(v_init_out, float):
-            v_init_out = torch.zeros(batch, D, device=flat.device, dtype=flat.dtype)
+            v_init_out = self.output_neuron.expand_v_init(batch, flat.device, flat.dtype)
         u_out = (1.0 - beta_out) * I_out  # (D,) broadcast → (TK, batch, D)
 
         beta_out_row = beta_out.unsqueeze(0).expand(batch, D).contiguous()
@@ -174,7 +178,7 @@ class SNNFFN(base.MemoryModule):
 
         spike_out, V_post_out = plif_rowparam_forward(
             beta_out_row, u_out, v_th_out_row, v_init_out,
-            surrogate_function=self.output_neuron.surrogate_function,
+            surrogate_function=self.output_neuron.get_surrogate(u_out),
         )
         self.output_neuron.v = V_post_out[-1].detach()
 

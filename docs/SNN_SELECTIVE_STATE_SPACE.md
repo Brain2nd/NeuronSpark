@@ -2178,7 +2178,10 @@ accumulation_steps = 32  # effective batch = 2 × 32 = 64
 | v7.2 | 完成 | Triton linear_recurrence kernel，33× vs Hillis-Steele |
 | v7.3 | 完成 | Fused PLIF kernel（scan + spike + reset + surrogate），4-20× |
 | v7.4 | 完成 | Row-param PLIF kernel + torch.compile fused modulation，1.74× 整层 |
-| v7.5 | **当前** | 连续残差流 + PLIFNode 输入（V_th 原生归一化），解决 20 层梯度消失 |
+| v7.5 | 完成 | 连续残差流 + PLIFNode 输入（V_th 原生归一化），解决 20 层梯度消失 |
+| v7.6 | **规划** | **位权脉冲编码（MSB-first）+ PonderNet 自适应精度停止 — v7.5 核心升级** |
+| v8.0 | 对照实验 | 全膜电位输出（V_post 替代 spike）+ PonderNet 自适应 K + embed repeat 编解码（LIAF 混合架构） |
+| v8.1 | 规划 | 二阶振荡动力学（RF 神经元，ω(t)）+ 逐通道自适应停止（2D PonderNet，halt D→D） |
 
 ### 10.2 当前训练配置（v7.5）
 
@@ -2212,6 +2215,409 @@ TPS: ~120 tokens/sec
 3. **输出 PLIFNode v_th 自适应**：深层级联衰减导致 firing rate 降低，动态 V_th 是否需要显式补偿？
 4. **模型规模扩展**：D=1024, L=22 的配置尚未实验。
 
+### 10.5 v7.5 待改进项
+
+以下两项改进专门针对 v7.5 的 binary spike 架构。v8.0 因使用 V_post 连续输出 + PonderNet 自适应步数，这两项的优先级较低。
+
+#### 10.5.1 可学习初始膜电位 (Learnable Initial Membrane Potential)
+
+**问题**
+
+当前所有神经元 `register_memory('v', 0.)`，每个新序列 V[0]=0。在固定 K=16 步的 v7.5 中，前几步纯粹在充电暖机，浪费了计算步数。尤其对短时间常数神经元（低 β），V 很快达到稳态，但对长时间常数神经元（高 β），V[0]=0 意味着需要多步才能充到有意义的水平。
+
+**方案**
+
+将 V[0] 从固定零值改为可学习参数：
+
+```python
+# 当前
+self.register_memory('v', 0.)
+
+# 改进
+self.v_init = nn.Parameter(torch.zeros(dim))
+self.register_memory('v', 0.)  # 运行时仍用 register_memory 管理状态
+
+# reset 时恢复到学习到的 V[0]（而非零）
+def reset(self):
+    self.v = self.v_init.clone()
+```
+
+每个神经元学到自己的最优初始状态，等于省了几步暖机时间。
+
+**预期收益**
+
+- 在固定 K=16 步中，有效计算步数增加（不再浪费前几步充电）
+- 对高 β 神经元收益最大（暖机时间最长的恰好是记忆最重要的）
+
+**v8.0 不需要的原因**：PonderNet 自适应步数已经解决了"需要多少步"的问题，且 V_post 连续输出不依赖 spike 发放，暖机影响小。
+
+**文献参考**
+
+- Rethinking the Membrane Dynamics and Optimization Objectives of Spiking Neural Networks (NeurIPS 2024): 证明 learnable IMP 显著提升 SNN 准确率
+
+#### 10.5.2 自适应 Surrogate Gradient (Adaptive Surrogate Gradient)
+
+**问题**
+
+v7.5 全链路 binary spike，surrogate gradient 是唯一的梯度通路。当前使用固定 `Sigmoid(alpha=4.0)`，surrogate 宽度在所有层、所有时间步相同。但实际膜电位分布会漂移：
+
+- 浅层：膜电位分布窄（刚从编码进来），固定 alpha 可能太宽 → 梯度不精确
+- 深层：膜电位分布可能变宽或偏移，固定 alpha 可能太窄 → 梯度截断
+- 训练初期 vs 后期：V 分布随训练进程变化，固定 surrogate 始终存在失配
+
+**方案**
+
+根据当前膜电位分布的统计量（均值 μ_V、标准差 σ_V）动态调整 surrogate 参数：
+
+$$\alpha_{adaptive} = \alpha_0 \cdot \frac{\sigma_0}{\sigma_V + \epsilon}$$
+
+其中 $\sigma_0$ 是目标标准差（超参数），$\sigma_V$ 是当前层当前步的 V 分布标准差。当 V 分布变宽时 α 自动缩小（surrogate 变宽以覆盖更多神经元），反之亦然。
+
+**与 compensate_modulation_gradients 的关系**
+
+两者互补，解决不同问题：
+
+| 机制 | 补偿对象 | 作用位置 |
+|------|----------|----------|
+| `compensate_modulation_gradients` | sigmoid/softplus 对 b_beta/b_alpha 的梯度衰减 | 调制参数（β, α 的偏置） |
+| Adaptive surrogate gradient | surrogate 形状与 V 分布的失配 | 所有 spike 函数的梯度近似 |
+
+**v8.0 不需要的原因**：V_post 连续输出使梯度直接通过膜电位流过，surrogate gradient 仅在内部 reset 机制中起作用，不再是主要梯度通路。
+
+**文献参考**
+
+- Adaptive Gradient Learning for Spiking Neural Networks by Exploiting Membrane Potential Dynamics (IJCAI 2025)
+
+#### 10.5.3 位权脉冲编码 + 自适应精度停止（Bit-Weighted Spike Coding）
+
+> **核心思想**：给每个 SNN 时间步的 spike 赋予固定位权（MSB-first），使 K 步 binary spike train 等价于 K-bit 二进制数。结合 PonderNet 自适应停止，实现逐 token、逐通道的自适应精度计算。
+
+**问题：v7.5 的信息瓶颈**
+
+当前 v7.5 中，所有时间步的 spike 权重相同：
+
+$$\text{contribution}[k] = \text{spike}[k] \times W_{synapse} \in \{0, W\} \quad \forall k$$
+
+每步 spike 贡献相同的突触电流，K=16 步的 spike train 信息容量受 PLIF 动力学约束，有效信息仅约 11.5 bits（firing rate p≈0.2 时的 Shannon entropy × K）。这是 v7.5 不如 v8.0（V_post 连续输出，~16 bit/step）的根本原因。
+
+**方案：MSB-first 位权编码**
+
+给第 k 步 spike 赋予位权 $w_k = 2^{K-1-k}$（MSB-first，先算高位）：
+
+$$\text{contribution}[k] = \text{spike}[k] \times 2^{K-1-k} \times W_{synapse}$$
+
+K=16 步 spike train 的有效值：
+
+$$\text{value} = \sum_{k=0}^{K-1} \text{spike}[k] \times 2^{K-1-k} \in \{0, 1, 2, \ldots, 2^K - 1\}$$
+
+信息容量从 ~11.5 bits 提升到**完整 K bits**（$2^K = 65536$ 个离散值），与 float16 的信息容量相当。
+
+**关键：spike 仍然是 binary {0,1}，完全保持纯 SNN 身份。**
+
+MSB-first 排列的直觉：
+
+```
+步骤 0:  spike × 2^15 = 32768    ← 最高位（粗糙轮廓）
+步骤 1:  spike × 2^14 = 16384    ← 次高位
+步骤 2:  spike × 2^13 = 8192
+...
+步骤 5:  spike × 2^10 = 1024     ← 粗糙 token 在这里停 → 6-bit 精度
+...
+步骤 15: spike × 2^0  = 1        ← 最低位（最精细化）
+```
+
+**与 PonderNet 自适应停止的统一**
+
+位权编码 + PonderNet = **逐次逼近 ADC（Successive Approximation ADC）**：
+
+- 先算最高位（粗糙估计）
+- 逐步细化低位
+- PonderNet 停止 = "后面的低位对这个 token 不重要了"
+- 2D 逐通道停止 = "每个通道需要不同的精度"
+
+统一框架：
+
+| 组件 | SAR-ADC 对应 | 功能 |
+|------|-------------|------|
+| K 步 SNN | K-bit ADC | 最大精度 |
+| 位权 $2^{K-1-k}$ | 位权电容 | 每步的信息权重 |
+| MSB-first 顺序 | 先粗后细 | 高位先定，低位细化 |
+| PonderNet 1D 停止 | 精度截断 | 整层统一："这个 token 够了" |
+| PonderNet 2D 停止 | 逐通道精度 | 每个通道独立："这个特征够了" |
+
+自适应精度的直觉：
+
+```
+"的" "是" "了"     → K=4 停止，4-bit 精度（16 级），省 75% 计算
+"量子纠缠"          → K=12 停止，12-bit 精度（4096 级）
+罕见专业术语         → K=16 跑满，16-bit 精度（65536 级）
+
+同一 token 不同通道：
+  通道 37（简单特征）:  K=3  ███░░░░░░░░░░░░░   → 3-bit
+  通道 128（中等特征）: K=8  ████████░░░░░░░░   → 8-bit
+  通道 512（复杂特征）: K=16 ████████████████   → 16-bit
+```
+
+**实现要点**
+
+1. **固定位权向量**（不参与训练）：
+
+```python
+# MSB-first: 第 k 步 (k=0..K-1) 的位权
+bit_weights = 2 ** torch.arange(K-1, -1, -1)  # [32768, 16384, ..., 2, 1]
+# 归一化到合理幅度（可选）
+bit_weights = bit_weights / bit_weights.max()  # [1.0, 0.5, 0.25, ..., 2^{-15}]
+```
+
+2. **在子层 spike 输出处乘以位权**：
+
+```python
+# spike_out: (TK, batch, D), binary {0,1}
+# 对每个 token 的 K 帧，乘以对应位权
+# k_index: 每帧在 token 内的位置 (0..K-1)
+weighted_spike = spike_out * bit_weights[k_index]  # 仍然稀疏（0 或 2^{K-1-k}）
+```
+
+3. **位权应用位置**：每个子层（SNNBlock, SNNFFN）的 spike 输出 → 乘位权 → 送入 out_proj。层内 PLIF 递推不变，位权仅影响层间信号传递的信息权重。
+
+4. **与 FP16 codec 的关系**：FP16 encode/decode 在模型输入/输出边界使用 IEEE 754 位布局。位权编码将同样的思想**下沉到每一层内部**，但使用简单的二进制整数位权（非 IEEE 754 浮点布局），更适合 SNN 的逐步累积特性。
+
+**对 SNNFFN AND 门的影响**
+
+当前 AND 门是信息瓶颈：
+
+```
+无位权: gate{0,1} × up{0,1} = gated{0,1} → 1 bit/step
+有位权: gate × w[k] 和 up × w[k] 在 down_proj 后时间求和
+       → Σ_k gated[k] × w[k] → K-bit 精度连续值
+```
+
+AND 门仍然在每步产生 binary 结果，但位权使得时间聚合后的总贡献成为 K-bit 连续值。信息瓶颈从 1 bit 提升到 K bits。
+
+**与 v8.0 的对比**
+
+| | v7.5 无位权 | v7.5 + 位权 | v8.0 (V_post) |
+|--|--|--|--|
+| 每步信息 | 1 bit | 1 bit（但权重不同） | ~16 bit |
+| K 步总信息 | ~11.5 bit | **K bit (16 bit)** | K × 16 bit |
+| SNN 纯度 | 纯 binary spike | **纯 binary spike** | LIAF 混合 |
+| 计算能力 | NC¹ | **NC¹** | 可能退化到 TC⁰ |
+| 稀疏性 | 高 | 高 | 低 |
+| 自适应精度 | 无 | **PonderNet = 精度截断** | PonderNet = 计算截断 |
+
+v7.5 + 位权编码在保持纯 SNN 身份的同时，将信息容量提升到与 V_post 可比的水平，且自适应精度有更清晰的物理解释。
+
+**优先级与依赖**
+
+- 前置条件：v7.5 基线训练完成
+- 优先级：**极高**（解决 v7.5 vs v8.0 的核心信息瓶颈，实现简单，不改变神经元动力学）
+- 风险：低（位权是固定常数，不引入新的可训练参数，不改变梯度流结构）
+- 与其他改进的兼容性：与 learnable V[0]、adaptive surrogate、振荡神经元、2D PonderNet 完全正交
+
+**稳定性分析：位权编码是否导致"癫痫"（神经振荡失控）？**
+
+> 核心问题：MSB 步位权 w_0 ≈ 8.0（归一化后），相比均匀权重 1.0 放大了 8 倍。是否导致下游神经元膜电位瞬间超阈值、反复发放形成正反馈？
+
+**分析结论：Pre-LN 架构天然防止癫痫。**
+
+详细推导：
+
+1. **位权幅度**：归一化后 Σw_k = K=16，MSB 步 w_0 ≈ 8.0，LSB 步 w_15 ≈ 0.0002。
+
+2. **out_proj 输出幅度**：out_proj 初始化 std = 0.02/√(2·20) ≈ 0.0032。对于 D=768：
+   - 当前（均匀）：每帧残差幅度 ≈ 0.0032 × √768 × p_fire ≈ 0.018
+   - MSB 帧（位权 8.0）：0.018 × 8 ≈ 0.14
+   - 整个 token 残差总量：≈ 0.14 + 0.07 + ... ≈ 0.28（vs 均匀的 0.018×16 = 0.29，接近）
+
+3. **残差 → 下游 PLIF 的路径**（关键防护链）：
+   ```
+   h += res_block × bit_weight    ← 残差注入（MSB 帧较大）
+   h_norm = RMSNorm(h)            ← 归一化到单位尺度！
+   u = (1-β) × h_norm             ← PLIF 输入，幅度 O(1)
+   V[t] = β·V[t-1] + u[t]        ← 膜电位，受 β 阻尼
+   spike = Θ(V - V_th)            ← 发放判定
+   ```
+   **RMSNorm 是核心防护**：无论 h 因位权增长多少，RMSNorm 都将其归一化到单位尺度。下游 PLIF 神经元始终看到 O(1) 的输入，不会因 MSB 帧的大残差而癫痫。
+
+4. **层内子层间防护**：同一 decoder layer 内，SNNBlock 残差注入后、SNNFFN 处理前也经过 ffn_norm（RMSNorm）。两个子层之间有归一化隔离。
+
+5. **层内 PLIF 动力学不受影响**：位权仅作用于子层 spike 输出 → out_proj 路径。SNNBlock/SNNFFN 内部的 PLIF 递推完全不变（输入仍是 binary {0,1}），不存在层内癫痫风险。
+
+6. **梯度分析**：
+   - MSB 帧梯度放大 8×：期望行为（高位需要更精确学习）
+   - LSB 帧梯度衰减 ~0.0002×：可能导致后续步无法训练
+   - **缓解**：PonderNet 自适应停止会让网络主动跳过对这些低位帧的计算，梯度衰减的帧本就不需要训练
+   - Adaptive surrogate gradient 在 sigma_V 变化时自动调整 alpha，防止梯度截断
+
+7. **潜在风险场景**（需监控但预期不会发生）：
+   - 训练后期 out_proj 权重增长 → MSB 帧残差进一步放大 → 但 RMSNorm 仍然归一化
+   - β → 1 的神经元 V 累积缓慢 → MSB 帧的大输入被分摊到多步 → 无瞬间跳变
+   - 极端情况：所有 MSB 帧同时发放（p=1）→ 残差最大 ≈ 0.14 vs h ≈ 1.0 → RMSNorm 后 ≈ 1.01，可忽略
+
+**结论**：Pre-LN + RMSNorm 归一化构成了完整的防癫痫机制。位权编码不引入稳定性风险。建议训练时监控 MSB vs LSB 帧的 firing rate 和 h 的 std，确认理论分析成立。
+
+**文献参考**
+
+- FP16 二进制编解码 (本项目 atomic_ops/fp16_codec.py): 模型边界的位提取/重建
+- SAR-ADC (Successive Approximation Register ADC): 硬件逐次逼近模数转换器，同构原理
+- High-performance deep SNNs with 0.3 spikes per neuron (Nature Communications 2024): spike timing 与 ReLU 激活值的数学等价性
+- Sengupta et al. (PLOS Computational Biology 2014): graded potential 比 binary spike 信息容量高 10x 的生物学分析
+
+### 10.6 v8.0 → v8.1 演进路线
+
+#### v8.0 现状（独立分支）
+
+v8.0 在 v7.5 连续残差流基础上引入两项核心变更：
+
+| 特性 | v7.5 | v8.0 |
+|------|------|------|
+| 层间传递 | 连续值 h | 连续值 h（不变） |
+| 子层输出 | binary spike → out_proj | V_post（膜电位）→ out_proj |
+| FFN 门控 | spike AND spike（巧合检测） | V_post × V_post（连续门控，对标 SwiGLU） |
+| 时间步数 K | 固定 K=16 | PonderNet 自适应 K（E[K] ∈ [1, K_max]） |
+| 编解码 | FP16 位提取/重建 | embed repeat K → K 帧均值池化 |
+
+PonderNet 实现：每层每子层 `halt_proj(D→1)`，计算几何分布停止概率 $\lambda_k = p_k \cdot \prod_{j<k}(1-p_j)$，归一化后加权聚合 K 帧输出。ponder_cost 正则化鼓励更少的计算步数。
+
+#### v8.1 规划：二阶振荡动力学扩展（v7.5 + v8.0 均采纳）
+
+> **适用范围**：改动位于神经元动力学层面，与架构无关。v7.5（binary spike）和 v8.0（V_post 输出）的 PLIF/SelectivePLIF 均可扩展为二阶振荡版本。
+
+**动机**
+
+v8.0 的 SelectivePLIF 是**一阶**递推系统：
+
+$$V[t] = \beta(t) \cdot V[t-1] + \alpha(t) \cdot I[t]$$
+
+单状态变量 V 只能做**指数衰减**（β 控制衰减速率，α 控制输入增益）。即使 β 和 α 是 input-dependent 的，V 的自由响应仍然是单调衰减——给一个脉冲输入后撤掉，V 只会 $V[t] = V_0 \cdot \beta^t \to 0$。
+
+这意味着当前架构**缺乏频率选择性**：无法天然地对特定时间频率的输入模式敏感（比如文本中周期性出现的语法结构）。α(t) 控制的是"输入放大倍率"，而非"对什么节奏敏感"。
+
+**方案：Resonate-and-Fire (RF) 神经元**
+
+将一阶 PLIF 扩展为二阶耦合系统，引入辅助状态变量 W 和频率参数 ω：
+
+$$V[t] = \beta \cdot V[t-1] - \omega \cdot W[t-1] + I[t]$$
+$$W[t] = \omega \cdot V[t-1] + \beta \cdot W[t-1]$$
+
+等价矩阵形式：
+
+$$\begin{pmatrix} V[t] \\ W[t] \end{pmatrix} = \begin{pmatrix} \beta & -\omega \\ \omega & \beta \end{pmatrix} \begin{pmatrix} V[t-1] \\ W[t-1] \end{pmatrix} + \begin{pmatrix} I[t] \\ 0 \end{pmatrix}$$
+
+状态转移矩阵的特征值为 $\beta \pm i\omega$（复数共轭对），模为 $\sqrt{\beta^2 + \omega^2}$，辐角为 $\arctan(\omega/\beta)$。
+
+**物理直觉**
+
+- V = 位移，W = 速度，ω = 弹簧刚度
+- 脉冲响应：$V[t] \propto r^t \cos(\theta t)$，阻尼振荡而非单调衰减
+- **共振效应**：当输入频率匹配 $\theta = \arctan(\omega/\beta)$ 时，膜电位振幅最大
+- 不同神经元学到不同的 ω → 自动形成**频率分解**（类似 Fourier basis）
+
+**与 v8.0 参数的关系**
+
+| v8.0 参数 | 控制 | 振荡扩展 |
+|-----------|------|----------|
+| β(t) | 衰减速率（"记多久"） | 保留，控制阻尼包络 |
+| α(t) | 输入增益（"听多大声"） | 保留，控制驱动幅度 |
+| V_th(t) | 发放阈值（"什么时候响应"） | 保留，控制发放条件 |
+| — | — | **新增 ω(t)**：振荡频率（"对什么节奏敏感"） |
+
+ω(t) 可设计为 input-dependent（与 β/α/V_th 一致）：
+
+$$\omega(t) = \text{softplus}(W_\omega \cdot x[t] + b_\omega)$$
+
+新增一条投影路径 $W_\omega: D \to D \times N$，复用现有的六路并行投影架构。
+
+**稳定性约束**
+
+振荡系统需要 $|r| = \sqrt{\beta^2 + \omega^2} < 1$ 保证衰减（否则发散）。当 β 和 ω 均为 input-dependent 时，需施加约束：
+
+- 方案 A：极坐标参数化 $\beta = r\cos\theta, \omega = r\sin\theta$，其中 $r = \sigma(\cdot) < 1$
+- 方案 B：事后归一化 $(\beta, \omega) \leftarrow (\beta, \omega) / \max(1, \sqrt{\beta^2+\omega^2}/r_{max})$
+
+**Parallel Scan 兼容性**
+
+二阶系统的状态维度翻倍（V, W 各 DN 维），但 parallel scan 的结构不变——递推仍为线性：
+
+$$s[t] = A[t] \cdot s[t-1] + b[t], \quad s = (V, W)^T$$
+
+现有 Triton kernel 需扩展为 2×2 矩阵乘法版本，或将 (V, W) 交错排列复用标量 kernel（牺牲精度换取实现简单性）。
+
+**文献参考**
+
+- C-SiLIF (arXiv 2506.06374): 严格证明 AdLIF = 对角 SSM，提出复数脉冲神经元 + 匹配 reset 机制
+- SHaRe-SSM (arXiv 2510.14386): Resonate-and-Fire 神经元在 50K 步长序列上纯 spike 工作
+- Oscillatory Modulated SNNs (Nature Communications 2025): 异质振荡调制提高时间处理能力并降低 firing rate
+
+**优先级与依赖**
+
+- 前置条件：v8.0 训练稳定、PonderNet 收敛验证
+- 优先级：中（v8.0 的 β/α/V_th 组合已提供足够的动力学丰富度，振荡扩展是"锦上添花"）
+- 风险：状态维度翻倍 → 显存 ×2、Triton kernel 改写
+
+#### v8.1 规划：逐通道自适应停止（2D PonderNet）（v7.5 + v8.0 均采纳）
+
+> **适用范围**：v8.0 已有 PonderNet 1D，升级为 2D 仅需改 halt_proj 输出维度。v7.5 当前固定 K=16，可同时引入 PonderNet 机制 + 直接采用 2D 版本（跳过 1D 阶段）。
+
+**动机**
+
+v8.0 的 PonderNet 使用 `halt_proj(D→1)`，每层每子层每步只有一个标量停止概率——所有 D 个通道在同一时刻一起停止。但不同通道承载不同特征，复杂度不同：简单特征可能 3 步就够了，复杂特征需要跑满 K 步。全通道同步停止浪费了简单通道的计算。
+
+**方案：halt_proj(D→D)**
+
+将停止概率从标量扩展为 D 维向量，每个通道独立决定何时停止：
+
+$$p_k^d = \sigma(\text{halt\_proj}(h_k)_d), \quad d = 1, \dots, D$$
+
+几何分布权重变为逐通道：
+
+$$\lambda_k^d = p_k^d \cdot \prod_{j<k}(1 - p_j^d)$$
+
+聚合从广播标量变为逐元素：
+
+$$\text{output}_d = \sum_{k=1}^{K} \lambda_k^d \cdot h_{k,d}$$
+
+v8.0 vs v8.1 对比：
+
+```
+v8.0 (1D):  halt_proj: D → 1
+            λ_k ∈ R          （标量，全通道共享）
+            output = Σ_k λ_k · h_k
+
+v8.1 (2D):  halt_proj: D → D
+            λ_k ∈ R^D        （向量，逐通道独立）
+            output_d = Σ_k λ_k^d · h_{k,d}
+```
+
+**训练 vs 推理**
+
+- **训练**：仍然计算全部 K 步（所有帧都需要梯度），计算量不变。唯一差异是加权方式从标量广播变为逐元素乘。
+- **推理**：已停止的通道（$\sum_{j \leq k} \lambda_j^d > 1-\epsilon$）可跳过后续步骤。按 STAS 论文报告，节能 30-46%。
+
+**ponder_cost 正则化**
+
+逐通道 ponder_cost 鼓励每个通道尽早停止：
+
+$$\mathcal{L}_{ponder} = \frac{1}{D} \sum_{d=1}^{D} \mathbb{E}[K_d], \quad \mathbb{E}[K_d] = \sum_{k=1}^{K_{max}} k \cdot \lambda_k^d$$
+
+**实现变更**
+
+仅需修改 `snn_decoder_layer.py` 中的 `halt_proj` 和 `_adaptive_aggregate`：
+
+1. `halt_proj = nn.Linear(D, D)` （原 `D→1` 改为 `D→D`）
+2. `_adaptive_aggregate`: 几何分布计算从标量变为逐元素
+3. 初始化：`weight *= 0.01, bias = -3.5`（与 v8.0 一致，保证初始 E[K] ≈ 均匀）
+
+**文献参考**
+
+- STAS (arXiv 2508.14138): Spatio-Temporal Adaptive Computation Time for Spiking Transformers，2D token pruning，节能 30-46%
+
+**优先级与依赖**
+
+- 前置条件：v8.0 PonderNet 1D 版本训练收敛、验证 E[K] 自适应有效
+- 优先级：高（改动极小，仅 halt_proj 输出维度 + 聚合方式，但直接提升推理效率）
+- 风险：低（训练时计算量不变，仅加权粒度变化）
+
 ---
 
 ## 11. 参考来源
@@ -2227,8 +2633,26 @@ TPS: ~120 tokens/sec
 - Linear Attention ↔ RNN 等价性，SNN时间残差的理论定位
 - 信息瓶颈与泛化界，spike阈值的信息论意义
 
+### v7.6 / v8.1 规划相关参考
+- **LRU** (Orvieto et al., ICML 2023): element-wise 递推 + exp(-softplus) 参数化 + Adam = 匹配 S4 性能
+- **Curse of Memory** (Zucchet & Orvieto, NeurIPS 2024): β→1 时参数敏感度 O(1/(1-β²)^{3/2})，element-wise + Adam 天然缓解
+- **Gradient Flossing** (Krein et al., NeurIPS 2023): Lyapunov 指数正则化 Σ(log|β|)² → 鼓励 β 多样性
+- **Illusion of State** (Merrill & Petty, ICML 2024): 线性 SSM ∈ TC⁰，spike 非线性提升至 NC¹
+- **BSNN** (Zhang et al., JMLR 2021): β 与 α 独立控制的分岔理论必要性
+- **Selective SSM Foundations** (Cirone et al., NeurIPS 2024): 选择性机制是表达力核心，对角 SSM 堆叠恢复完整表达力
+- **Surrogate Gradient Theory** (Gygax & Zenke, Neural Computation 2025): surrogate gradient = 随机 SNN 的精确梯度
+- **Graded vs Spike Information** (Sengupta et al., PLOS Comp Bio 2014): graded potential 信息量 10x、能效 95-156x 优于 spike
+- **LIAF-Net** (Wu et al., IEEE TNNLS 2021): Leaky Integrate and Analog Fire 先例，V_post 输出的 SNN-ANN 混合范式
+- **SAR-ADC**: 逐次逼近模数转换器，位权脉冲编码 + 自适应精度停止的硬件同构原理
+- **STAS** (arXiv 2508.14138): 时空自适应计算，2D halting 节能 30-46%
+- **SiLIF/C-SiLIF** (arXiv 2506.06374): SSM-SNN 数学桥梁，log 参数化 + 复数脉冲神经元
+- **SHaRe-SSM** (arXiv 2510.14386): Resonate-and-Fire 纯 spike 架构，50K 步长序列
+- **Natural Gradient** (Amari, Neural Computation 1998): Fisher 信息矩阵，参数空间黎曼度量
+
 ---
 
 *本文档记录了SNN隐神经元状态空间的完整设计与实现。核心机制：β(t)、α(t)、V_th(t) 由当前输入 spike 动态计算（v7: 移除膜电位反馈 W^(V) 以支持 parallel scan），spike/reset 提供隐式状态反馈。v7.5 引入连续残差流（PLIFNode V_th 原生归一化 + 残差连接）解决 20 层梯度消失问题。训练采用 surrogate gradient backpropagation（v7.1+），在 DGX Spark (GB10) 上以 ~95 TPS 运行。*
 
-*状态: v7.5 已实现，训练中。*
+*v7.6 规划：位权脉冲编码（MSB-first SAR-ADC）+ PonderNet 自适应精度停止 + 2D 逐通道停止。主线架构回归纯 binary spike SNN。*
+
+*状态: v7.5 训练中，v7.6 设计完成待实现，v8.0 作为 LIAF 对照实验继续。*

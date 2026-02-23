@@ -2,7 +2,63 @@
 
 一个**完全基于脉冲神经网络 (SNN)** 构建的语言模型，灵感来自 Mamba 的选择性状态空间模型 (SSM)。隐层神经元的动态参数 β(t), α(t), V_th(t) 作为输入依赖的调制信号，实现选择性信息过滤。**整个网络是纯 SNN —— 不包含任何标准 ANN 组件**。
 
-**当前版本: v7.5c** (连续残差流 + Pre-LN RMSNorm + FP16 边界编解码 + Triton Fused PLIF Kernel)
+**当前版本: v8.0** (Full V_post + 874M 参数 + 完整预训练 & SFT)
+
+## 模型下载
+
+预训练权重托管在 HuggingFace: [LumenscopeAI/NeuronSpark-V8.0Pre](https://huggingface.co/LumenscopeAI/NeuronSpark-V8.0Pre)
+
+| Checkpoint | 说明 | 大小 |
+|------------|------|------|
+| `checkpoints/ckpt_step85000.pth` | 预训练 85000 步，loss ~3.6 | 9.8 GB |
+| `checkpoints_sft/ckpt_step6500.pth` | SFT 6500 步，基础对话能力 | 9.8 GB |
+
+### 快速下载
+
+```bash
+# 方法1: 使用 huggingface_hub (推荐)
+pip install huggingface_hub
+python -c "
+from huggingface_hub import hf_hub_download
+repo_id = 'LumenscopeAI/NeuronSpark-V8.0Pre'
+
+# 下载预训练 checkpoint
+hf_hub_download(repo_id=repo_id, filename='checkpoints/ckpt_step85000.pth', local_dir='.')
+
+# 下载 SFT checkpoint
+hf_hub_download(repo_id=repo_id, filename='checkpoints_sft/ckpt_step6500.pth', local_dir='.')
+"
+
+# 方法2: 使用 curl 直接下载
+mkdir -p checkpoints checkpoints_sft
+curl -L -C - -o checkpoints/ckpt_step85000.pth \
+    "https://huggingface.co/LumenscopeAI/NeuronSpark-V8.0Pre/resolve/main/checkpoints/ckpt_step85000.pth"
+curl -L -C - -o checkpoints_sft/ckpt_step6500.pth \
+    "https://huggingface.co/LumenscopeAI/NeuronSpark-V8.0Pre/resolve/main/checkpoints_sft/ckpt_step6500.pth"
+```
+
+### 快速推理
+
+```bash
+# SFT 对话模式 (推荐 temperature=0.1~0.3)
+python generate_sample.py \
+    --checkpoint checkpoints_sft/ckpt_step6500.pth \
+    --mode sft \
+    --prompt "中国的首都是哪里？" \
+    --temperature 0.1 --top_k 10
+
+# 预训练续写模式
+python generate_sample.py \
+    --checkpoint checkpoints/ckpt_step85000.pth \
+    --mode pretrain \
+    --prompt "人工智能的发展"
+```
+
+**示例输出 (SFT, temp=0.1):**
+```
+Q: 中国的首都是哪里？
+A: 中国的首都在北京。
+```
 
 ## 致谢与参考
 

@@ -29,7 +29,7 @@ import warnings
 
 import torch
 import torch.distributed as dist
-from torch import optim
+
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -39,6 +39,7 @@ from transformers import AutoTokenizer
 
 from model import SNNLanguageModel
 from dataset import PretrainDataset
+from atomic_ops import SNNAdam
 
 warnings.filterwarnings('ignore')
 
@@ -165,7 +166,7 @@ def init_model(args, local_rank, rank):
     """初始化模型和分词器。"""
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
 
-    model = SNNLanguageModel(
+    model_kwargs = dict(
         vocab_size=args.vocab_size,
         D=args.D,
         N=args.N,
@@ -174,6 +175,15 @@ def init_model(args, local_rank, rank):
         D_ff=args.D_ff,
         v_th_min=args.v_th_min,
     )
+    if args.use_moe:
+        model_kwargs.update(
+            use_moe=True,
+            num_experts=args.num_experts,
+            top_k=args.top_k,
+            D_ff_shared=args.D_ff_shared,
+            D_ff_expert=args.D_ff_expert,
+        )
+    model = SNNLanguageModel(**model_kwargs)
 
     device = torch.device(f"cuda:{local_rank}")
     model = model.to(device)
@@ -221,10 +231,11 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
         # 梯度累积
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
-            # Natural Gradient: 补偿 b_beta/b_alpha 的 sigmoid/softplus 梯度衰减
-            raw_model = model.module if isinstance(model, DDP) else model
-            raw_model.compensate_modulation_gradients()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            # SNNAdam.step() 内部处理:
+            #   Phase 1: Natural Gradient 补偿（b_beta/b_alpha/b_omega）
+            #   Phase 2: 梯度裁剪
+            #   Phase 3: Adam 标准步
+            #   Phase 4-10: 软正则化 + 硬约束
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
@@ -280,6 +291,13 @@ if __name__ == "__main__":
     parser.add_argument('--num_layers', type=int, default=20)
     parser.add_argument('--D_ff', type=int, default=3072)
     parser.add_argument('--v_th_min', type=float, default=0.1)
+
+    # MoE 参数
+    parser.add_argument('--use_moe', action='store_true', help='启用 MoE-SNNFFN')
+    parser.add_argument('--num_experts', type=int, default=4)
+    parser.add_argument('--top_k', type=int, default=2)
+    parser.add_argument('--D_ff_shared', type=int, default=None)
+    parser.add_argument('--D_ff_expert', type=int, default=None)
 
     # 训练参数
     parser.add_argument("--out_dir", type=str, default="checkpoints")
@@ -347,17 +365,37 @@ if __name__ == "__main__":
     # ==================== 优化器 ====================
     scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
 
-    # 通过 .module 访问原始模型方法
+    # SNNAdam: Adam + 10 阶段神经动力学增强（对齐 HappyLLM 预训练无 weight decay）
     _pg = model.module.get_param_groups()
-    _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th',
-                    'block_output_neuron', 'ffn_neurons', 'output_neuron'}
-    neuron_params = [p for k in _neuron_keys for p in _pg[k]]
-    other_params = [p for k, ps in _pg.items() if k not in _neuron_keys for p in ps]
-    optimizer = optim.Adam([
-        {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0},
-        {'params': neuron_params, 'lr': args.learning_rate * args.neuron_lr_mult,
-         'lr_mult': float(args.neuron_lr_mult)},
-    ])
+
+    # dynamics 标记（SNNAdam Phase 1/4-10 使用）
+    _dynamics_map = {'b_beta': 'b_beta', 'b_alpha': 'b_alpha', 'b_omega': 'b_omega',
+                     'b_th': 'b_th'}
+
+    # 神经元参数 lr_mult（surrogate gradient 天然较弱，需要更高 lr）
+    _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th', 'b_omega',
+                    'block_output_neuron', 'ffn_neurons', 'ffn_expert_neurons',
+                    'output_neuron'}
+
+    param_groups = []
+    for key, params in _pg.items():
+        if not params:
+            continue
+        lr_mult = float(args.neuron_lr_mult) if key in _neuron_keys else 1.0
+        param_groups.append({
+            'params': params,
+            'lr': args.learning_rate * lr_mult,
+            'lr_mult': lr_mult,
+            'dynamics': _dynamics_map.get(key),
+            'N': args.N if key in ('b_beta', 'b_alpha', 'b_omega', 'b_th') else None,
+        })
+
+    optimizer = SNNAdam(
+        param_groups,
+        lr=args.learning_rate,
+        betas=(0.9, 0.95),
+        grad_clip=args.grad_clip,
+    )
 
     # 恢复 checkpoint
     tokens_seen = 0

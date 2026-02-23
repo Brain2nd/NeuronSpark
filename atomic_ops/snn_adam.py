@@ -1,13 +1,16 @@
 """
-SNNAdamW: SNN 专用优化器 — AdamW + 神经动力学增强（v2: 合并参数组 + foreach）。
+SNNAdam: SNN 专用优化器 — Adam + 神经动力学增强（无 weight decay，对齐 HappyLLM 预训练）。
 
-step() 内部 11 个阶段：
+与 SNNAdamW 的唯一区别：继承 Adam（无解耦 weight decay），对齐 HappyLLM 预训练原始设计。
+SFT 阶段使用 SNNAdamW（带 weight decay）。
+
+step() 内部 11 个阶段（与 SNNAdamW 完全一致）：
 
   ── 梯度预处理 ──
   1. Natural Gradient 补偿（b_beta/b_alpha/b_omega 梯度除以激活导数）
   2. 梯度裁剪（全参数 clip_grad_norm_，foreach 加速）
   ── 参数更新 ──
-  3. AdamW 标准步 + Magma 掩码（super().step() + 动量对齐随机掩码，可选）
+  3. Adam 标准步 + Magma 掩码（super().step() + 动量对齐随机掩码，可选）
   ── 软正则化（梯度级微调） ──
   4. 双侧 Lyapunov 惩罚（Gradient Flossing: 推 β 远离 0 和 1 两端）
   5. β 多样性维护（同一 D 通道内 N 个 β 互斥）
@@ -19,20 +22,9 @@ step() 内部 11 个阶段：
   10. V_th 上界钳制（|b_th| ≤ b_th_max，防死寂）
   11. RF 稳定性投影（√(β²+ω²) ≤ r_max，防癫痫，最终权威）
 
-v2 优化（数学等价，仅改执行方式）：
-  - 参数组合并: train.py 传入的 28 组按 (weight_decay, lr_mult) 合并为 ~3 组
-    · AdamW foreach 内部按组批量操作，组数减少 → Python 循环开销大幅降低
-  - foreach=True: AdamW 多张量批量更新（单次 multi-tensor kernel 替代逐参数循环）
-  - clip_grad_norm_ foreach=True: 梯度范数批量计算
-  - dynamics 元数据从 param_group 提取到 self._dyn_params，直接索引目标参数
-  - 预计算硬钳制边界（避免每步 torch.logit）
-
-外部接口完全不变：train.py 仍传 28 组，内部自动合并。
-
-设计原则：
-  - 软正则化 (Phase 4-7) 提供持续的分布引导力
-  - 硬约束 (Phase 8-10) 作为安全网，防止极端情况
-  - Phase 10 最后执行，RF 稳定性是不可违反的绝对约束
+合并参数组: train_ddp.py 传入的参数组按 lr_mult 合并为 ~2 组
+  · (lr_mult=1.0): 权重矩阵 + norm + router
+  · (lr_mult=10.0): 神经元 + dynamics 参数
 
 文献基础：
   - Gradient Flossing (Krein+, NeurIPS'23): Lyapunov 指数正则化
@@ -44,38 +36,22 @@ v2 优化（数学等价，仅改执行方式）：
 
 import torch
 import torch.nn.functional as F
-from torch.optim import AdamW
+from torch.optim import Adam
+
+from .snn_adamw import _softplus_inv
 
 
-def _softplus_inv(x):
-    """softplus 反函数: log(exp(x) - 1)，数值稳定版。
+class SNNAdam(Adam):
+    """SNN 专用优化器：Adam + 10 阶段神经动力学增强（无 weight decay）。
 
-    identity: softplus(softplus_inv(x)) == x
-    公式: log(exp(x) - 1) = x + log(1 - exp(-x))
-    """
-    return x + torch.log1p(-torch.exp(-x))
-
-
-class SNNAdamW(AdamW):
-    """SNN 专用优化器：AdamW + 10 阶段神经动力学增强。
-
-    v2: 内部合并参数组（28 → ~3）+ foreach 加速。
-    外部接口不变 — train.py 传入的 28 个参数组在 __init__ 中自动合并。
-
-    合并规则: 按 (weight_decay, lr_mult) 分组
-      · (wd=0.1, lr_mult=1.0): 权重矩阵
-      · (wd=0.0, lr_mult=1.0): norm + router
-      · (wd=0.0, lr_mult=10.0): 神经元 + dynamics 参数
-
-    dynamics 元数据从 param_group 提取到 self._dyn_params，
-    Phase 1/4-10 直接索引目标参数，无需遍历全部 param_groups。
+    对齐 HappyLLM 预训练设计：预训练阶段不使用 weight decay。
+    内部合并参数组 + foreach 加速，与 SNNAdamW 相同的 10 阶段增强。
 
     Args:
         params: 参数组（每组可含 'dynamics' 和 'N' 键标记神经动力学参数）
         lr: 基础学习率
         betas: Adam 动量系数
         eps: Adam epsilon
-        weight_decay: 默认 weight decay
         grad_clip: 梯度裁剪阈值（0 = 不裁剪）
         max_comp: Natural Gradient 补偿因子上限
         lyapunov_strength: 双侧 Lyapunov 正则化强度
@@ -98,7 +74,6 @@ class SNNAdamW(AdamW):
         lr: float = 2e-4,
         betas: tuple = (0.9, 0.95),
         eps: float = 1e-8,
-        weight_decay: float = 0.01,
         grad_clip: float = 1.0,
         max_comp: float = 100.0,
         lyapunov_strength: float = 1e-4,
@@ -130,19 +105,16 @@ class SNNAdamW(AdamW):
         self.magma_ema = magma_ema
 
         # ---- 提取 dynamics 元数据 ----
-        # 按类型直接索引目标参数（替代每次遍历 28 个 param_groups）
         self._dyn_params = {'b_beta': [], 'b_alpha': [], 'b_omega': [], 'b_th': []}
         self._dyn_N = {}  # id(p) → N (状态扩展因子)
 
-        # ---- 合并参数组: 28 → ~3（按 weight_decay + lr_mult 去重） ----
-        # AdamW foreach 内部按组批量操作，组数越少 Python 循环越少
-        merged = {}  # (wd, lr_mult) → group dict
+        # ---- 合并参数组（按 lr_mult 去重，无 weight_decay 维度） ----
+        merged = {}  # lr_mult → group dict
         dynamics_lr_mult = 1.0
 
         for group in params:
             dynamics = group.get('dynamics')
             N_val = group.get('N')
-            wd = group.get('weight_decay', weight_decay)
             lr_mult = group.get('lr_mult', 1.0)
 
             for p in group['params']:
@@ -152,29 +124,27 @@ class SNNAdamW(AdamW):
                         self._dyn_N[id(p)] = N_val
                     dynamics_lr_mult = lr_mult
 
-            key = (wd, lr_mult)
-            if key not in merged:
-                merged[key] = {
+            if lr_mult not in merged:
+                merged[lr_mult] = {
                     'params': [],
-                    'weight_decay': wd,
                     'lr': lr * lr_mult,
                     'lr_mult': lr_mult,
                 }
-            merged[key]['params'].extend(group['params'])
+            merged[lr_mult]['params'].extend(group['params'])
 
         self._dynamics_lr_mult = dynamics_lr_mult
 
-        # 预计算硬钳制边界（避免每步 torch.logit 计算）
+        # 预计算硬钳制边界
         self._b_beta_lo = torch.logit(torch.tensor(beta_range[0])).item()
         self._b_beta_hi = torch.logit(torch.tensor(beta_range[1])).item()
 
         super().__init__(
             list(merged.values()), lr=lr, betas=betas, eps=eps,
-            weight_decay=weight_decay, foreach=True,
+            foreach=True,
         )
 
     def _get_dynamics_lr(self):
-        """获取当前 dynamics 参数组的学习率（train.py 每步动态更新 param_group['lr']）。"""
+        """获取当前 dynamics 参数组的学习率。"""
         for g in self.param_groups:
             if abs(g.get('lr_mult', 1.0) - self._dynamics_lr_mult) < 0.01:
                 return g['lr']
@@ -184,11 +154,6 @@ class SNNAdamW(AdamW):
     def step(self, closure=None):
         # ================================================================
         # Phase 1: Natural Gradient 补偿
-        # ----------------------------------------------------------------
-        # 消除 sigmoid/softplus 激活函数对 b_beta/b_alpha/b_omega 的梯度衰减。
-        # β = sigmoid(b_beta), sigmoid'(z) = β(1-β)
-        #   → 当 β→0.99 时 sigmoid' = 0.0099，梯度衰减 100×
-        # 补偿: grad /= activation'(b)，等价于在 β/α/ω 空间做梯度下降。
         # ================================================================
         for p in self._dyn_params['b_beta']:
             if p.grad is None:
@@ -207,7 +172,7 @@ class SNNAdamW(AdamW):
             p.grad.div_(torch.sigmoid(p.data).clamp(min=0.1))
 
         # ================================================================
-        # Phase 2: 梯度裁剪（foreach 批量计算范数）
+        # Phase 2: 梯度裁剪
         # ================================================================
         if self.grad_clip > 0:
             all_params = [p for g in self.param_groups for p in g['params']
@@ -217,7 +182,7 @@ class SNNAdamW(AdamW):
                                                foreach=True)
 
         # ================================================================
-        # Phase 3: AdamW 标准步 + Magma 掩码
+        # Phase 3: Adam 标准步 + Magma 掩码
         # ----------------------------------------------------------------
         # Magma (arXiv 2602.15322): per-block 随机掩码 + 动量对齐缩放
         #   1. cos(momentum, gradient) → sigmoid(·/τ) → EMA 平滑 → 对齐分数 s
@@ -264,14 +229,10 @@ class SNNAdamW(AdamW):
                         # 丢弃块: 恢复原始参数
                         p.data.copy_(theta_old)
 
-        # ---- 获取当前 dynamics lr ----
         dyn_lr = self._get_dynamics_lr()
 
         # ================================================================
         # Phase 4: 双侧 Lyapunov 惩罚 (Gradient Flossing)
-        # ----------------------------------------------------------------
-        # penalty = (log β)² + (log(1-β))²
-        # d/db = 2·log(β)·(1-β) − 2·β·log(1-β)
         # ================================================================
         if self.lyapunov_strength > 0:
             coeff = self.lyapunov_strength * dyn_lr
@@ -285,9 +246,6 @@ class SNNAdamW(AdamW):
 
         # ================================================================
         # Phase 5: β 多样性维护
-        # ----------------------------------------------------------------
-        # 排斥力 = +(β - mean_β)，推离通道均值。
-        # 链式法则转回 logit 空间: Δb = repulsion · β·(1-β)
         # ================================================================
         if self.beta_diversity_strength > 0:
             coeff = self.beta_diversity_strength * dyn_lr
@@ -305,8 +263,6 @@ class SNNAdamW(AdamW):
 
         # ================================================================
         # Phase 6: ω 多样性维护
-        # ----------------------------------------------------------------
-        # softplus'(b) = sigmoid(b)，链式法则转回 b_omega 空间。
         # ================================================================
         if self.omega_diversity_strength > 0:
             coeff = self.omega_diversity_strength * dyn_lr
@@ -325,8 +281,6 @@ class SNNAdamW(AdamW):
 
         # ================================================================
         # Phase 7: α 多样性维护
-        # ----------------------------------------------------------------
-        # α = softplus(b_alpha), softplus'(b) = sigmoid(b)
         # ================================================================
         if self.alpha_diversity_strength > 0:
             coeff = self.alpha_diversity_strength * dyn_lr
@@ -377,9 +331,6 @@ class SNNAdamW(AdamW):
 
         # ================================================================
         # Phase 11: RF 稳定性投影（最终权威，不可违反）
-        # ----------------------------------------------------------------
-        # r = √(β² + ω²) ≤ r_max
-        # 投影: (β, ω) ← (β, ω) · r_max/r，映射回参数空间
         # ================================================================
         b_beta_list = self._dyn_params['b_beta']
         b_omega_list = self._dyn_params['b_omega']
@@ -399,7 +350,6 @@ class SNNAdamW(AdamW):
                 beta_proj = (beta[violation] * scale).clamp(1e-7, 1.0 - 1e-7)
                 omega_proj = (omega[violation] * scale).clamp(min=1e-7)
 
-                # 映射回参数空间
                 p_beta.data[violation] = torch.log(beta_proj / (1.0 - beta_proj))
                 p_omega.data[violation] = _softplus_inv(omega_proj)
 

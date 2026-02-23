@@ -60,6 +60,11 @@ class SNNLanguageModel(nn.Module):
         num_layers: int = 20,
         D_ff: int = 3072,
         v_th_min: float = 0.1,
+        use_moe: bool = False,
+        num_experts: int = 4,
+        top_k: int = 2,
+        D_ff_shared: int = None,
+        D_ff_expert: int = None,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -68,6 +73,11 @@ class SNNLanguageModel(nn.Module):
         self.K = K
         self.num_layers = num_layers
         self.D_ff = D_ff
+        self.use_moe = use_moe
+        self.num_experts = num_experts
+        self.moe_top_k = top_k
+        self.D_ff_shared = D_ff_shared
+        self.D_ff_expert = D_ff_expert
 
         # ====== Embedding + Norm（全部可训练）======
         self.embed_tokens = nn.Embedding(vocab_size, D)
@@ -93,6 +103,11 @@ class SNNLanguageModel(nn.Module):
                 ffn_output_v_threshold=0.15,
                 num_layers=num_layers,
                 layer_idx=i,
+                use_moe=use_moe,
+                num_experts=num_experts,
+                top_k=top_k,
+                D_ff_shared=D_ff_shared,
+                D_ff_expert=D_ff_expert,
             )
             for i in range(num_layers)
         ])
@@ -395,11 +410,14 @@ class SNNLanguageModel(nn.Module):
             'ffn_down_proj': [],
             'ffn_skip_proj': [],
             'ffn_neurons': [],
+            # MoE 路由 expert 参数
+            'ffn_expert_projs': [],
+            'ffn_expert_neurons': [],
+            'ffn_router': [],
         }
 
         for layer_module in self.layers:
             block = layer_module.snn_block
-            ffn = layer_module.snn_ffn
 
             # 残差流组件
             groups['residual_projs'].extend([
@@ -440,15 +458,40 @@ class SNNLanguageModel(nn.Module):
                 block.hidden_neuron.w_init,
             ])
 
-            # SNNFFN 参数
-            groups['ffn_gate_proj'].append(ffn.gate_proj.weight)
-            groups['ffn_up_proj'].append(ffn.up_proj.weight)
-            groups['ffn_down_proj'].append(ffn.down_proj.weight)
-            groups['ffn_skip_proj'].append(ffn.skip_proj.weight)
-            groups['ffn_neurons'].extend([
-                ffn.gate_neuron.w, ffn.gate_neuron.v_th, ffn.gate_neuron.v_init,
-                ffn.up_neuron.w, ffn.up_neuron.v_th, ffn.up_neuron.v_init,
-                ffn.output_neuron.w, ffn.output_neuron.v_th, ffn.output_neuron.v_init,
-            ])
+            # SNNFFN 参数（MoE 模式: shared expert 沿用现有 key，routed expert 用新 key）
+            if layer_module.use_moe:
+                moe = layer_module.snn_ffn
+                # 共享 expert → 现有参数组（同 learning rate / weight decay）
+                shared = moe.shared_expert
+                groups['ffn_gate_proj'].append(shared.gate_proj.weight)
+                groups['ffn_up_proj'].append(shared.up_proj.weight)
+                groups['ffn_down_proj'].append(shared.down_proj.weight)
+                groups['ffn_skip_proj'].append(shared.skip_proj.weight)
+                groups['ffn_neurons'].extend([
+                    shared.gate_neuron.w, shared.gate_neuron.v_th, shared.gate_neuron.v_init,
+                    shared.up_neuron.w, shared.up_neuron.v_th, shared.up_neuron.v_init,
+                    shared.output_neuron.w, shared.output_neuron.v_th, shared.output_neuron.v_init,
+                ])
+                # 路由 expert → 堆叠参数（v3: 无 ModuleList）
+                groups['ffn_expert_projs'].extend([
+                    moe.expert_W_gus, moe.expert_W_down,
+                ])
+                groups['ffn_expert_neurons'].extend([
+                    moe.expert_gu_w, moe.expert_gu_v_th, moe.expert_gu_v_init,
+                    moe.expert_out_w, moe.expert_out_v_th, moe.expert_out_v_init,
+                ])
+                # Router
+                groups['ffn_router'].append(moe.router.weight)
+            else:
+                ffn = layer_module.snn_ffn
+                groups['ffn_gate_proj'].append(ffn.gate_proj.weight)
+                groups['ffn_up_proj'].append(ffn.up_proj.weight)
+                groups['ffn_down_proj'].append(ffn.down_proj.weight)
+                groups['ffn_skip_proj'].append(ffn.skip_proj.weight)
+                groups['ffn_neurons'].extend([
+                    ffn.gate_neuron.w, ffn.gate_neuron.v_th, ffn.gate_neuron.v_init,
+                    ffn.up_neuron.w, ffn.up_neuron.v_th, ffn.up_neuron.v_init,
+                    ffn.output_neuron.w, ffn.output_neuron.v_th, ffn.output_neuron.v_init,
+                ])
 
         return groups

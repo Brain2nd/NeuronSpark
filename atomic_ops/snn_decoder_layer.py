@@ -59,6 +59,11 @@ class SNNDecoderLayer(base.MemoryModule):
         ffn_output_v_threshold: SNNFFN 输出神经元阈值
         num_layers: 总层数（用于残差输出缩放 + SNNFFN down_proj 缩放）
         layer_idx: 当前层索引
+        use_moe: 是否启用 MoE-SNNFFN
+        num_experts: 路由 expert 数量
+        top_k: 每 token 选中的 expert 数
+        D_ff_shared: 共享 expert 中间层维度（默认 D）
+        D_ff_expert: 路由 expert 中间层维度（默认 D//2）
     """
 
     def __init__(
@@ -72,6 +77,11 @@ class SNNDecoderLayer(base.MemoryModule):
         ffn_output_v_threshold: float,
         num_layers: int = 1,
         layer_idx: int = 0,
+        use_moe: bool = False,
+        num_experts: int = 4,
+        top_k: int = 2,
+        D_ff_shared: int = None,
+        D_ff_expert: int = None,
     ):
         super().__init__()
         self.D = D
@@ -90,12 +100,26 @@ class SNNDecoderLayer(base.MemoryModule):
             D=D, N=N, v_th_min=v_th_min,
             output_v_threshold=block_output_v_threshold,
         )
-        self.snn_ffn = SNNFFN(
-            D=D, D_ff=D_ff,
-            output_v_threshold=ffn_output_v_threshold,
-            num_layers=num_layers,
-            layer_idx=layer_idx,
-        )
+
+        self.use_moe = use_moe
+        if use_moe:
+            from .moe_snn_ffn import MoESNNFFN
+            D_ff_shared = D_ff_shared or D
+            D_ff_expert = D_ff_expert or D // 2
+            self.snn_ffn = MoESNNFFN(
+                D=D, D_ff_shared=D_ff_shared, D_ff_expert=D_ff_expert,
+                num_experts=num_experts, top_k=top_k, K=K,
+                output_v_threshold=ffn_output_v_threshold,
+                num_layers=num_layers,
+                layer_idx=layer_idx,
+            )
+        else:
+            self.snn_ffn = SNNFFN(
+                D=D, D_ff=D_ff,
+                output_v_threshold=ffn_output_v_threshold,
+                num_layers=num_layers,
+                layer_idx=layer_idx,
+            )
 
         # Pre-LN 分支归一化: h → RMSNorm → PLIFNode
         self.block_norm = RMSNorm(D)
@@ -200,7 +224,11 @@ class SNNDecoderLayer(base.MemoryModule):
 
         # 子层 2: SNNFFN — RMSNorm → PLIF → SNNFFN → spike×bit_weight → out_proj → 残差
         spike_in2 = self._input_neuron_parallel(self.input_neuron2, self.ffn_norm(h))
-        spike_ffn = self.snn_ffn.forward_parallel(spike_in2)
+        if self.use_moe:
+            spike_ffn, router_info = self.snn_ffn.forward_parallel(spike_in2, h=h)
+            self._last_router_info = router_info
+        else:
+            spike_ffn = self.snn_ffn.forward_parallel(spike_in2)
         spike_ffn = self._apply_bit_weights(spike_ffn)
         res_ffn = self.ffn_out_proj(spike_ffn)
         h = _fused_residual_center(h, res_ffn)
@@ -231,7 +259,10 @@ class SNNDecoderLayer(base.MemoryModule):
 
         # 子层 2: SNNFFN — RMSNorm → PLIFNode → SNNFFN → spike×bit_weight → out_proj → 残差
         spike_in2 = self.input_neuron2(self.ffn_norm(h))
-        spike_ffn = self.snn_ffn.single_step_forward(spike_in2)
+        if self.use_moe:
+            spike_ffn = self.snn_ffn.single_step_forward(spike_in2, h=h)
+        else:
+            spike_ffn = self.snn_ffn.single_step_forward(spike_in2)
         spike_ffn = spike_ffn * bw
         res_ffn = self.ffn_out_proj(spike_ffn)
         h = _fused_residual_center(h, res_ffn)

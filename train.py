@@ -114,6 +114,11 @@ def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, 
             'K': raw.K,
             'num_layers': raw.num_layers,
             'D_ff': raw.D_ff,
+            'use_moe': getattr(raw, 'use_moe', False),
+            'num_experts': getattr(raw, 'num_experts', 4),
+            'top_k': getattr(raw, 'moe_top_k', 2),
+            'D_ff_shared': getattr(raw, 'D_ff_shared', None),
+            'D_ff_expert': getattr(raw, 'D_ff_expert', None),
         },
     }, path)
     Logger(f"  → Checkpoint saved: {path}")
@@ -179,6 +184,11 @@ def init_model(args):
         num_layers=args.num_layers,
         D_ff=args.D_ff,
         v_th_min=args.v_th_min,
+        use_moe=args.use_moe,
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+        D_ff_shared=args.D_ff_shared,
+        D_ff_expert=args.D_ff_expert,
     )
 
     # 将模型移动到指定设备
@@ -233,6 +243,14 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
             scaler.step(optimizer)     # 内部自动：补偿 → 裁剪 → AdamW → Lyapunov → 多样性
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+
+            # MoE expert bias 更新（DeepSeek-V3 sign rule）
+            if args.use_moe:
+                _raw = model.module if hasattr(model, 'module') else model
+                for layer_mod in _raw.layers:
+                    info = getattr(layer_mod, '_last_router_info', None)
+                    if info is not None:
+                        layer_mod.snn_ffn.update_expert_bias(info['expert_counts'])
 
         # 有效 token 数
         valid_tokens = int(loss_mask_flat.sum().item())
@@ -289,6 +307,13 @@ if __name__ == "__main__":
     parser.add_argument('--num_layers', type=int, default=20, help='SNN 解码层数')
     parser.add_argument('--D_ff', type=int, default=3072, help='FFN 中间层维度')
     parser.add_argument('--v_th_min', type=float, default=0.1, help='阈值下限')
+
+    # MoE 参数
+    parser.add_argument('--use_moe', action='store_true', help='启用 MoE-SNNFFN')
+    parser.add_argument('--num_experts', type=int, default=4, help='路由 expert 数量')
+    parser.add_argument('--top_k', type=int, default=2, help='每 token 选中的 expert 数')
+    parser.add_argument('--D_ff_shared', type=int, default=None, help='共享 expert D_ff（默认 D）')
+    parser.add_argument('--D_ff_expert', type=int, default=None, help='路由 expert D_ff（默认 D//2）')
 
     # 基础训练参数（对齐教程）
     parser.add_argument("--out_dir", type=str, default="checkpoints", help="模型输出目录")
@@ -367,6 +392,9 @@ if __name__ == "__main__":
         'W_gate': 0.1, 'W_skip': 0.1, 'W_out': 0.1,
         'residual_projs': 0.1,
         'ffn_gate_proj': 0.1, 'ffn_up_proj': 0.1, 'ffn_down_proj': 0.1, 'ffn_skip_proj': 0.1,
+        'ffn_expert_projs': 0.1,   # 路由 expert 投影权重
+        'ffn_expert_neurons': 0.0, # 路由 expert 神经元参数
+        'ffn_router': 0.0,         # router 不加 weight_decay
         # wd=0 组
         'b_beta': 0.0, 'b_alpha': 0.0, 'b_th': 0.0, 'b_omega': 0.0,
         'input_neurons': 0.0, 'block_output_neuron': 0.0, 'ffn_neurons': 0.0, 'output_neuron': 0.0,
@@ -379,7 +407,8 @@ if __name__ == "__main__":
 
     # 神经元参数 lr_mult
     _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th', 'b_omega',
-                    'block_output_neuron', 'ffn_neurons', 'output_neuron'}
+                    'block_output_neuron', 'ffn_neurons', 'ffn_expert_neurons',
+                    'output_neuron'}
 
     param_groups = []
     for key, params in _pg.items():
@@ -392,7 +421,7 @@ if __name__ == "__main__":
             'lr_mult': lr_mult,
             'weight_decay': _wd_groups.get(key, 0.1),
             'dynamics': _dynamics_map.get(key),
-            'N': args.N if key in ('b_beta', 'b_alpha', 'b_omega') else None,
+            'N': args.N if key in ('b_beta', 'b_alpha', 'b_omega', 'b_th') else None,
         })
 
     optimizer = SNNAdamW(
@@ -417,6 +446,10 @@ if __name__ == "__main__":
     Logger(f"SNN Language Model Pretraining v7.1 (Backprop + Surrogate Gradient)")
     Logger(f"  Vocab:       {args.vocab_size}")
     Logger(f"  Model:       D={args.D}, N={args.N}, K={args.K}, Layers={args.num_layers}, D_ff={args.D_ff}")
+    if args.use_moe:
+        Logger(f"  MoE:         E={args.num_experts}, top_k={args.top_k}, "
+               f"D_ff_shared={args.D_ff_shared or args.D}, "
+               f"D_ff_expert={args.D_ff_expert or args.D // 2}")
     Logger(f"  Data:        {args.data_path}")
     Logger(f"  Samples:     {len(train_ds):,}")
     Logger(f"  Max length:  {args.max_length}")

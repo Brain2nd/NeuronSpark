@@ -205,7 +205,12 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
             out = model(X, Y)
             loss = out.last_loss / args.accumulation_steps
             loss_mask_flat = loss_mask.view(-1)
-            loss = torch.sum(loss * loss_mask_flat) / loss_mask_flat.sum()
+            loss_mask_float = loss_mask_flat.float()
+            mask_sum = loss_mask_float.sum()
+            if mask_sum > 0:
+                loss = torch.sum(loss * loss_mask_float) / mask_sum
+            else:
+                loss = loss.mean()  # fallback
 
         scaler.scale(loss).backward()
 

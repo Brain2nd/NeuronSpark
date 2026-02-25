@@ -377,18 +377,64 @@ if __name__ == "__main__":
                     'block_output_neuron', 'ffn_neurons', 'ffn_expert_neurons',
                     'output_neuron'}
 
+    # ---- Layer-wise LR 自适应校准：一次前向+反向实测每层梯度 RMS ----
+    _raw_model = model.module if isinstance(model, DDP) else model
+    _layer_map = _raw_model.get_layer_indices()
+    _no_layer_scale_keys = {'b_beta', 'b_alpha', 'b_omega', 'b_th'}
+
+    def _calibrate_layer_scales():
+        """一次前向+反向，测量各层 W_in 梯度 RMS，返回补偿倍率。"""
+        model.train()
+        X, Y, loss_mask = next(iter(train_loader))
+        X, Y, loss_mask = X.to(device), Y.to(device), loss_mask.to(device)
+        with ctx:
+            out = model(X, Y)
+            lm = loss_mask.view(-1)
+            loss = torch.sum(out.last_loss * lm) / lm.sum()
+        loss.backward()
+        rms = []
+        for layer in _raw_model.layers:
+            g = layer.snn_block.W_in.weight.grad
+            rms.append(g.float().pow(2).mean().sqrt().item())
+        model.zero_grad(set_to_none=True)
+        return [rms[0] / max(r, 1e-10) for r in rms]
+
+    _layer_scales = _calibrate_layer_scales()
+    Logger(f"  Layer LR calibrated: L0={_layer_scales[0]:.2f}x → L{args.num_layers-1}={_layer_scales[-1]:.2f}x", rank)
+
     param_groups = []
     for key, params in _pg.items():
         if not params:
             continue
-        lr_mult = float(args.neuron_lr_mult) if key in _neuron_keys else 1.0
-        param_groups.append({
-            'params': params,
-            'lr': args.learning_rate * lr_mult,
-            'lr_mult': lr_mult,
-            'dynamics': _dynamics_map.get(key),
-            'N': args.N if key in ('b_beta', 'b_alpha', 'b_omega', 'b_th') else None,
-        })
+        func_lr_mult = float(args.neuron_lr_mult) if key in _neuron_keys else 1.0
+        dynamics = _dynamics_map.get(key)
+        N_val = args.N if key in ('b_beta', 'b_alpha', 'b_omega', 'b_th') else None
+
+        if key not in _no_layer_scale_keys:
+            # 按层拆分，用校准倍率
+            by_layer = {}
+            for p in params:
+                lidx = _layer_map.get(id(p))
+                by_layer.setdefault(lidx, []).append(p)
+            for lidx, lparams in sorted(by_layer.items(), key=lambda x: (x[0] is None, x[0])):
+                ls = _layer_scales[lidx] if lidx is not None else 1.0
+                composite = func_lr_mult * ls
+                param_groups.append({
+                    'params': lparams,
+                    'lr': args.learning_rate * composite,
+                    'lr_mult': composite,
+                    'dynamics': dynamics,
+                    'N': N_val,
+                })
+        else:
+            # Dynamics 参数：lr_mult 统一，不按层拆分
+            param_groups.append({
+                'params': params,
+                'lr': args.learning_rate * func_lr_mult,
+                'lr_mult': func_lr_mult,
+                'dynamics': dynamics,
+                'N': N_val,
+            })
 
     optimizer = SNNAdam(
         param_groups,
@@ -421,6 +467,7 @@ if __name__ == "__main__":
     Logger(f"  Steps/epoch: {iter_per_epoch:,}", rank)
     Logger(f"  LR:          {args.learning_rate} (warmup {args.warmup_iters} → cosine → {args.learning_rate/10})", rank)
     Logger(f"  Neuron LR:   {args.learning_rate * args.neuron_lr_mult} ({args.neuron_lr_mult}× base)", rank)
+    Logger(f"  Layer LR:    L0={_layer_scales[0]:.2f}x → L{args.num_layers-1}={_layer_scales[-1]:.2f}x (calibrated, {len(param_groups)} groups)", rank)
     Logger(f"  Grad clip:   {args.grad_clip}", rank)
     Logger(f"  Precision:   {args.dtype}", rank)
     Logger(f"  Save every:  {args.save_interval} steps", rank)

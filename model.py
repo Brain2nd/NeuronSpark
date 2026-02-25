@@ -495,3 +495,11 @@ class SNNLanguageModel(nn.Module):
                 ])
 
         return groups
+
+    def get_layer_indices(self) -> dict[int, int]:
+        """Return {id(param): layer_idx} for all layer-indexed parameters."""
+        mapping = {}
+        for i, layer_module in enumerate(self.layers):
+            for p in layer_module.parameters():
+                mapping[id(p)] = i
+        return mapping

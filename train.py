@@ -240,6 +240,20 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
         # 梯度累积：每 accumulation_steps 步更新一次（对齐教程 L113-125）
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
+
+            # 首次 accumulated batch: 就地校准 layer-wise LR
+            if not getattr(optimizer, '_layer_lr_calibrated', False):
+                _rms = [l.snn_block.W_in.weight.grad.float().pow(2).mean().sqrt().item()
+                        for l in model.layers]
+                _scales = [_rms[0] / max(r, 1e-10) for r in _rms]
+                for pg in optimizer.param_groups:
+                    _lidx = pg.get('_layer_idx')
+                    if _lidx is not None:
+                        pg['lr_mult'] = pg['_func_lr_mult'] * _scales[_lidx]
+                        pg['lr'] = lr * pg['lr_mult']
+                Logger(f"  Layer LR calibrated: L0={_scales[0]:.2f}x → L{args.num_layers-1}={_scales[-1]:.2f}x ({len(optimizer.param_groups)} groups)")
+                optimizer._layer_lr_calibrated = True
+
             scaler.step(optimizer)     # 内部自动：补偿 → 裁剪 → AdamW → Lyapunov → 多样性
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
@@ -410,31 +424,11 @@ if __name__ == "__main__":
                     'block_output_neuron', 'ffn_neurons', 'ffn_expert_neurons',
                     'output_neuron'}
 
-    # ---- Layer-wise LR 自适应校准：一次前向+反向实测每层梯度 RMS ----
+    # ---- Layer-wise LR: 按层拆分参数组，第一次 accumulated batch 后就地校准 ----
     # Dynamics 参数 (b_beta/b_alpha/b_omega/b_th) 不参与层缩放：
     # optimizer Phase 1/4-8 通过 lr_mult 匹配 dynamics 组，各层不同会导致匹配失效。
     _layer_map = model.get_layer_indices()
     _no_layer_scale_keys = {'b_beta', 'b_alpha', 'b_omega', 'b_th'}
-
-    def _calibrate_layer_scales():
-        """一次前向+反向，测量各层 W_in 梯度 RMS，返回补偿倍率。"""
-        model.train()
-        X, Y, loss_mask = next(iter(train_loader))
-        X, Y, loss_mask = X.to(args.device), Y.to(args.device), loss_mask.to(args.device)
-        with ctx:
-            out = model(X, Y)
-            lm = loss_mask.view(-1)
-            loss = torch.sum(out.last_loss * lm) / lm.sum()
-        loss.backward()
-        rms = []
-        for layer in model.layers:
-            g = layer.snn_block.W_in.weight.grad
-            rms.append(g.float().pow(2).mean().sqrt().item())
-        model.zero_grad(set_to_none=True)
-        return [rms[0] / max(r, 1e-10) for r in rms]
-
-    _layer_scales = _calibrate_layer_scales()
-    Logger(f"  Layer LR calibrated: L0={_layer_scales[0]:.2f}x → L{args.num_layers-1}={_layer_scales[-1]:.2f}x")
 
     param_groups = []
     for key, params in _pg.items():
@@ -446,18 +440,18 @@ if __name__ == "__main__":
         N_val = args.N if key in ('b_beta', 'b_alpha', 'b_omega', 'b_th') else None
 
         if key not in _no_layer_scale_keys:
-            # 按层拆分，用校准倍率
+            # 按层拆分，校准前 ls=1.0
             by_layer = {}
             for p in params:
                 lidx = _layer_map.get(id(p))  # None for non-layer params
                 by_layer.setdefault(lidx, []).append(p)
             for lidx, lparams in sorted(by_layer.items(), key=lambda x: (x[0] is None, x[0])):
-                ls = _layer_scales[lidx] if lidx is not None else 1.0
-                composite = func_lr_mult * ls
                 param_groups.append({
                     'params': lparams,
-                    'lr': args.learning_rate * composite,
-                    'lr_mult': composite,
+                    'lr': args.learning_rate * func_lr_mult,
+                    'lr_mult': func_lr_mult,
+                    '_func_lr_mult': func_lr_mult,
+                    '_layer_idx': lidx,
                     'weight_decay': wd,
                     'dynamics': dynamics,
                     'N': N_val,
@@ -468,6 +462,8 @@ if __name__ == "__main__":
                 'params': params,
                 'lr': args.learning_rate * func_lr_mult,
                 'lr_mult': func_lr_mult,
+                '_func_lr_mult': func_lr_mult,
+                '_layer_idx': None,
                 'weight_decay': wd,
                 'dynamics': dynamics,
                 'N': N_val,
@@ -507,7 +503,7 @@ if __name__ == "__main__":
     Logger(f"  Steps/epoch: {iter_per_epoch:,}")
     Logger(f"  LR:          {args.learning_rate} (warmup {args.warmup_iters} → cosine → {args.learning_rate/10})")
     Logger(f"  Neuron LR:   {args.learning_rate * args.neuron_lr_mult} ({args.neuron_lr_mult}× base)")
-    Logger(f"  Layer LR:    L0={_layer_scales[0]:.2f}x → L{args.num_layers-1}={_layer_scales[-1]:.2f}x (calibrated, {len(param_groups)} groups)")
+    Logger(f"  Layer LR:    auto-calibrate on first accumulated batch ({len(param_groups)} groups)")
     Logger(f"  Grad clip:   {args.grad_clip}")
     Logger(f"  Precision:   {args.dtype}")
     Logger(f"  Save every:  {args.save_interval} steps")

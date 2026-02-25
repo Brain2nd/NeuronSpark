@@ -198,6 +198,20 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
         # 梯度累积
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
+
+            # 首次 accumulated batch: 就地校准 layer-wise LR
+            if not getattr(optimizer, '_layer_lr_calibrated', False):
+                _rms = [l.snn_block.W_in.weight.grad.float().pow(2).mean().sqrt().item()
+                        for l in model.layers]
+                _scales = [_rms[0] / max(r, 1e-10) for r in _rms]
+                for pg in optimizer.param_groups:
+                    _lidx = pg.get('_layer_idx')
+                    if _lidx is not None:
+                        pg['lr_mult'] = pg['_func_lr_mult'] * _scales[_lidx]
+                        pg['lr'] = lr * pg['lr_mult']
+                Logger(f"  Layer LR calibrated: L0={_scales[0]:.2f}x → L{args.num_layers-1}={_scales[-1]:.2f}x ({len(optimizer.param_groups)} groups)")
+                optimizer._layer_lr_calibrated = True
+
             model.compensate_modulation_gradients()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
@@ -323,14 +337,44 @@ if __name__ == "__main__":
     _pg = model.get_param_groups()
     _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th',
                     'block_output_neuron', 'ffn_neurons', 'output_neuron'}
-    neuron_params = [p for k in _neuron_keys for p in _pg[k]]
-    other_params = [p for k, ps in _pg.items() if k not in _neuron_keys for p in ps]
-    optimizer = optim.AdamW([
-        {'params': other_params, 'lr': args.learning_rate, 'lr_mult': 1.0,
-         'weight_decay': 0.01},
-        {'params': neuron_params, 'lr': args.learning_rate * args.neuron_lr_mult,
-         'lr_mult': float(args.neuron_lr_mult), 'weight_decay': 0.0},
-    ])
+
+    # ---- Layer-wise LR: 按层拆分参数组，第一次 accumulated batch 后就地校准 ----
+    # Dynamics 参数不参与层缩放（与预训练脚本一致）
+    _layer_map = model.get_layer_indices()
+    _no_layer_scale_keys = {'b_beta', 'b_alpha', 'b_omega', 'b_th'}
+
+    param_groups = []
+    for key, params in _pg.items():
+        if not params:
+            continue
+        func_lr_mult = float(args.neuron_lr_mult) if key in _neuron_keys else 1.0
+        wd = 0.0 if key in _neuron_keys else 0.01
+
+        if key not in _no_layer_scale_keys:
+            by_layer = {}
+            for p in params:
+                lidx = _layer_map.get(id(p))
+                by_layer.setdefault(lidx, []).append(p)
+            for lidx, lparams in sorted(by_layer.items(), key=lambda x: (x[0] is None, x[0])):
+                param_groups.append({
+                    'params': lparams,
+                    'lr': args.learning_rate * func_lr_mult,
+                    'lr_mult': func_lr_mult,
+                    '_func_lr_mult': func_lr_mult,
+                    '_layer_idx': lidx,
+                    'weight_decay': wd,
+                })
+        else:
+            param_groups.append({
+                'params': params,
+                'lr': args.learning_rate * func_lr_mult,
+                'lr_mult': func_lr_mult,
+                '_func_lr_mult': func_lr_mult,
+                '_layer_idx': None,
+                'weight_decay': wd,
+            })
+
+    optimizer = optim.AdamW(param_groups)
 
     # 恢复 SFT checkpoint
     tokens_seen = 0
@@ -355,6 +399,7 @@ if __name__ == "__main__":
     Logger(f"  Steps/epoch: {iter_per_epoch:,}")
     Logger(f"  LR:          {args.learning_rate} (warmup {args.warmup_iters} → cosine → {args.learning_rate/10})")
     Logger(f"  Neuron LR:   {args.learning_rate * args.neuron_lr_mult} ({args.neuron_lr_mult}× base)")
+    Logger(f"  Layer LR:    auto-calibrate on first accumulated batch ({len(param_groups)} groups)")
     Logger(f"  Grad clip:   {args.grad_clip}")
     Logger(f"  Precision:   {args.dtype}")
     Logger(f"  Save every:  {args.save_interval} steps")

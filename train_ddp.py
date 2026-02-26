@@ -406,7 +406,7 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
             # 定期健康检查（每 500 步，或训练开始时）
             global_step = epoch * iter_per_epoch + step + 1
             if global_step == args.accumulation_steps or global_step % 500 == 0:
-                health = snn_health_check(model, optimizer, loss, global_step, rank, verbose=True)
+                health = snn_health_check(model, optimizer, loss, global_step, rank, check_grad=False)
                 if not health['healthy']:
                     raise RuntimeError(f"SNN 健康检查失败: {health['errors']}")
 

@@ -403,14 +403,8 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
-            # 计算全局步数
-            global_step = epoch * iter_per_epoch + step + 1
-
-            # 首次编译后清理显存碎片（torch.compile 峰值优化）
-            if global_step == args.accumulation_steps:
-                torch.cuda.empty_cache()
-
             # 定期健康检查（每 500 步，或训练开始时）
+            global_step = epoch * iter_per_epoch + step + 1
             if global_step == args.accumulation_steps or global_step % 500 == 0:
                 health = snn_health_check(model, optimizer, loss, global_step, rank, check_grad=False)
                 if not health['healthy']:

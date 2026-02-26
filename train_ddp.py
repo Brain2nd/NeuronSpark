@@ -232,8 +232,9 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
 
-            # 每 epoch 首个 accumulated batch 重校准 layer-wise LR (EMA α=0.3)
-            if (step + 1) == args.accumulation_steps:
+            # 每 5000 步重校准 layer-wise LR (EMA α=0.3)
+            global_step = step + 1; _recalib = (global_step == args.accumulation_steps) or (global_step % 5000 == 0)
+            if _recalib:
                 _raw = model.module if isinstance(model, DDP) else model
                 _rms = [l.snn_block.W_in.weight.grad.float().pow(2).mean().sqrt().item()
                         for l in _raw.layers]

@@ -24,7 +24,7 @@ from spikingjelly.activation_based import base, surrogate
 
 from .plif_node import PLIFNode
 from .rms_norm import RMSNorm
-from .snn_block import SNNBlock
+from .snn_block_sew import SNNBlock
 from .snn_ffn import SNNFFN
 from .parallel_scan import plif_rowparam_forward
 

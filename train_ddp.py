@@ -195,6 +195,134 @@ def init_model(args, local_rank, rank):
 
 
 # ============================================================
+# SNN 健康检查
+# ============================================================
+
+def snn_health_check(model, optimizer, loss, step, rank, verbose=True):
+    """
+    SNN 训练健康检查，检测以下异常：
+    1. Loss 异常：NaN/Inf
+    2. 神经元发放异常：癫痫（发放率过高）/ 死寂（发放率过低）
+    3. 神经元趋同：所有神经元输出相同
+    4. 梯度流通异常：梯度消失/爆炸
+    5. Layer-wise LR 倍率补偿异常
+
+    Returns:
+        dict: 健康状态报告
+    """
+    report = {'healthy': True, 'warnings': [], 'errors': []}
+    _raw = model.module if hasattr(model, 'module') else model
+
+    # 1. Loss 检查
+    if torch.isnan(loss) or torch.isinf(loss):
+        report['healthy'] = False
+        report['errors'].append(f"Loss 异常: {loss.item()}")
+        return report
+
+    # 2. 神经元发放率检查（通过检查 hidden_neuron 的 v 状态）
+    firing_rates = []
+    dead_layers = []
+    epileptic_layers = []
+
+    for i, layer in enumerate(_raw.layers):
+        snn_block = layer.snn_block
+        # 检查隐藏神经元膜电位分布
+        if hasattr(snn_block, 'hidden_neuron') and hasattr(snn_block.hidden_neuron, 'v'):
+            v = snn_block.hidden_neuron.v
+            if isinstance(v, torch.Tensor):
+                v_mean = v.mean().item()
+                v_std = v.std().item()
+                v_th = snn_block.hidden_neuron.v_th
+                if isinstance(v_th, torch.Tensor):
+                    v_th_mean = v_th.mean().item()
+                else:
+                    v_th_mean = v_th
+
+                # 估计发放率：v 接近 v_th 的比例
+                if isinstance(v_th, torch.Tensor):
+                    firing_ratio = (v > v_th * 0.8).float().mean().item()
+                else:
+                    firing_ratio = (v > v_th * 0.8).float().mean().item()
+                firing_rates.append(firing_ratio)
+
+                # 死寂检测：发放率 < 1%
+                if firing_ratio < 0.01:
+                    dead_layers.append(i)
+                # 癫痫检测：发放率 > 90%
+                elif firing_ratio > 0.90:
+                    epileptic_layers.append(i)
+
+    if dead_layers:
+        report['warnings'].append(f"死寂神经元层: {dead_layers} (发放率<1%)")
+    if epileptic_layers:
+        report['warnings'].append(f"癫痫神经元层: {epileptic_layers} (发放率>90%)")
+
+    # 3. 神经元趋同检查（输出方差过小）
+    convergent_layers = []
+    for i, layer in enumerate(_raw.layers):
+        snn_block = layer.snn_block
+        if hasattr(snn_block, 'output_neuron') and hasattr(snn_block.output_neuron, 'v'):
+            v = snn_block.output_neuron.v
+            if isinstance(v, torch.Tensor) and v.numel() > 1:
+                v_std = v.std().item()
+                if v_std < 1e-6:
+                    convergent_layers.append(i)
+
+    if convergent_layers:
+        report['warnings'].append(f"神经元趋同层: {convergent_layers} (输出方差<1e-6)")
+
+    # 4. 梯度流通检查
+    grad_norms = {}
+    vanishing_params = []
+    exploding_params = []
+
+    for name, param in _raw.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.float().norm().item()
+            grad_norms[name] = grad_norm
+
+            # 梯度消失：norm < 1e-7
+            if grad_norm < 1e-7:
+                vanishing_params.append(name)
+            # 梯度爆炸：norm > 1e4
+            elif grad_norm > 1e4:
+                exploding_params.append(name)
+
+            # 梯度 NaN/Inf
+            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                report['healthy'] = False
+                report['errors'].append(f"梯度 NaN/Inf: {name}")
+
+    if vanishing_params and len(vanishing_params) > len(grad_norms) * 0.3:
+        report['warnings'].append(f"梯度消失参数: {len(vanishing_params)}/{len(grad_norms)} (>30%)")
+    if exploding_params:
+        report['warnings'].append(f"梯度爆炸参数: {exploding_params[:5]}...")
+
+    # 5. Layer-wise LR 倍率补偿检查
+    if hasattr(optimizer, '_layer_scales'):
+        scales = optimizer._layer_scales
+        if scales:
+            scale_min, scale_max = min(scales), max(scales)
+            scale_ratio = scale_max / max(scale_min, 1e-10)
+            # 倍率差异过大（>100x）可能有问题
+            if scale_ratio > 100:
+                report['warnings'].append(f"LR 倍率差异过大: {scale_min:.2f}x ~ {scale_max:.2f}x (比值{scale_ratio:.0f})")
+            # 倍率全部接近 0
+            if scale_max < 0.01:
+                report['warnings'].append(f"LR 倍率过小: max={scale_max:.4f}")
+
+    # 汇总
+    if report['errors']:
+        report['healthy'] = False
+    if report['warnings'] and verbose and rank == 0:
+        print(f"[Health Check @ step {step}] ⚠️ Warnings: {report['warnings']}")
+    if report['errors'] and rank == 0:
+        print(f"[Health Check @ step {step}] ❌ Errors: {report['errors']}")
+
+    return report
+
+
+# ============================================================
 # 训练循环
 # ============================================================
 
@@ -256,6 +384,13 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+
+            # 定期健康检查（每 500 步，或训练开始时）
+            global_step = epoch * iter_per_epoch + step + 1
+            if global_step == args.accumulation_steps or global_step % 500 == 0:
+                health = snn_health_check(model, optimizer, loss, global_step, rank, verbose=True)
+                if not health['healthy']:
+                    raise RuntimeError(f"SNN 健康检查失败: {health['errors']}")
 
         # 有效 token 数（汇总所有卡）
         valid_tokens = loss_mask_flat.sum()

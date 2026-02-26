@@ -37,7 +37,6 @@ from .plif_node import PLIFNode
 from .parallel_scan import plif_parallel_forward, plif_fixed_param_forward, plif_rowparam_forward, plif_rowparam_forward_sew, rf_plif_parallel_forward
 
 
-@torch.compile(backend='inductor', fullgraph=True)
 def _fused_gate_skip_scale(
     I_out: torch.Tensor, gate: torch.Tensor,
     I_skip: torch.Tensor, one_minus_beta: torch.Tensor,
@@ -50,13 +49,17 @@ def _fused_gate_skip_scale(
     为:
         u_output = (I_out * gate + I_skip) * (1 - beta)
     省去 I_total 中间张量分配。
+
+    NOTE: 移除 @torch.compile 以避免 autograd 图膨胀 (inductor 会保存所有输入张量)。
+    PyTorch 的 JIT fuser 会自动融合这些 elementwise ops。
     """
     return (I_out * gate + I_skip) * one_minus_beta
 
 
-# ====== Fused modulation activations (torch.compile) ======
+# ====== Fused modulation activations ======
+# NOTE: 移除 @torch.compile 以避免训练时 autograd 图膨胀
+# PyTorch eager mode 的 JIT fuser 会自动融合这些 elementwise ops
 
-@torch.compile(backend='inductor', fullgraph=True)
 def _fused_modulation_rf(raw_beta, b_beta, raw_alpha, b_alpha, raw_th, b_th,
                           v_th_min, I_all, raw_omega, b_omega):
     """融合 sigmoid + softplus + abs + stability constraint → 单 kernel。

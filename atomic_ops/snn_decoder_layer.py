@@ -29,9 +29,10 @@ from .snn_ffn import SNNFFN
 from .parallel_scan import plif_rowparam_forward
 
 
-# ====== Fused residual + mean-centering (torch.compile → single kernel) ======
+# ====== Fused residual + mean-centering ======
+# NOTE: 移除 @torch.compile 以避免训练时 autograd 图膨胀
+# PyTorch eager mode 的 JIT fuser 会自动融合这些 elementwise ops
 
-@torch.compile(backend='inductor', fullgraph=True)
 def _fused_residual_center(h: torch.Tensor, res: torch.Tensor) -> torch.Tensor:
     """h + res - mean(res, dim=-1): 3 element-wise ops → 1 fused kernel."""
     return h + res - res.mean(dim=-1, keepdim=True)

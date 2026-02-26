@@ -560,9 +560,14 @@ if _HAS_TRITON:
                 BLOCK=BLOCK,
             )
 
+            # 内存优化: 保存 spike_orig 而非 (spike_sew + spike_in)
+            # spike_orig = spike_sew - spike_in (原始 PLIF spike)
+            # 这样只保存 5 个张量而非 6 个，节省 ~17% autograd 内存
+            spike_orig = spike_sew - spike_in_c
+
             if any(ctx.needs_input_grad[:5]):
                 ctx.save_for_backward(
-                    beta_row_c, v_th_row_c, v_init_c, V_post, spike_sew, spike_in_c,
+                    beta_row_c, v_th_row_c, v_init_c, V_post, spike_orig,
                 )
             ctx.K = K
             ctx.num_cols = num_cols
@@ -572,18 +577,17 @@ if _HAS_TRITON:
 
         @staticmethod
         def backward(ctx, grad_spike_sew, grad_V_post):
-            beta_row, v_th_row, v_init, V_post, spike_sew, spike_in = ctx.saved_tensors
+            beta_row, v_th_row, v_init, V_post, spike_orig = ctx.saved_tensors
             K = ctx.K
             num_cols = ctx.num_cols
             alpha = ctx.alpha
 
             if grad_spike_sew is None:
-                grad_spike_sew = torch.zeros_like(spike_sew)
+                grad_spike_sew = torch.zeros_like(spike_orig)
             if grad_V_post is None:
                 grad_V_post = torch.zeros_like(V_post)
 
-            # Recover original PLIF spike: spike_orig = spike_sew - spike_in
-            spike_orig = spike_sew - spike_in
+            # spike_orig 已在 forward 中计算保存
 
             grad_spike_c = grad_spike_sew.contiguous()
             grad_V_post_c = grad_V_post.contiguous()

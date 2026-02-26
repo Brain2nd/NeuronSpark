@@ -199,18 +199,23 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
 
-            # 首次 accumulated batch: 就地校准 layer-wise LR
-            if not getattr(optimizer, '_layer_lr_calibrated', False):
+            # 每 epoch 首个 accumulated batch 重校准 layer-wise LR (EMA α=0.3)
+            if (step + 1) == args.accumulation_steps:
                 _rms = [l.snn_block.W_in.weight.grad.float().pow(2).mean().sqrt().item()
                         for l in model.layers]
-                _scales = [_rms[0] / max(r, 1e-10) for r in _rms]
+                _new = [_rms[0] / max(r, 1e-10) for r in _rms]
+                _prev = getattr(optimizer, '_layer_scales', None)
+                if _prev is not None:
+                    _scales = [0.3 * n + 0.7 * p for n, p in zip(_new, _prev)]
+                else:
+                    _scales = _new
+                optimizer._layer_scales = _scales
                 for pg in optimizer.param_groups:
                     _lidx = pg.get('_layer_idx')
                     if _lidx is not None:
                         pg['lr_mult'] = pg['_func_lr_mult'] * _scales[_lidx]
                         pg['lr'] = lr * pg['lr_mult']
-                Logger(f"  Layer LR calibrated: L0={_scales[0]:.2f}x → L{args.num_layers-1}={_scales[-1]:.2f}x ({len(optimizer.param_groups)} groups)")
-                optimizer._layer_lr_calibrated = True
+                Logger(f"  Layer LR recalib: L0={_scales[0]:.2f}x → L{args.num_layers-1}={_scales[-1]:.2f}x")
 
             model.compensate_modulation_gradients()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)

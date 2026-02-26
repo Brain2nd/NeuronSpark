@@ -249,19 +249,22 @@ def snn_health_check(model, optimizer=None, loss=None, step=0, rank=0, check_gra
 
     for i, layer in enumerate(_raw.layers):
         snn_block = layer.snn_block
-        if hasattr(snn_block, 'hidden_neuron') and hasattr(snn_block.hidden_neuron, 'v'):
-            v = snn_block.hidden_neuron.v
-            if isinstance(v, torch.Tensor):
-                v_th = snn_block.hidden_neuron.v_th
-                v_th_val = v_th.mean().item() if isinstance(v_th, torch.Tensor) else v_th
-                # 估计发放率：v > 0.8 * v_th 的比例
-                firing_ratio = (v > v_th_val * 0.8).float().mean().item()
-                firing_stats.append({'layer': i, 'firing_rate': firing_ratio, 'v_mean': v.mean().item()})
+        if hasattr(snn_block, 'hidden_neuron'):
+            neuron = snn_block.hidden_neuron
+            # 检查是否有 v 和 v_th 属性（SelectivePLIFNode 可能没有）
+            if hasattr(neuron, 'v') and hasattr(neuron, 'v_th'):
+                v = neuron.v
+                if isinstance(v, torch.Tensor):
+                    v_th = neuron.v_th
+                    v_th_val = v_th.mean().item() if isinstance(v_th, torch.Tensor) else v_th
+                    # 估计发放率：v > 0.8 * v_th 的比例
+                    firing_ratio = (v > v_th_val * 0.8).float().mean().item()
+                    firing_stats.append({'layer': i, 'firing_rate': firing_ratio, 'v_mean': v.mean().item()})
 
-                if firing_ratio < 0.01:
-                    dead_layers.append(i)
-                elif firing_ratio > 0.90:
-                    epileptic_layers.append(i)
+                    if firing_ratio < 0.01:
+                        dead_layers.append(i)
+                    elif firing_ratio > 0.90:
+                        epileptic_layers.append(i)
 
     report['stats']['firing'] = firing_stats
     if dead_layers:

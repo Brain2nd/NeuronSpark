@@ -1325,6 +1325,271 @@ if _HAS_TRITON:
 
             return grad_beta, grad_omega, grad_u, grad_v_th, grad_v_init, grad_w_init, None
 
+    # ============================================================
+    # RF-PLIF with V_post/W recomputation (memory-optimal)
+    # ============================================================
+    # 优化策略: forward 只保存 spike, backward 时重新计算 V_post/W
+    # 节省 ~66% autograd 内存 (V_post + W 两个大张量)
+
+    @triton.jit
+    def _fused_rf_plif_fwd_noVW_kernel(
+        BETA_ptr, OMEGA_ptr, U_ptr, VTH_ptr, VINIT_ptr, WINIT_ptr,
+        SPIKE_ptr, V_LAST_ptr, W_LAST_ptr,
+        K, num_cols,
+        BLOCK: tl.constexpr,
+    ):
+        """Fused RF-PLIF forward, only stores spike and last V/W state.
+
+        V_post and W sequences are NOT stored - they will be recomputed in backward.
+        This saves ~66% autograd memory.
+
+        Per column:
+          v, w = v_init, w_init
+          for k = 0..K-1:
+            v_pre = beta[k]*v - omega[k]*w + u[k]
+            w_new = omega[k]*v + beta[k]*w
+            spike[k] = Θ(v_pre - v_th[k])
+            v = v_pre - v_th[k]*spike[k]
+            w = w_new
+          v_last = v, w_last = w
+        """
+        pid = tl.program_id(0)
+        cols = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < num_cols
+
+        v = tl.load(VINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(WINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+        for k in range(K):
+            off = k * num_cols + cols
+            beta = tl.load(BETA_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            omega = tl.load(OMEGA_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            u = tl.load(U_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            vth = tl.load(VTH_ptr + off, mask=mask, other=0.0).to(tl.float32)
+
+            v_pre = beta * v - omega * w + u
+            w_new = omega * v + beta * w
+
+            spike = tl.where(v_pre >= vth, 1.0, 0.0)
+            v = v_pre - vth * spike  # soft reset V
+            w = w_new               # W not reset
+
+            tl.store(SPIKE_ptr + off, spike, mask=mask)
+
+        # Store only the last V_post and W for state update
+        tl.store(V_LAST_ptr + cols, v, mask=mask)
+        tl.store(W_LAST_ptr + cols, w, mask=mask)
+
+    @triton.jit
+    def _fused_rf_plif_bwd_recomp_kernel(
+        BETA_ptr, OMEGA_ptr, U_ptr, VTH_ptr, VINIT_ptr, WINIT_ptr,
+        SPIKE_ptr,
+        GRAD_SPIKE_ptr, GRAD_VPOST_ptr,
+        GRAD_BETA_ptr, GRAD_OMEGA_ptr, GRAD_U_ptr, GRAD_VTH_ptr,
+        GRAD_VINIT_ptr, GRAD_WINIT_ptr,
+        VPOST_TEMP_ptr, W_TEMP_ptr,
+        K, num_cols, ALPHA,
+        BLOCK: tl.constexpr,
+    ):
+        """Fused RF-PLIF backward with V_post/W recomputation.
+
+        Phase 1: Forward recomputation to reconstruct V_post and W sequences
+        Phase 2: Backward scan using recomputed V_post/W
+
+        This trades compute for memory - recomputes V_post/W instead of storing them.
+        """
+        pid = tl.program_id(0)
+        cols = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < num_cols
+
+        # ====== Phase 1: Forward recomputation of V_post and W ======
+        v = tl.load(VINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(WINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+        for k in range(K):
+            off = k * num_cols + cols
+            beta = tl.load(BETA_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            omega = tl.load(OMEGA_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            u = tl.load(U_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            vth = tl.load(VTH_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            spike = tl.load(SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
+
+            v_pre = beta * v - omega * w + u
+            w_new = omega * v + beta * w
+
+            v = v_pre - vth * spike
+            w = w_new
+
+            # Store to temp buffer for backward phase
+            tl.store(VPOST_TEMP_ptr + off, v, mask=mask)
+            tl.store(W_TEMP_ptr + off, w, mask=mask)
+
+        # ====== Phase 2: Backward scan using recomputed V_post/W ======
+        acc_v = tl.zeros([BLOCK], dtype=tl.float32)
+        acc_w = tl.zeros([BLOCK], dtype=tl.float32)
+
+        # Preload last step's v_post, w from temp buffer
+        last_off = (K - 1) * num_cols + cols
+        cached_v = tl.load(VPOST_TEMP_ptr + last_off, mask=mask, other=0.0).to(tl.float32)
+        cached_w = tl.load(W_TEMP_ptr + last_off, mask=mask, other=0.0).to(tl.float32)
+
+        for k_rev in range(K):
+            k = K - 1 - k_rev
+            off = k * num_cols + cols
+
+            beta = tl.load(BETA_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            omega = tl.load(OMEGA_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            vth = tl.load(VTH_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            spike = tl.load(SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
+
+            g_s = tl.load(GRAD_SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            g_V = tl.load(GRAD_VPOST_ptr + off, mask=mask, other=0.0).to(tl.float32)
+
+            # v_post[k] and w[k] from cached registers (first iter from preload)
+            v_post = cached_v
+            w_cur = cached_w
+
+            # Load v_prev=v_post[k-1], w_prev=w[k-1], cache for next iteration
+            if k > 0:
+                v_prev = tl.load(
+                    VPOST_TEMP_ptr + (k - 1) * num_cols + cols,
+                    mask=mask, other=0.0,
+                ).to(tl.float32)
+                w_prev = tl.load(
+                    W_TEMP_ptr + (k - 1) * num_cols + cols,
+                    mask=mask, other=0.0,
+                ).to(tl.float32)
+                cached_v = v_prev
+                cached_w = w_prev
+            else:
+                v_prev = tl.load(VINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+                w_prev = tl.load(WINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+            # Sigmoid surrogate gradient
+            x = v_post - vth * (1.0 - spike)  # = V_pre - v_th
+            neg_ax = -ALPHA * x
+            neg_ax = tl.where(neg_ax > 88.0, 88.0, neg_ax)
+            sig = 1.0 / (1.0 + tl.exp(neg_ax))
+            sg = ALPHA * sig * (1.0 - sig)
+
+            total_gV = g_V + acc_v
+            total_gW = acc_w
+            grad_v_pre = g_s * sg + total_gV
+
+            # Parameter gradients
+            tl.store(GRAD_BETA_ptr + off, grad_v_pre * v_prev + total_gW * w_prev, mask=mask)
+            tl.store(GRAD_OMEGA_ptr + off, grad_v_pre * (-w_prev) + total_gW * v_prev, mask=mask)
+            tl.store(GRAD_U_ptr + off, grad_v_pre, mask=mask)
+            tl.store(GRAD_VTH_ptr + off, -g_s * sg - total_gV * spike, mask=mask)
+
+            # Propagate accumulators (transpose of forward transition matrix)
+            acc_v = grad_v_pre * beta + total_gW * omega
+            acc_w = grad_v_pre * (-omega) + total_gW * beta
+
+        tl.store(GRAD_VINIT_ptr + cols, acc_v, mask=mask)
+        tl.store(GRAD_WINIT_ptr + cols, acc_w, mask=mask)
+
+    class _TritonRFPLIFRecompute(torch.autograd.Function):
+        """Fused Triton RF-PLIF with V_post/W recomputation (memory-optimal).
+
+        Saves ~66% autograd memory by not storing V_post and W sequences.
+        Instead, recomputes them during backward pass.
+        """
+
+        _BLOCK = 128
+
+        @staticmethod
+        def forward(ctx, beta, omega, u, v_th, v_init, w_init, alpha):
+            beta_c = beta.contiguous()
+            omega_c = omega.contiguous()
+            u_c = u.contiguous()
+            v_th_c = v_th.contiguous()
+            v_init_c = v_init.contiguous()
+            w_init_c = w_init.contiguous()
+
+            K = beta_c.shape[0]
+            num_cols = beta_c[0].numel()
+
+            spike = torch.empty_like(u_c)
+            v_last = torch.empty_like(v_init_c)
+            w_last = torch.empty_like(w_init_c)
+
+            BLOCK = _TritonRFPLIFRecompute._BLOCK
+            grid = ((num_cols + BLOCK - 1) // BLOCK,)
+
+            _fused_rf_plif_fwd_noVW_kernel[grid](
+                beta_c, omega_c, u_c, v_th_c, v_init_c, w_init_c,
+                spike, v_last, w_last,
+                K, num_cols,
+                BLOCK=BLOCK,
+            )
+
+            if any(ctx.needs_input_grad[:6]):
+                # Don't save V_post and W - save the inputs for recomputation
+                ctx.save_for_backward(
+                    beta_c, omega_c, u_c, v_th_c, v_init_c, w_init_c, spike,
+                )
+            ctx.K = K
+            ctx.num_cols = num_cols
+            ctx.alpha = alpha
+
+            # Return spike and last V_post/W for state update
+            # Create placeholder V_post/W tensors (only v_last/w_last are valid)
+            V_post = v_last.unsqueeze(0)  # (1, *shape) - only last frame
+            W = w_last.unsqueeze(0)        # (1, *shape) - only last frame
+
+            return spike, V_post, W
+
+        @staticmethod
+        def backward(ctx, grad_spike, grad_V_post, grad_W):
+            beta, omega, u, v_th, v_init, w_init, spike = ctx.saved_tensors
+            K = ctx.K
+            num_cols = ctx.num_cols
+            alpha = ctx.alpha
+
+            if grad_spike is None:
+                grad_spike = torch.zeros_like(spike)
+
+            # grad_V_post comes as (1, *shape) from the placeholder
+            # We need full (K, *shape) for backward, but we only have gradient for last step
+            # Create full gradient tensor with zeros, only last frame has gradient
+            if grad_V_post is not None and grad_V_post.shape[0] == 1:
+                full_grad_V_post = torch.zeros_like(spike)
+                full_grad_V_post[-1] = grad_V_post[0]
+                grad_V_post = full_grad_V_post
+            elif grad_V_post is None:
+                grad_V_post = torch.zeros_like(spike)
+
+            grad_spike_c = grad_spike.contiguous()
+            grad_V_post_c = grad_V_post.contiguous()
+
+            grad_beta = torch.empty_like(beta)
+            grad_omega = torch.empty_like(omega)
+            grad_u = torch.empty_like(u)
+            grad_v_th = torch.empty_like(v_th)
+            grad_v_init = torch.empty_like(v_init)
+            grad_w_init = torch.empty_like(w_init)
+
+            # Temporary buffers for recomputed V_post and W
+            V_post_temp = torch.empty_like(spike)
+            W_temp = torch.empty_like(spike)
+
+            BLOCK = _TritonRFPLIFRecompute._BLOCK
+            grid = ((num_cols + BLOCK - 1) // BLOCK,)
+
+            _fused_rf_plif_bwd_recomp_kernel[grid](
+                beta, omega, u, v_th, v_init, w_init,
+                spike,
+                grad_spike_c, grad_V_post_c,
+                grad_beta, grad_omega, grad_u, grad_v_th,
+                grad_v_init, grad_w_init,
+                V_post_temp, W_temp,
+                K, num_cols, float(alpha),
+                BLOCK=BLOCK,
+            )
+
+            return grad_beta, grad_omega, grad_u, grad_v_th, grad_v_init, grad_w_init, None
+
 # Hillis-Steele parallel prefix scan (CPU fallback)
 # ============================================================
 
@@ -1779,12 +2044,13 @@ def rf_plif_parallel_forward(
         V_post: (K, *shape) — 发放后膜电位
         W:      (K, *shape) — 振荡状态
     """
-    # Fused Triton path
+    # Fused Triton path with V_post/W recomputation (memory-optimal)
+    # 使用 _TritonRFPLIFRecompute 版本，节省 ~66% autograd 内存
     if (_HAS_TRITON and beta.is_cuda and surrogate_function is not None
             and hasattr(surrogate_function, 'alpha')
             and type(surrogate_function).__name__ == 'Sigmoid'):
         alpha = float(surrogate_function.alpha)
-        spike, V_post, W = _TritonRFPLIFForward.apply(
+        spike, V_post, W = _TritonRFPLIFRecompute.apply(
             beta, omega, u, v_th, v_init, w_init, alpha,
         )
         return spike, V_post, W

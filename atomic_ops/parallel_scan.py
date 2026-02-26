@@ -2044,13 +2044,13 @@ def rf_plif_parallel_forward(
         V_post: (K, *shape) — 发放后膜电位
         W:      (K, *shape) — 振荡状态
     """
-    # Fused Triton path with V_post/W recomputation (memory-optimal)
-    # 使用 _TritonRFPLIFRecompute 版本，节省 ~66% autograd 内存
+    # Fused Triton path
+    # NOTE: _TritonRFPLIFRecompute 有梯度 bug，暂时使用原版 _TritonRFPLIFForward
     if (_HAS_TRITON and beta.is_cuda and surrogate_function is not None
             and hasattr(surrogate_function, 'alpha')
             and type(surrogate_function).__name__ == 'Sigmoid'):
         alpha = float(surrogate_function.alpha)
-        spike, V_post, W = _TritonRFPLIFRecompute.apply(
+        spike, V_post, W = _TritonRFPLIFForward.apply(
             beta, omega, u, v_th, v_init, w_init, alpha,
         )
         return spike, V_post, W

@@ -34,7 +34,24 @@ from spikingjelly.activation_based import base, layer, neuron, surrogate
 
 from .selective_plif import SelectivePLIFNode
 from .plif_node import PLIFNode
-from .parallel_scan import plif_parallel_forward, plif_fixed_param_forward, plif_rowparam_forward, rf_plif_parallel_forward
+from .parallel_scan import plif_parallel_forward, plif_fixed_param_forward, plif_rowparam_forward, plif_rowparam_forward_sew, rf_plif_parallel_forward
+
+
+@torch.compile(backend='inductor', fullgraph=True)
+def _fused_gate_skip_scale(
+    I_out: torch.Tensor, gate: torch.Tensor,
+    I_skip: torch.Tensor, one_minus_beta: torch.Tensor,
+) -> torch.Tensor:
+    """融合 gate·out + skip → (1-β) 缩放 → u_output: 3 element-wise ops → 1 fused kernel。
+
+    替代:
+        I_total = I_out * gate + I_skip
+        u_output = (1 - beta) * I_total
+    为:
+        u_output = (I_out * gate + I_skip) * (1 - beta)
+    省去 I_total 中间张量分配。
+    """
+    return (I_out * gate + I_skip) * one_minus_beta
 
 
 # ====== Fused modulation activations (torch.compile) ======
@@ -248,15 +265,14 @@ class SNNBlock(base.MemoryModule):
         self.hidden_neuron.v = V_post_hidden[-1].detach()
         self.hidden_neuron.w = W_hidden[-1].detach()
 
-        # ====== Phase 4: 输出投影 ======
+        # ====== Phase 4: 输出投影 + 融合 gate·skip·scale (P2) ======
         s_flat = s_hidden.reshape(TK * batch, DN)
         I_out_all = F.linear(s_flat, self.W_out.weight).reshape(TK, batch, D)
-        I_total_all = I_out_all * gate_all + I_skip_all
-
-        # ====== Phase 5: 输出神经元 parallel scan ======
         beta_out = self.output_neuron.beta
-        u_output = (1.0 - beta_out) * I_total_all
+        # P2: fuse (I_out * gate + I_skip) * (1-beta) into single kernel
+        u_output = _fused_gate_skip_scale(I_out_all, gate_all, I_skip_all, 1.0 - beta_out)
 
+        # ====== Phase 5+6: 输出神经元 parallel scan + SEW 残差 (P1) ======
         v_init_output = self.output_neuron.v
         if isinstance(v_init_output, float):
             v_init_output = self.output_neuron.expand_v_init(batch, flat.device, flat.dtype)
@@ -264,15 +280,18 @@ class SNNBlock(base.MemoryModule):
         beta_out_row = beta_out.unsqueeze(0).expand(batch, D).contiguous()
         v_th_out_row = self.output_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
 
-        spike_out, V_post_output = plif_rowparam_forward(
+        surr = self.output_neuron.get_surrogate(u_output)
+        alpha = float(surr.alpha) if hasattr(surr, 'alpha') else 4.0
+
+        # P1: fused PLIF + SEW (spike_sew = plif_spike + spike_in) in single Triton kernel
+        spike_sew, V_post_output = plif_rowparam_forward_sew(
             beta_out_row, u_output, v_th_out_row, v_init_output,
-            surrogate_function=self.output_neuron.get_surrogate(u_output),
+            spike_in_seq, alpha,
         )
 
         self.output_neuron.v = V_post_output[-1].detach()
 
-        # SEW-ResNet ADD: spike-level identity mapping for gradient flow
-        return spike_out + spike_in_seq
+        return spike_sew
 
     def single_step_forward(self, spike_in: torch.Tensor) -> torch.Tensor:
         """

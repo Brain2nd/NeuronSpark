@@ -486,6 +486,131 @@ if _HAS_TRITON:
             return grad_beta_row, grad_u, grad_v_th_row, grad_v_init, None
 
     # ============================================================
+    # Fused PLIF row-param + SEW residual kernel
+    # (spike_out = plif_spike + spike_in, fused into single kernel)
+    # ============================================================
+
+    @triton.jit
+    def _fused_plif_fwd_rowparam_sew_kernel(
+        BETA_ROW_ptr, U_ptr, VTH_ROW_ptr, INIT_ptr,
+        SPIKE_IN_ptr,
+        SPIKE_SEW_ptr, VPOST_ptr,
+        K, num_cols,
+        BLOCK: tl.constexpr,
+    ):
+        """Fused PLIF forward + SEW residual with row-parameter beta and v_th.
+
+        Same as _fused_plif_fwd_rowparam_kernel but stores spike + spike_in
+        instead of spike. Saves one full-tensor elementwise add kernel launch.
+        V_post uses original spike for soft reset (not spike + spike_in).
+        """
+        pid = tl.program_id(0)
+        cols = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = cols < num_cols
+
+        v = tl.load(INIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        beta = tl.load(BETA_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+        vth = tl.load(VTH_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+        for k in range(K):
+            off = k * num_cols + cols
+            u = tl.load(U_ptr + off, mask=mask, other=0.0).to(tl.float32)
+            spike_in = tl.load(SPIKE_IN_ptr + off, mask=mask, other=0.0).to(tl.float32)
+
+            v_pre = beta * v + u
+            spike = tl.where(v_pre >= vth, 1.0, 0.0)
+            v = v_pre - vth * spike
+
+            # SEW: store spike + spike_in (fused add)
+            tl.store(SPIKE_SEW_ptr + off, spike + spike_in, mask=mask)
+            tl.store(VPOST_ptr + off, v, mask=mask)
+
+    class _TritonPLIFRowParamSEWForward(torch.autograd.Function):
+        """Fused Triton PLIF + SEW residual.
+
+        Forward: spike_sew = plif_spike + spike_in (fused in kernel).
+        Backward: reuses _fused_plif_bwd_rowparam_kernel with spike_orig = spike_sew - spike_in.
+        grad_spike_in = grad_spike_sew (straight-through from SEW add).
+        """
+
+        _BLOCK = 128
+
+        @staticmethod
+        def forward(ctx, beta_row, u, v_th_row, v_init, spike_in_seq, alpha):
+            beta_row_c = beta_row.contiguous()
+            u_c = u.contiguous()
+            v_th_row_c = v_th_row.contiguous()
+            v_init_c = v_init.contiguous()
+            spike_in_c = spike_in_seq.contiguous()
+
+            K = u_c.shape[0]
+            num_cols = u_c[0].numel()
+
+            spike_sew = torch.empty_like(u_c)
+            V_post = torch.empty_like(u_c)
+
+            BLOCK = _TritonPLIFRowParamSEWForward._BLOCK
+            grid = ((num_cols + BLOCK - 1) // BLOCK,)
+
+            _fused_plif_fwd_rowparam_sew_kernel[grid](
+                beta_row_c, u_c, v_th_row_c, v_init_c,
+                spike_in_c,
+                spike_sew, V_post,
+                K, num_cols,
+                BLOCK=BLOCK,
+            )
+
+            if any(ctx.needs_input_grad[:5]):
+                ctx.save_for_backward(
+                    beta_row_c, v_th_row_c, v_init_c, V_post, spike_sew, spike_in_c,
+                )
+            ctx.K = K
+            ctx.num_cols = num_cols
+            ctx.alpha = alpha
+
+            return spike_sew, V_post
+
+        @staticmethod
+        def backward(ctx, grad_spike_sew, grad_V_post):
+            beta_row, v_th_row, v_init, V_post, spike_sew, spike_in = ctx.saved_tensors
+            K = ctx.K
+            num_cols = ctx.num_cols
+            alpha = ctx.alpha
+
+            if grad_spike_sew is None:
+                grad_spike_sew = torch.zeros_like(spike_sew)
+            if grad_V_post is None:
+                grad_V_post = torch.zeros_like(V_post)
+
+            # Recover original PLIF spike: spike_orig = spike_sew - spike_in
+            spike_orig = spike_sew - spike_in
+
+            grad_spike_c = grad_spike_sew.contiguous()
+            grad_V_post_c = grad_V_post.contiguous()
+
+            grad_beta_row = torch.empty_like(beta_row)
+            grad_u = torch.empty_like(V_post)
+            grad_v_th_row = torch.empty_like(v_th_row)
+            grad_v_init = torch.empty_like(v_init)
+
+            BLOCK = _TritonPLIFRowParamSEWForward._BLOCK
+            grid = ((num_cols + BLOCK - 1) // BLOCK,)
+
+            # Reuse existing backward kernel with original spike
+            _fused_plif_bwd_rowparam_kernel[grid](
+                beta_row, v_th_row, v_init, V_post, spike_orig,
+                grad_spike_c, grad_V_post_c,
+                grad_beta_row, grad_u, grad_v_th_row, grad_v_init,
+                K, num_cols, float(alpha),
+                BLOCK=BLOCK,
+            )
+
+            # grad_spike_in = grad_spike_sew (straight-through from SEW add)
+            grad_spike_in = grad_spike_sew
+
+            return grad_beta_row, grad_u, grad_v_th_row, grad_v_init, grad_spike_in, None
+
+    # ============================================================
     # Fused PLIF row-param kernels with V_post recomputation (Mamba-style)
     # Forward: only stores spike (no V_post materialization)
     # Backward: recomputes V_post from u + beta + v_th + spike in registers
@@ -1245,6 +1370,46 @@ def plif_rowparam_forward_alpha(
     v_th = v_th_row.unsqueeze(0).expand(K, *u.shape[1:]).contiguous()
     spike, V_post, _ = plif_parallel_forward(beta, u, v_th, v_init, surrogate_function=surr)
     return spike, V_post
+
+
+def plif_rowparam_forward_sew(
+    beta_row: torch.Tensor,
+    u: torch.Tensor,
+    v_th_row: torch.Tensor,
+    v_init: torch.Tensor,
+    spike_in_seq: torch.Tensor,
+    alpha: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    行参数 PLIF 前向 + SEW 残差融合（spike_sew = plif_spike + spike_in）。
+
+    将 PLIF 输出神经元的 spike 计算与 SEW-ResNet 的 spike-level add 融合到
+    单个 Triton kernel 中，省去一次全张量 elementwise add kernel launch。
+
+    Forward: spike_sew = plif_spike + spike_in (fused in kernel)
+    Backward: grad_spike_in = grad_spike_sew (straight-through)
+
+    Args:
+        beta_row: (*shape) — 每列的衰减率（所有 K 步相同）
+        u:        (K, *shape) — 每步输入（已含 1-beta 缩放）
+        v_th_row: (*shape) — 每列的阈值（所有 K 步相同）
+        v_init:   (*shape) — 初始膜电位
+        spike_in_seq: (K, *shape) — SEW 输入 spike 序列
+        alpha:    surrogate gradient alpha 值（float）
+
+    Returns:
+        spike_sew: (K, *shape) — plif_spike + spike_in
+        V_post:    (K, *shape) — 发放后膜电位
+    """
+    if _HAS_TRITON and u.is_cuda:
+        spike_sew, V_post = _TritonPLIFRowParamSEWForward.apply(
+            beta_row, u, v_th_row, v_init, spike_in_seq, alpha,
+        )
+        return spike_sew, V_post
+
+    # Fallback: unfused path
+    spike, V_post = plif_rowparam_forward_alpha(beta_row, u, v_th_row, v_init, alpha)
+    return spike + spike_in_seq, V_post
 
 
 def plif_rowparam_forward_recompute(

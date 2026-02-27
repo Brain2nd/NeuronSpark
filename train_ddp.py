@@ -38,6 +38,8 @@ from contextlib import nullcontext
 from transformers import AutoTokenizer
 
 from model import SNNLanguageModel
+from torch.utils.tensorboard import SummaryWriter
+
 from dataset import PretrainDataset
 from atomic_ops import SNNAdam
 
@@ -345,7 +347,7 @@ def print_health_report(report, rank=0):
 # ============================================================
 
 def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, args,
-                iter_per_epoch, tokens_seen, rank, world_size):
+                iter_per_epoch, tokens_seen, rank, world_size, writer=None):
     """训练一个 epoch（DDP 版本）。"""
     # 设置 sampler 的 epoch 以保证每个 epoch 的 shuffle 不同
     sampler.set_epoch(epoch)
@@ -409,6 +411,10 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
                 health = snn_health_check(model, optimizer, loss, global_step, rank, check_grad=False)
                 if not health['healthy']:
                     raise RuntimeError(f"SNN 健康检查失败: {health['errors']}")
+                # TensorBoard: 健康检查指标
+                if writer and health:
+                    for i, info in enumerate(health.get('stats', {}).get('firing', [])):
+                        writer.add_scalar(f'health/firing_rate/layer_{i}', info['firing_rate'], global_step)
 
         # 有效 token 数（汇总所有卡）
         valid_tokens = loss_mask_flat.sum()
@@ -431,6 +437,16 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
                     batch_loss, batch_ppl, lr, tps,
                     spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
                     mem_cur, mem_peak, world_size))
+
+            # TensorBoard
+            if writer:
+                global_step = epoch * iter_per_epoch + step
+                writer.add_scalar('train/loss', batch_loss, global_step)
+                writer.add_scalar('train/ppl', batch_ppl, global_step)
+                writer.add_scalar('train/lr', lr, global_step)
+                writer.add_scalar('train/tps', tps, global_step)
+                writer.add_scalar('train/mem_gb', mem_cur, global_step)
+                writer.add_scalar('train/mem_peak_gb', mem_peak, global_step)
 
         # 定期保存（仅主进程，带步数，保留最新 5 个）
         if (step + 1) % args.save_interval == 0:
@@ -496,6 +512,9 @@ if __name__ == "__main__":
                         default="data/seq-monkey/seq_monkey_datawhale.jsonl")
     parser.add_argument("--tokenizer_path", type=str, default="./tokenizer_snn/")
 
+    # TensorBoard
+    parser.add_argument('--tb_dir', default='runs', type=str, help='TensorBoard 日志根目录')
+
     # Checkpoint
     parser.add_argument('--resume', type=str, default=None)
 
@@ -509,6 +528,9 @@ if __name__ == "__main__":
 
     # 种子：每卡不同（保证数据不同），但可复现
     torch.manual_seed(42 + rank)
+
+    # TensorBoard（仅主进程）
+    writer = SummaryWriter(log_dir=os.path.join(args.tb_dir, args.out_dir)) if is_main_process(rank) else None
 
     # 混合精度
     ctx = torch.amp.autocast('cuda',
@@ -642,7 +664,7 @@ if __name__ == "__main__":
         model.train()
         tokens_seen = train_epoch(
             epoch, model, train_loader, sampler, optimizer, scaler, ctx, args,
-            iter_per_epoch, tokens_seen, rank, world_size,
+            iter_per_epoch, tokens_seen, rank, world_size, writer,
         )
 
     # 最终保存
@@ -651,5 +673,8 @@ if __name__ == "__main__":
         Logger(f"Peak CUDA memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB", rank)
         save_checkpoint(args.save_dir, model, optimizer, scaler,
                         args.epochs * iter_per_epoch, args.epochs - 1, 0.0, tokens_seen)
+
+    if writer:
+        writer.close()
 
     cleanup_distributed()

@@ -36,6 +36,8 @@ from contextlib import nullcontext
 
 from transformers import AutoTokenizer
 
+from torch.utils.tensorboard import SummaryWriter
+
 from model import SNNLanguageModel
 from dataset import SFTDataset
 
@@ -69,12 +71,12 @@ def get_lr(it, total_iters, learning_rate, warmup_iters):
 # ============================================================
 
 def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, tokens_seen,
-                    max_keep=5):
+                    health_report=None, max_keep=5):
     """保存训练状态，每次不覆盖（带步数），仅保留最新 max_keep 个。"""
     os.makedirs(save_dir, exist_ok=True)
     raw = model.module if isinstance(model, torch.nn.DataParallel) else model
     path = os.path.join(save_dir, f'ckpt_step{step}.pth')
-    torch.save({
+    ckpt_data = {
         'model_state_dict': raw.state_dict(),
         'optimizer_state': optimizer.state_dict(),
         'scaler_state': scaler.state_dict(),
@@ -90,7 +92,10 @@ def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, 
             'num_layers': raw.num_layers,
             'D_ff': raw.D_ff,
         },
-    }, path)
+    }
+    if health_report:
+        ckpt_data['health_report'] = health_report
+    torch.save(ckpt_data, path)
     Logger(f"  → Checkpoint saved: {path}")
 
     ckpts = sorted(glob.glob(os.path.join(save_dir, 'ckpt_step*.pth')))
@@ -167,10 +172,134 @@ def init_model(args):
 
 
 # ============================================================
+# SNN 健康检查（从 train_ddp.py 移植）
+# ============================================================
+
+@torch.no_grad()
+def snn_health_check(model, optimizer=None, loss=None, step=0, check_grad=False):
+    """
+    SNN 训练健康检查（轻量级，不拖慢训练）。
+
+    检查项目：
+    1. Loss 异常：NaN/Inf
+    2. 神经元发放异常：癫痫（发放率过高）/ 死寂（发放率过低）
+    3. 神经元趋同：所有神经元输出相同
+    4. 梯度流通异常（仅在 check_grad=True 时检查）
+    5. Layer-wise LR 倍率补偿异常
+    """
+    report = {
+        'step': step,
+        'healthy': True,
+        'warnings': [],
+        'errors': [],
+        'stats': {}
+    }
+    _raw = model.module if hasattr(model, 'module') else model
+
+    # 1. Loss 检查
+    if loss is not None:
+        loss_val = loss.item() if torch.is_tensor(loss) else loss
+        report['stats']['loss'] = loss_val
+        if math.isnan(loss_val) or math.isinf(loss_val):
+            report['healthy'] = False
+            report['errors'].append(f"Loss 异常: {loss_val}")
+
+    # 2. 神经元发放率检查
+    firing_stats = []
+    dead_layers = []
+    epileptic_layers = []
+
+    for i, layer in enumerate(_raw.layers):
+        snn_block = layer.snn_block
+        if hasattr(snn_block, 'hidden_neuron'):
+            neuron = snn_block.hidden_neuron
+            if hasattr(neuron, 'v') and hasattr(neuron, 'v_th'):
+                v = neuron.v
+                if isinstance(v, torch.Tensor):
+                    v_th = neuron.v_th
+                    v_th_val = v_th.mean().item() if isinstance(v_th, torch.Tensor) else v_th
+                    firing_ratio = (v > v_th_val * 0.8).float().mean().item()
+                    firing_stats.append({'layer': i, 'firing_rate': firing_ratio, 'v_mean': v.mean().item()})
+
+                    if firing_ratio < 0.01:
+                        dead_layers.append(i)
+                    elif firing_ratio > 0.90:
+                        epileptic_layers.append(i)
+
+    report['stats']['firing'] = firing_stats
+    if dead_layers:
+        report['warnings'].append(f"死寂层: L{dead_layers}")
+    if epileptic_layers:
+        report['warnings'].append(f"癫痫层: L{epileptic_layers}")
+
+    # 3. 神经元趋同检查
+    convergent_layers = []
+    for i, layer in enumerate(_raw.layers):
+        snn_block = layer.snn_block
+        if hasattr(snn_block, 'output_neuron') and hasattr(snn_block.output_neuron, 'v'):
+            v = snn_block.output_neuron.v
+            if isinstance(v, torch.Tensor) and v.numel() > 1:
+                if v.std().item() < 1e-6:
+                    convergent_layers.append(i)
+
+    if convergent_layers:
+        report['warnings'].append(f"趋同层: L{convergent_layers}")
+
+    # 4. 梯度检查
+    if check_grad:
+        grad_stats = []
+        vanishing = []
+        exploding = []
+
+        for name, param in _raw.named_parameters():
+            if param.grad is not None:
+                g = param.grad
+                norm = g.float().norm().item()
+                grad_stats.append({'name': name, 'norm': norm})
+
+                if norm < 1e-7:
+                    vanishing.append(name.split('.')[-1])
+                elif norm > 1e4:
+                    exploding.append(name.split('.')[-1])
+                if torch.isnan(g).any() or torch.isinf(g).any():
+                    report['healthy'] = False
+                    report['errors'].append(f"梯度NaN: {name}")
+
+        report['stats']['grad'] = grad_stats
+        if len(vanishing) > len(grad_stats) * 0.3:
+            report['warnings'].append(f"梯度消失: {len(vanishing)}/{len(grad_stats)}")
+        if exploding:
+            report['warnings'].append(f"梯度爆炸: {exploding[:3]}")
+
+    # 5. LR 倍率检查
+    if optimizer and hasattr(optimizer, '_layer_scales'):
+        scales = optimizer._layer_scales
+        if scales:
+            report['stats']['lr_scales'] = {'min': min(scales), 'max': max(scales)}
+            ratio = max(scales) / max(min(scales), 1e-10)
+            if ratio > 100:
+                report['warnings'].append(f"LR倍率差异大: {ratio:.0f}x")
+
+    if report['errors']:
+        report['healthy'] = False
+
+    return report
+
+
+def print_health_report(report):
+    """打印健康检查报告"""
+    step = report.get('step', 0)
+    if report['errors']:
+        print(f"[Health@{step}] ❌ {report['errors']}")
+    if report['warnings']:
+        print(f"[Health@{step}] ⚠️ {report['warnings']}")
+
+
+# ============================================================
 # 训练循环
 # ============================================================
 
-def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen):
+def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen, writer=None):
     """训练一个 epoch（SFT 版本，与预训练逻辑完全一致）。"""
     start_time = time.time()
 
@@ -199,8 +328,10 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
 
-            # 每 epoch 首个 accumulated batch 重校准 layer-wise LR (EMA α=0.3)
-            if (step + 1) == args.accumulation_steps:
+            # 每 5000 步重校准 layer-wise LR (EMA α=0.3)（与 train_ddp.py 对齐）
+            global_step_recalib = step + 1
+            _recalib = (global_step_recalib == args.accumulation_steps) or (global_step_recalib % 5000 == 0)
+            if _recalib:
                 _rms = [l.snn_block.W_in.weight.grad.float().pow(2).mean().sqrt().item()
                         for l in model.layers]
                 _new = [_rms[0] / max(r, 1e-10) for r in _rms]
@@ -223,6 +354,17 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
+            # 定期健康检查（每 500 步，或训练开始时）
+            global_step = epoch * iter_per_epoch + step + 1
+            if global_step == args.accumulation_steps or global_step % 500 == 0:
+                health = snn_health_check(model, optimizer, loss, global_step, check_grad=False)
+                if not health['healthy']:
+                    raise RuntimeError(f"SNN 健康检查失败: {health['errors']}")
+                # TensorBoard: 健康检查指标
+                if writer and health:
+                    for i, info in enumerate(health.get('stats', {}).get('firing', [])):
+                        writer.add_scalar(f'health/firing_rate/layer_{i}', info['firing_rate'], global_step)
+
         valid_tokens = int(loss_mask_flat.sum().item())
         tokens_seen += valid_tokens
 
@@ -244,12 +386,26 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
                     spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
                     mem_str))
 
+            # TensorBoard
+            if writer:
+                global_step = epoch * iter_per_epoch + step
+                writer.add_scalar('train/loss', batch_loss, global_step)
+                writer.add_scalar('train/ppl', batch_ppl, global_step)
+                writer.add_scalar('train/lr', lr, global_step)
+                writer.add_scalar('train/tps', tps, global_step)
+                if args.device != 'cpu':
+                    writer.add_scalar('train/mem_gb', mem_cur, global_step)
+                    writer.add_scalar('train/mem_peak_gb', mem_peak, global_step)
+
         # 定期保存
         if (step + 1) % args.save_interval == 0:
             model.eval()
             global_step = epoch * iter_per_epoch + step + 1
+            # 保存时执行完整健康检查（含梯度检查）
+            health = snn_health_check(model, optimizer, batch_loss, global_step, check_grad=True)
+            print_health_report(health)
             save_checkpoint(args.save_dir, model, optimizer, scaler,
-                            global_step, epoch, batch_loss, tokens_seen)
+                            global_step, epoch, batch_loss, tokens_seen, health_report=health)
             model.train()
 
     return tokens_seen
@@ -303,6 +459,9 @@ if __name__ == "__main__":
     # Tokenizer
     parser.add_argument("--tokenizer_path", type=str, default="./tokenizer_snn/")
 
+    # TensorBoard
+    parser.add_argument('--tb_dir', default='runs', type=str, help='TensorBoard 日志根目录')
+
     # 断续训练
     parser.add_argument('--resume', type=str, default=None, help='从 SFT checkpoint 恢复')
 
@@ -312,6 +471,9 @@ if __name__ == "__main__":
     args.save_dir = args.out_dir
     os.makedirs(args.out_dir, exist_ok=True)
     torch.manual_seed(42)
+
+    # TensorBoard
+    writer = SummaryWriter(log_dir=os.path.join(args.tb_dir, args.out_dir))
 
     device_type = "cuda" if "cuda" in args.device else "cpu"
     ctx = nullcontext() if device_type == "cpu" else torch.amp.autocast(
@@ -415,11 +577,19 @@ if __name__ == "__main__":
         Logger(f"  CUDA memory: {mem_baseline:.2f} GB baseline")
     Logger(f"{'='*60}\n")
 
+    # ==================== 训练前健康检查 ====================
+    Logger("Running pre-training health check...")
+    pre_health = snn_health_check(model, optimizer, step=0, check_grad=False)
+    print_health_report(pre_health)
+    if not pre_health['healthy']:
+        raise RuntimeError(f"Pre-training health check failed: {pre_health['errors']}")
+    Logger("✓ Pre-training health check passed\n")
+
     # ==================== 训练 ====================
     for epoch in range(start_epoch, args.epochs):
         tokens_seen = train_epoch(
             epoch, model, train_loader, optimizer, scaler, ctx, args,
-            iter_per_epoch, tokens_seen,
+            iter_per_epoch, tokens_seen, writer,
         )
 
     Logger(f"\nSFT finished. Total tokens seen: {tokens_seen:,}")
@@ -427,3 +597,6 @@ if __name__ == "__main__":
         Logger(f"Peak CUDA memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
     save_checkpoint(args.save_dir, model, optimizer, scaler,
                     args.epochs * iter_per_epoch, args.epochs - 1, 0.0, tokens_seen)
+
+    if writer:
+        writer.close()

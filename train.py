@@ -41,6 +41,8 @@ from contextlib import nullcontext
 from transformers import AutoTokenizer
 
 from model import SNNLanguageModel
+from torch.utils.tensorboard import SummaryWriter
+
 from dataset import PretrainDataset
 from atomic_ops import SNNAdamW
 
@@ -202,7 +204,7 @@ def init_model(args):
 # 训练循环（对齐教程 train_epoch）
 # ============================================================
 
-def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen):
+def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen, writer=None):
     """
     训练一个 epoch（对齐教程训练循环，使用标准反向传播）。
 
@@ -299,6 +301,17 @@ def train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_p
                     spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60,
                     mem_str))
 
+            # TensorBoard
+            if writer:
+                global_step = epoch * iter_per_epoch + step
+                writer.add_scalar('train/loss', batch_loss, global_step)
+                writer.add_scalar('train/ppl', batch_ppl, global_step)
+                writer.add_scalar('train/lr', lr, global_step)
+                writer.add_scalar('train/tps', tps, global_step)
+                if args.device != 'cpu':
+                    writer.add_scalar('train/mem_gb', mem_cur, global_step)
+                    writer.add_scalar('train/mem_peak_gb', mem_peak, global_step)
+
         # 定期保存（带步数，自动清理保留最新 5 个）
         if (step + 1) % args.save_interval == 0:
             model.eval()
@@ -363,6 +376,9 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer_path", type=str, default="./tokenizer_snn/",
                         help="自训练 tokenizer 路径")
 
+    # TensorBoard
+    parser.add_argument('--tb_dir', default='runs', type=str, help='TensorBoard 日志根目录')
+
     # Checkpoint
     parser.add_argument('--resume', type=str, default=None, help='从 checkpoint 恢复')
 
@@ -374,6 +390,9 @@ if __name__ == "__main__":
 
     # 设置随机种子
     torch.manual_seed(42)
+
+    # TensorBoard
+    writer = SummaryWriter(log_dir=os.path.join(args.tb_dir, args.out_dir))
 
     # 混合精度上下文（对齐教程 L286-290）
     device_type = "cuda" if "cuda" in args.device else "cpu"
@@ -519,7 +538,7 @@ if __name__ == "__main__":
 
     # ==================== 开始训练 ====================
     for epoch in range(start_epoch, args.epochs):
-        tokens_seen = train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen)
+        tokens_seen = train_epoch(epoch, model, train_loader, optimizer, scaler, ctx, args, iter_per_epoch, tokens_seen, writer)
 
     # 训练结束，保存最终 checkpoint
     Logger(f"\nTraining finished. Total tokens seen: {tokens_seen:,}")
@@ -527,3 +546,6 @@ if __name__ == "__main__":
         Logger(f"Peak CUDA memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
     save_checkpoint(args.save_dir, model, optimizer, scaler,
                     args.epochs * iter_per_epoch, args.epochs - 1, 0.0, tokens_seen)
+
+    if writer:
+        writer.close()

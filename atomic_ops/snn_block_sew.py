@@ -34,7 +34,7 @@ from spikingjelly.activation_based import base, layer, neuron, surrogate
 
 from .selective_plif import SelectivePLIFNode
 from .plif_node import PLIFNode
-from .parallel_scan import plif_parallel_forward, plif_fixed_param_forward, plif_rowparam_forward, plif_rowparam_forward_sew, rf_plif_parallel_forward
+from .parallel_scan import plif_rowparam_forward_sew, rf_plif_parallel_forward_recompute
 
 
 @torch.compile(backend='inductor', fullgraph=True)
@@ -238,7 +238,7 @@ class SNNBlock(base.MemoryModule):
             raw_omega, self.b_omega,
         )
 
-        # ====== Phase 2: RF PLIF parallel scan（二阶耦合 V/W） ======
+        # ====== Phase 2: RF PLIF parallel scan（V_post/W recompute，省 1GB/层）======
         v_init_hidden = self.hidden_neuron.v
         if isinstance(v_init_hidden, float):
             v_init_hidden = self.hidden_neuron.expand_v_init(batch, flat.device, flat.dtype)
@@ -247,15 +247,15 @@ class SNNBlock(base.MemoryModule):
         if isinstance(w_init_hidden, float):
             w_init_hidden = self.hidden_neuron.expand_w_init(batch, flat.device, flat.dtype)
 
-        s_hidden, V_post_hidden, W_hidden = rf_plif_parallel_forward(
+        s_hidden, v_last_hidden, w_last_hidden = rf_plif_parallel_forward_recompute(
             beta_all, omega_all, u_hidden, v_th_all,
             v_init_hidden, w_init_hidden,
             surrogate_function=self.hidden_neuron.get_surrogate(u_hidden),
         )
 
-        # 更新隐神经元状态（V 和 W 均保存末步）
-        self.hidden_neuron.v = V_post_hidden[-1].detach()
-        self.hidden_neuron.w = W_hidden[-1].detach()
+        # 更新隐神经元状态（直接用末步值）
+        self.hidden_neuron.v = v_last_hidden.detach()
+        self.hidden_neuron.w = w_last_hidden.detach()
 
         # ====== Phase 4: 输出投影 + 融合 gate·skip·scale (P2) ======
         s_flat = s_hidden.reshape(TK * batch, DN)

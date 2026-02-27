@@ -500,7 +500,13 @@ if __name__ == "__main__":
         load_pretrained(args.pretrained_ckpt, model, device, rank)
 
     # DDP 包装
-    model = DDP(model, device_ids=[local_rank])
+    # gradient_as_bucket_view=True: param.grad 直接指向通信 bucket，
+    #   避免梯度拷贝，省 ~1× 模型参数量的 fp32 显存 (~5.5GB for 1.4B params)
+    # static_graph=True: 每次 forward 参与 backward 的参数集不变，
+    #   DDP 跳过 bucket 重建 + unused parameter 扫描
+    model = DDP(model, device_ids=[local_rank],
+                gradient_as_bucket_view=True,
+                static_graph=True)
 
     # ==================== 数据 ====================
     train_ds = SFTDataset(args.sft_data_path, tokenizer, max_length=args.max_length)

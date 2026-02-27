@@ -34,7 +34,7 @@ from spikingjelly.activation_based import base, layer, neuron, surrogate
 
 from .selective_plif import SelectivePLIFNode
 from .plif_node import PLIFNode
-from .parallel_scan import plif_parallel_forward, plif_fixed_param_forward, plif_rowparam_forward, rf_plif_parallel_forward
+from .parallel_scan import plif_parallel_forward, plif_fixed_param_forward, plif_rowparam_forward, rf_plif_parallel_forward, rf_plif_parallel_forward_recompute, plif_rowparam_forward_recompute
 
 
 # ====== Fused modulation activations (torch.compile) ======
@@ -238,15 +238,15 @@ class SNNBlock(base.MemoryModule):
         if isinstance(w_init_hidden, float):
             w_init_hidden = self.hidden_neuron.expand_w_init(batch, flat.device, flat.dtype)
 
-        s_hidden, V_post_hidden, W_hidden = rf_plif_parallel_forward(
+        s_hidden, V_last_hidden, W_last_hidden = rf_plif_parallel_forward_recompute(
             beta_all, omega_all, u_hidden, v_th_all,
             v_init_hidden, w_init_hidden,
             surrogate_function=self.hidden_neuron.get_surrogate(u_hidden),
         )
 
         # 更新隐神经元状态（V 和 W 均保存末步）
-        self.hidden_neuron.v = V_post_hidden[-1].detach()
-        self.hidden_neuron.w = W_hidden[-1].detach()
+        self.hidden_neuron.v = V_last_hidden.detach()
+        self.hidden_neuron.w = W_last_hidden.detach()
 
         # ====== Phase 4: 输出投影 ======
         s_flat = s_hidden.reshape(TK * batch, DN)
@@ -264,12 +264,12 @@ class SNNBlock(base.MemoryModule):
         beta_out_row = beta_out.unsqueeze(0).expand(batch, D).contiguous()
         v_th_out_row = self.output_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
 
-        spike_out, V_post_output = plif_rowparam_forward(
-            beta_out_row, u_output, v_th_out_row, v_init_output,
-            surrogate_function=self.output_neuron.get_surrogate(u_output),
+        alpha_out = float(self.output_neuron.get_surrogate(u_output).alpha)
+        spike_out, V_last_output = plif_rowparam_forward_recompute(
+            beta_out_row, u_output, v_th_out_row, v_init_output, alpha_out,
         )
 
-        self.output_neuron.v = V_post_output[-1].detach()
+        self.output_neuron.v = V_last_output.detach()
 
         return spike_out
 

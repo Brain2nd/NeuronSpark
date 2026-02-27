@@ -836,11 +836,11 @@ if _HAS_TRITON:
     @triton.jit
     def _fused_plif_fwd_rowparam_noV_kernel(
         BETA_ROW_ptr, U_ptr, VTH_ROW_ptr, INIT_ptr,
-        SPIKE_ptr,
+        SPIKE_ptr, V_LAST_ptr,
         K, num_cols,
         BLOCK: tl.constexpr,
     ):
-        """Forward: only stores spike. V_post recomputed in backward."""
+        """Forward: only stores spike + V_last. V_post recomputed in backward."""
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
         mask = cols < num_cols
@@ -858,6 +858,9 @@ if _HAS_TRITON:
             v = v_pre - vth * spike
 
             tl.store(SPIKE_ptr + off, spike, mask=mask)
+
+        # Store final V_post (V[K-1]) for state update
+        tl.store(V_LAST_ptr + cols, v, mask=mask)
 
     @triton.jit
     def _fused_plif_bwd_rowparam_recomp_kernel(
@@ -961,13 +964,14 @@ if _HAS_TRITON:
             num_cols = u_c[0].numel()
 
             spike = torch.empty_like(u_c)
+            V_last = torch.empty_like(v_init_c)
 
             BLOCK = _TritonPLIFRowParamRecompute._BLOCK
             grid = ((num_cols + BLOCK - 1) // BLOCK,)
 
             _fused_plif_fwd_rowparam_noV_kernel[grid](
                 beta_row_c, u_c, v_th_row_c, v_init_c,
-                spike,
+                spike, V_last,
                 K, num_cols,
                 BLOCK=BLOCK,
             )
@@ -978,10 +982,10 @@ if _HAS_TRITON:
             ctx.num_cols = num_cols
             ctx.alpha = alpha
 
-            return spike, None  # None for V_post (not materialized)
+            return spike, V_last  # V_last = V_post[K-1] for state update
 
         @staticmethod
-        def backward(ctx, grad_spike, _grad_V_post_unused):
+        def backward(ctx, grad_spike, _grad_V_last_unused):
             beta_row, v_th_row, v_init, spike, u = ctx.saved_tensors
             K = ctx.K
             num_cols = ctx.num_cols
@@ -1869,7 +1873,7 @@ def plif_rowparam_forward_recompute(
     v_th_row: torch.Tensor,
     v_init: torch.Tensor,
     alpha: float,
-) -> tuple[torch.Tensor, None]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     行参数 PLIF 前向，Mamba-style V_post 重计算（不持有 V_post 在 autograd 图中）。
 
@@ -1889,17 +1893,17 @@ def plif_rowparam_forward_recompute(
 
     Returns:
         spike:  (K, *shape)
-        V_post: None（不 materialize）
+        V_last: (*shape) — 末步 V_post（用于状态更新）
     """
     if _HAS_TRITON and u.is_cuda:
-        spike, _ = _TritonPLIFRowParamRecompute.apply(
+        spike, V_last = _TritonPLIFRowParamRecompute.apply(
             beta_row, u, v_th_row, v_init, alpha,
         )
-        return spike, None
+        return spike, V_last
 
     # Fallback: use standard path (with V_post materialization)
     spike, V_post = plif_rowparam_forward_alpha(beta_row, u, v_th_row, v_init, alpha)
-    return spike, V_post
+    return spike, V_post[-1]
 
 
 def plif_fixed_param_forward(

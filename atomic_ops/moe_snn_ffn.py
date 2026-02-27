@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from spikingjelly.activation_based import base, surrogate
 
 from .snn_ffn import SNNFFN
-from .parallel_scan import plif_rowparam_forward_alpha
+from .parallel_scan import plif_rowparam_forward_alpha, plif_rowparam_forward_recompute
 from .moe_kernels import moe_combine
 
 
@@ -209,7 +209,7 @@ class MoESNNFFN(base.MemoryModule):
         v_init = self.expert_gu_v_init.to(dtype=flat.dtype).unsqueeze(1).expand(E, TB, -1).reshape(E * TB, 2 * D_ff).contiguous()
 
         alpha_gu = self._compute_adaptive_alpha(u_flat)
-        spike_flat, _ = plif_rowparam_forward_alpha(
+        spike_flat, _ = plif_rowparam_forward_recompute(
             beta_row, u_flat, v_th_row, v_init, alpha_gu,
         )  # (K, E*TB, 2*D_ff) — AND 门直接在此布局操作
 
@@ -244,7 +244,7 @@ class MoESNNFFN(base.MemoryModule):
         v_init_out = self.expert_out_v_init.to(dtype=flat.dtype).unsqueeze(1).expand(E, TB, -1).reshape(E * TB, D).contiguous()
 
         alpha_out = self._compute_adaptive_alpha(u_out_flat)
-        spike_out_flat, _ = plif_rowparam_forward_alpha(
+        spike_out_flat, _ = plif_rowparam_forward_recompute(
             beta_out_row, u_out_flat, v_th_out_row, v_init_out, alpha_out,
         )  # (K, E*TB, D)
 

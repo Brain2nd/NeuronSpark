@@ -22,7 +22,7 @@ import torch.nn.functional as F
 from spikingjelly.activation_based import base, layer, surrogate
 
 from .plif_node import PLIFNode
-from .parallel_scan import plif_fixed_param_forward, plif_parallel_forward, plif_rowparam_forward
+from .parallel_scan import plif_fixed_param_forward, plif_parallel_forward, plif_rowparam_forward_recompute
 
 
 class SNNFFN(base.MemoryModule):
@@ -148,18 +148,17 @@ class SNNFFN(base.MemoryModule):
             v_init_up = self.up_neuron.expand_v_init(batch, flat.device, flat.dtype)
         v_init_merged = torch.cat([v_init_gate, v_init_up], dim=-1)
 
-        # Row-param PLIF scan: beta/v_th 从寄存器读取，不占显存带宽
+        # Row-param PLIF scan (recompute): beta/v_th 从寄存器读取，不占显存带宽
         # 自适应 surrogate: 根据 u_merged 的分布动态调整 alpha
-        surr = self.gate_neuron.get_surrogate(u_merged)
-        spike_merged, V_post_merged = plif_rowparam_forward(
-            beta_row, u_merged, v_th_row, v_init_merged,
-            surrogate_function=surr,
+        alpha = float(self.gate_neuron.get_surrogate(u_merged).alpha)
+        spike_merged, V_last_merged = plif_rowparam_forward_recompute(
+            beta_row, u_merged, v_th_row, v_init_merged, alpha,
         )
 
         gate_spike = spike_merged[:, :, :D_ff]
         up_spike = spike_merged[:, :, D_ff:]
-        self.gate_neuron.v = V_post_merged[-1, :, :D_ff].detach()
-        self.up_neuron.v = V_post_merged[-1, :, D_ff:].detach()
+        self.gate_neuron.v = V_last_merged[:, :D_ff].detach()
+        self.up_neuron.v = V_last_merged[:, D_ff:].detach()
 
         # ====== Phase 3: AND 门 + 降维 ======
         gated = gate_spike * up_spike  # (TK, batch, D_ff)
@@ -176,11 +175,11 @@ class SNNFFN(base.MemoryModule):
         beta_out_row = beta_out.unsqueeze(0).expand(batch, D).contiguous()
         v_th_out_row = self.output_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
 
-        spike_out, V_post_out = plif_rowparam_forward(
-            beta_out_row, u_out, v_th_out_row, v_init_out,
-            surrogate_function=self.output_neuron.get_surrogate(u_out),
+        alpha_out = float(self.output_neuron.get_surrogate(u_out).alpha)
+        spike_out, V_last_out = plif_rowparam_forward_recompute(
+            beta_out_row, u_out, v_th_out_row, v_init_out, alpha_out,
         )
-        self.output_neuron.v = V_post_out[-1].detach()
+        self.output_neuron.v = V_last_out.detach()
 
         return spike_out  # (TK, batch, D)
 

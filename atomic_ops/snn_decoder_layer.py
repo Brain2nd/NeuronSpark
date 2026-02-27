@@ -26,7 +26,7 @@ from .plif_node import PLIFNode
 from .rms_norm import RMSNorm
 from .snn_block_sew import SNNBlock
 from .snn_ffn import SNNFFN
-from .parallel_scan import plif_rowparam_forward
+from .parallel_scan import plif_rowparam_forward_recompute
 
 
 # ====== Fused residual + mean-centering ======
@@ -198,12 +198,12 @@ class SNNDecoderLayer(base.MemoryModule):
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = input_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
 
-        spike, V_post = plif_rowparam_forward(
-            beta_row, u, v_th_row, v_init,
-            surrogate_function=input_neuron.get_surrogate(u),
+        alpha = float(input_neuron.get_surrogate(u).alpha)
+        spike, V_last = plif_rowparam_forward_recompute(
+            beta_row, u, v_th_row, v_init, alpha,
         )
 
-        input_neuron.v = V_post[-1].detach()
+        input_neuron.v = V_last.detach()
         return spike
 
     def forward_parallel(self, h):

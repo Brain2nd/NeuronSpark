@@ -25,7 +25,7 @@ from torch.utils.checkpoint import checkpoint
 from atomic_ops import SNNDecoderLayer
 from atomic_ops.plif_node import PLIFNode
 from atomic_ops.rms_norm import RMSNorm
-from atomic_ops.parallel_scan import plif_rowparam_forward
+from atomic_ops.parallel_scan import plif_rowparam_forward_recompute
 from atomic_ops.fp16_codec import fp16_encode, fp16_decode
 from atomic_ops.lateral_inhibition import LateralInhibition
 
@@ -172,12 +172,12 @@ class SNNLanguageModel(nn.Module):
         beta_row = beta.unsqueeze(0).expand(batch, D).contiguous()
         v_th_row = self.output_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
 
-        spike, V_post = plif_rowparam_forward(
-            beta_row, u, v_th_row, v_init,
-            surrogate_function=self.output_neuron.get_surrogate(u),
+        alpha = float(self.output_neuron.get_surrogate(u).alpha)
+        spike, V_last = plif_rowparam_forward_recompute(
+            beta_row, u, v_th_row, v_init, alpha,
         )
 
-        self.output_neuron.v = V_post[-1].detach()
+        self.output_neuron.v = V_last.detach()
         return spike
 
     def decode(self, h_out: torch.Tensor, seq_len: int) -> torch.Tensor:

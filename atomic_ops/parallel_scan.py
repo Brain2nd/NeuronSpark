@@ -527,19 +527,20 @@ if _HAS_TRITON:
         BETA_ROW_ptr, VTH_ROW_ptr, INIT_ptr,
         U_ptr, SPIKE_ptr,
         GRAD_SPIKE_ptr,
-        GRAD_BETA_ROW_ptr, GRAD_U_ptr, GRAD_VTH_ROW_ptr, GRAD_INIT_ptr,
+        GRAD_BETA_ROW_ptr, GRAD_VTH_ROW_ptr, GRAD_INIT_ptr,
         K, num_cols, ALPHA,
         BLOCK: tl.constexpr,
     ):
-        """Backward with V_post recomputation (memory-optimized).
+        """Backward with in-place u overwrite (memory-optimized v2).
 
-        Phase 1: Forward recompute V_post → reuse GRAD_U buffer
-        Phase 2: Reverse step k reads GRAD_U[k-1] (=V_post[k-1]),
-                 then overwrites GRAD_U[k] with grad_u[k].  No conflict.
+        U_ptr is used for both V_post temp (Phase 1) and grad_u output (Phase 2).
+        Phase 1: read u[k] → write V_post[k] to U_ptr (overwrite u)
+        Phase 2: read V_post[k-1] from U_ptr → write grad_u[k] to U_ptr
 
-        Saves 2 large tensors vs original:
-          - grad_V_post_c  (always zero, replaced by constant 0)
-          - V_post_temp     (reuses GRAD_U buffer)
+        Saves 3 large tensors vs original:
+          - grad_V_post_c  (always zero → constant 0)
+          - V_post_temp    (in-place in U_ptr)
+          - grad_u          (in-place in U_ptr)
         """
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
@@ -549,7 +550,7 @@ if _HAS_TRITON:
         vth = tl.load(VTH_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         v_init_val = tl.load(INIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
-        # Phase 1: 前向重计算 V_post → 写入 GRAD_U buffer (临时复用)
+        # Phase 1: 前向重计算 V_post → 写入 U_ptr (覆盖已消费的 u)
         v = v_init_val
         for k in range(K):
             off = k * num_cols + cols
@@ -557,17 +558,17 @@ if _HAS_TRITON:
             spike = tl.load(SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
             v_pre = beta * v + u
             v = v_pre - vth * spike
-            tl.store(GRAD_U_ptr + off, v, mask=mask)    # V_post temp
+            tl.store(U_ptr + off, v, mask=mask)    # V_post temp (overwrite u)
 
         # Phase 2: 标准反向 scan
-        # GRAD_U[k] currently holds V_post[k]
+        # U_ptr[k] currently holds V_post[k]
         # Reverse step k reads [k-1] then overwrites [k] — no conflict
         acc = tl.zeros([BLOCK], dtype=tl.float32)
         acc_grad_beta = tl.zeros([BLOCK], dtype=tl.float32)
         acc_grad_vth = tl.zeros([BLOCK], dtype=tl.float32)
 
         cached_v = tl.load(
-            GRAD_U_ptr + (K - 1) * num_cols + cols, mask=mask, other=0.0,
+            U_ptr + (K - 1) * num_cols + cols, mask=mask, other=0.0,
         ).to(tl.float32)
 
         for k_rev in range(K):
@@ -581,7 +582,7 @@ if _HAS_TRITON:
 
             if k > 0:
                 v_prev = tl.load(
-                    GRAD_U_ptr + (k - 1) * num_cols + cols,
+                    U_ptr + (k - 1) * num_cols + cols,
                     mask=mask, other=0.0,
                 ).to(tl.float32)
                 cached_v = v_prev
@@ -599,7 +600,7 @@ if _HAS_TRITON:
             total_gV = acc
             grad_v_pre = g_s * sg + total_gV
 
-            tl.store(GRAD_U_ptr + off, grad_v_pre, mask=mask)
+            tl.store(U_ptr + off, grad_v_pre, mask=mask)  # grad_u in-place
 
             acc_grad_beta += grad_v_pre * v_prev
             acc_grad_vth += -g_s * sg - total_gV * spike
@@ -667,7 +668,7 @@ if _HAS_TRITON:
             grad_spike_c = grad_spike.contiguous()
 
             grad_beta_row = torch.empty_like(beta_row)
-            grad_u = torch.empty_like(u)
+            # grad_u: kernel overwrites u in-place (no alloc)
             grad_v_th_row = torch.empty_like(v_th_row)
             grad_v_init = torch.empty_like(v_init)
 
@@ -678,12 +679,13 @@ if _HAS_TRITON:
                 beta_row, v_th_row, v_init,
                 u, spike,
                 grad_spike_c,
-                grad_beta_row, grad_u, grad_v_th_row, grad_v_init,
+                grad_beta_row, grad_v_th_row, grad_v_init,
                 K, num_cols, float(alpha),
                 BLOCK=BLOCK,
             )
 
-            return grad_beta_row, grad_u, grad_v_th_row, grad_v_init, None
+            # u now contains grad_u (overwritten in-place by kernel)
+            return grad_beta_row, u, grad_v_th_row, grad_v_init, None
 
     class _TritonPLIFForward(torch.autograd.Function):
         """Fused Triton PLIF forward + backward.
@@ -958,22 +960,27 @@ if _HAS_TRITON:
         BETA_ptr, OMEGA_ptr, VTH_ptr, VINIT_ptr, WINIT_ptr,
         U_ptr, SPIKE_ptr,
         GRAD_SPIKE_ptr,
-        GRAD_BETA_ptr, GRAD_OMEGA_ptr, GRAD_U_ptr, GRAD_VTH_ptr,
+        GRAD_BETA_ptr, GRAD_OMEGA_ptr,
         GRAD_VINIT_ptr, GRAD_WINIT_ptr,
         K, num_cols, ALPHA,
         BLOCK: tl.constexpr,
     ):
-        """RF PLIF backward with V_post/W recomputation (memory-optimized).
+        """RF PLIF backward with in-place u/v_th overwrite (memory-optimized v2).
 
-        Phase 1: Forward recompute V_post/W → reuse GRAD_U / GRAD_VTH buffers
-        Phase 2: Reverse gradient — read V_post[k-1]/W[k-1], then overwrite
-                 with grad_u[k]/grad_v_th[k].  No conflict: reverse step k
-                 reads [k-1] before writing [k].
+        Eliminates grad_u and grad_v_th allocations by overwriting saved tensors:
+          - U_ptr:          Phase 1 read u → write V_post;  Phase 2 overwrite grad_u
+          - VTH_ptr:        Phase 2 read v_th → overwrite grad_v_th (same step)
+          - GRAD_OMEGA_ptr: Phase 1 write W temp; Phase 2 overwrite grad_omega
 
-        Saves 3 large tensors vs original:
-          - grad_V_post_c  (always zero, replaced by constant 0)
-          - V_post_temp     (reuses GRAD_U buffer)
-          - W_temp          (reuses GRAD_VTH buffer)
+        Phase 2 reverse step k: reads [k-1] then writes [k] — no conflict.
+        VTH_ptr at step k: read v_th[k] before write grad_v_th[k] — no conflict.
+
+        Saves 5 large tensors vs original (3 from v1 + 2 from v2):
+          - grad_V_post_c  (always zero → constant 0)
+          - V_post_temp    (in-place in U_ptr)
+          - W_temp          (dual-use GRAD_OMEGA_ptr)
+          - grad_u          (in-place in U_ptr)
+          - grad_v_th       (in-place in VTH_ptr)
         """
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
@@ -982,7 +989,9 @@ if _HAS_TRITON:
         v_init_val = tl.load(VINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         w_init_val = tl.load(WINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
-        # Phase 1: Forward recompute V_post, W → GRAD_U / GRAD_VTH buffers
+        # Phase 1: Forward recompute V_post, W
+        #   V_post → U_ptr (overwrite u, already consumed)
+        #   W      → GRAD_OMEGA_ptr (will be overwritten with grad_omega in Phase 2)
         v = v_init_val
         w = w_init_val
         for k in range(K):
@@ -998,18 +1007,17 @@ if _HAS_TRITON:
             v = v_pre - vth * spike
             w = w_new
 
-            tl.store(GRAD_U_ptr + off, v, mask=mask)    # V_post temp
-            tl.store(GRAD_VTH_ptr + off, w, mask=mask)   # W temp
+            tl.store(U_ptr + off, v, mask=mask)            # V_post temp
+            tl.store(GRAD_OMEGA_ptr + off, w, mask=mask)    # W temp
 
         # Phase 2: Reverse gradient accumulation
-        # GRAD_U[k] currently holds V_post[k], GRAD_VTH[k] holds W[k]
+        # U_ptr[k] = V_post[k], GRAD_OMEGA_ptr[k] = W[k]
         # Reverse step k reads [k-1] then overwrites [k] — no conflict
         acc_v = tl.zeros([BLOCK], dtype=tl.float32)
         acc_w = tl.zeros([BLOCK], dtype=tl.float32)
 
         last_off = (K - 1) * num_cols + cols
-        cached_v = tl.load(GRAD_U_ptr + last_off, mask=mask, other=0.0).to(tl.float32)
-        cached_w = tl.load(GRAD_VTH_ptr + last_off, mask=mask, other=0.0).to(tl.float32)
+        cached_v = tl.load(U_ptr + last_off, mask=mask, other=0.0).to(tl.float32)
 
         for k_rev in range(K):
             k = K - 1 - k_rev
@@ -1026,15 +1034,14 @@ if _HAS_TRITON:
 
             if k > 0:
                 v_prev = tl.load(
-                    GRAD_U_ptr + (k - 1) * num_cols + cols,
+                    U_ptr + (k - 1) * num_cols + cols,
                     mask=mask, other=0.0,
                 ).to(tl.float32)
                 w_prev = tl.load(
-                    GRAD_VTH_ptr + (k - 1) * num_cols + cols,
+                    GRAD_OMEGA_ptr + (k - 1) * num_cols + cols,
                     mask=mask, other=0.0,
                 ).to(tl.float32)
                 cached_v = v_prev
-                cached_w = w_prev
             else:
                 v_prev = v_init_val
                 w_prev = w_init_val
@@ -1052,8 +1059,8 @@ if _HAS_TRITON:
 
             tl.store(GRAD_BETA_ptr + off, grad_v_pre * v_prev + total_gW * w_prev, mask=mask)
             tl.store(GRAD_OMEGA_ptr + off, grad_v_pre * (-w_prev) + total_gW * v_prev, mask=mask)
-            tl.store(GRAD_U_ptr + off, grad_v_pre, mask=mask)
-            tl.store(GRAD_VTH_ptr + off, -g_s * sg - total_gV * spike, mask=mask)
+            tl.store(U_ptr + off, grad_v_pre, mask=mask)                      # grad_u in-place
+            tl.store(VTH_ptr + off, -g_s * sg - total_gV * spike, mask=mask)  # grad_v_th in-place
 
             acc_v = grad_v_pre * beta + total_gW * omega
             acc_w = grad_v_pre * (-omega) + total_gW * beta
@@ -1205,8 +1212,7 @@ if _HAS_TRITON:
 
             grad_beta = torch.empty_like(beta)
             grad_omega = torch.empty_like(omega)
-            grad_u = torch.empty_like(u)
-            grad_v_th = torch.empty_like(v_th)
+            # grad_u / grad_v_th: kernel overwrites u / v_th in-place (no alloc)
             grad_v_init = torch.empty_like(v_init)
             grad_w_init = torch.empty_like(w_init)
 
@@ -1217,13 +1223,14 @@ if _HAS_TRITON:
                 beta, omega, v_th, v_init, w_init,
                 u, spike,
                 grad_spike_c,
-                grad_beta, grad_omega, grad_u, grad_v_th,
+                grad_beta, grad_omega,
                 grad_v_init, grad_w_init,
                 K, num_cols, float(alpha),
                 BLOCK=BLOCK,
             )
 
-            return grad_beta, grad_omega, grad_u, grad_v_th, grad_v_init, grad_w_init, None
+            # u now contains grad_u, v_th now contains grad_v_th
+            return grad_beta, grad_omega, u, v_th, grad_v_init, grad_w_init, None
 
 # Hillis-Steele parallel prefix scan (CPU fallback)
 # ============================================================

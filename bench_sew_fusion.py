@@ -25,7 +25,7 @@ from spikingjelly.activation_based import functional
 def _forward_unfused(block, spike_in_seq):
     """原始 forward_parallel（unfused: 分离的 gate·skip, 分离的 SEW add）"""
     from atomic_ops.parallel_scan import plif_rowparam_forward, rf_plif_parallel_forward
-    from atomic_ops.snn_block_sew import _fused_modulation_rf
+    from atomic_ops.snn_block import _fused_modulation_rf
 
     TK, batch, D = spike_in_seq.shape
     DN = block.D * block.N
@@ -162,7 +162,7 @@ def main():
     for D, N, K, batch, seq_len, label in configs:
         TK = seq_len * K
 
-        from atomic_ops.snn_block_sew import SNNBlock
+        from atomic_ops.snn_block import SNNBlock
         block = SNNBlock(D=D, N=N, v_th_min=0.1, output_v_threshold=0.3).to(device, dtype)
 
         spike_in = (torch.rand(TK, batch, D, device=device, dtype=dtype) > 0.85).float()

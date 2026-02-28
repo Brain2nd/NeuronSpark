@@ -98,7 +98,7 @@ def fp16_decode(spikes: Tensor, seq_len: int, K: int = 16) -> Tensor:
     return torch.where(is_normal, normal_val, subnormal_val)
 
 
-# ====== 二进制残差连接（替代 SEW 十进制加法） ======
+# ====== 二进制残差连接 ======
 
 def _binary_residual_naive(spike_a: Tensor, spike_b: Tensor) -> Tensor:
     """未融合 baseline（仅用于 benchmark 对比）: fp16_decode → add → fp16_encode。
@@ -187,7 +187,7 @@ class _BinaryResidual(torch.autograd.Function):
 
 
 def binary_residual(spike_a: Tensor, spike_b: Tensor) -> Tensor:
-    """二进制残差加法（替代 SEW 的十进制 spike_a + spike_b）。
+    """二进制残差加法：decode(a) + decode(b) → encode → {0,1}，STE backward。
 
     将两个二值 spike 序列在 IEEE 754 float16 语义下正确相加：
     decode → continuous add → re-encode，inductor 融合为 2-3 个 kernel。

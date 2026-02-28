@@ -34,7 +34,17 @@ from spikingjelly.activation_based import base, layer, neuron, surrogate
 
 from .selective_plif import SelectivePLIFNode
 from .plif_node import PLIFNode
-from .parallel_scan import plif_parallel_forward, plif_fixed_param_forward, plif_rowparam_forward, rf_plif_parallel_forward, rf_plif_parallel_forward_recompute, plif_rowparam_forward_recompute
+from .parallel_scan import plif_rowparam_forward_recompute, rf_plif_parallel_forward_recompute
+from .fp16_codec import binary_residual
+
+
+@torch.compile(backend='inductor', fullgraph=True)
+def _fused_gate_skip_scale(
+    I_out: torch.Tensor, gate: torch.Tensor,
+    I_skip: torch.Tensor, one_minus_beta: torch.Tensor,
+) -> torch.Tensor:
+    """融合 gate·out + skip → (1-β) 缩放 → u_output: 3 element-wise ops → 1 fused kernel。"""
+    return (I_out * gate + I_skip) * one_minus_beta
 
 
 # ====== Fused modulation activations (torch.compile) ======
@@ -229,7 +239,7 @@ class SNNBlock(base.MemoryModule):
             raw_omega, self.b_omega,
         )
 
-        # ====== Phase 2: RF PLIF parallel scan（二阶耦合 V/W） ======
+        # ====== Phase 2: RF PLIF parallel scan（V_post/W recompute，省 1GB/层）======
         v_init_hidden = self.hidden_neuron.v
         if isinstance(v_init_hidden, float):
             v_init_hidden = self.hidden_neuron.expand_v_init(batch, flat.device, flat.dtype)
@@ -238,25 +248,24 @@ class SNNBlock(base.MemoryModule):
         if isinstance(w_init_hidden, float):
             w_init_hidden = self.hidden_neuron.expand_w_init(batch, flat.device, flat.dtype)
 
-        s_hidden, V_last_hidden, W_last_hidden = rf_plif_parallel_forward_recompute(
+        s_hidden, v_last_hidden, w_last_hidden = rf_plif_parallel_forward_recompute(
             beta_all, omega_all, u_hidden, v_th_all,
             v_init_hidden, w_init_hidden,
             surrogate_function=self.hidden_neuron.get_surrogate(u_hidden),
         )
 
-        # 更新隐神经元状态（V 和 W 均保存末步）
-        self.hidden_neuron.v = V_last_hidden.detach()
-        self.hidden_neuron.w = W_last_hidden.detach()
+        # 更新隐神经元状态（直接用末步值）
+        self.hidden_neuron.v = v_last_hidden.detach()
+        self.hidden_neuron.w = w_last_hidden.detach()
 
-        # ====== Phase 4: 输出投影 ======
+        # ====== Phase 4: 输出投影 + 融合 gate·skip·scale (P2) ======
         s_flat = s_hidden.reshape(TK * batch, DN)
         I_out_all = F.linear(s_flat, self.W_out.weight).reshape(TK, batch, D)
-        I_total_all = I_out_all * gate_all + I_skip_all
-
-        # ====== Phase 5: 输出神经元 parallel scan ======
         beta_out = self.output_neuron.beta
-        u_output = (1.0 - beta_out) * I_total_all
+        # P2: fuse (I_out * gate + I_skip) * (1-beta) into single kernel
+        u_output = _fused_gate_skip_scale(I_out_all, gate_all, I_skip_all, 1.0 - beta_out)
 
+        # ====== Phase 5+6: 输出神经元 parallel scan + 二进制残差 ======
         v_init_output = self.output_neuron.v
         if isinstance(v_init_output, float):
             v_init_output = self.output_neuron.expand_v_init(batch, flat.device, flat.dtype)
@@ -264,14 +273,15 @@ class SNNBlock(base.MemoryModule):
         beta_out_row = beta_out.unsqueeze(0).expand(batch, D).contiguous()
         v_th_out_row = self.output_neuron.v_th.unsqueeze(0).expand(batch, D).contiguous()
 
-        alpha_out = float(self.output_neuron.get_surrogate(u_output).alpha)
+        surr = self.output_neuron.get_surrogate(u_output)
+        alpha = float(surr.alpha) if hasattr(surr, 'alpha') else 4.0
+
+        # PLIF scan + 二进制残差
         spike_out, V_last_output = plif_rowparam_forward_recompute(
-            beta_out_row, u_output, v_th_out_row, v_init_output, alpha_out,
+            beta_out_row, u_output, v_th_out_row, v_init_output, alpha,
         )
-
         self.output_neuron.v = V_last_output.detach()
-
-        return spike_out
+        return binary_residual(spike_out, spike_in_seq)
 
     def single_step_forward(self, spike_in: torch.Tensor) -> torch.Tensor:
         """
@@ -316,4 +326,5 @@ class SNNBlock(base.MemoryModule):
         I_total = I_out * gate + I_skip
         spike_out = self.output_neuron(I_total)
 
-        return spike_out
+        # 残差：clamp 保证输出 {0,1}（binary_residual 需要完整 K=16 帧，单步无法用）
+        return (spike_out + spike_in).clamp(max=1)

@@ -1,22 +1,22 @@
 """
-SNNFFN: SNN 等价的 Feed-Forward Network（v10: +SEW 残差）
+SNNFFN: SNN 等价的 Feed-Forward Network（v10: +二进制残差）
 
 对标 Qwen3MLP 的 SwiGLU 结构：
   Qwen3 MLP:  down_proj( SiLU(gate_proj(x)) * up_proj(x) )
-  SNN  FFN:   down_proj( gate_spike AND up_spike ) + skip → output_neuron → SEW
+  SNN  FFN:   down_proj( gate_spike AND up_spike ) + skip → output_neuron → binary_residual
 
 SiLU gating → spike 巧合检测（AND 门）：
   只有当 gate 和 up 通道同时发放时，信号才传递，实现非线性选择。
 
-SEW 残差（v10）：
-  spike_out = output_neuron_spike + spike_in
-  提供 identity mapping 保证深度梯度流。
+二进制残差：
+  spike_out = binary_residual(output_neuron_spike, spike_in)
+  decode → continuous add → re-encode，输出严格 {0,1}，STE identity backward。
 
 信号流：
   spike_in (p~20%) → gate_proj → gate_neuron → gate_spike (p~30%)
   spike_in (p~20%) → up_proj   → up_neuron   → up_spike (p~30%)
                       gate_spike AND up_spike → gated (p~9%)
-                      down_proj(gated) + skip_proj(spike_in) → output_neuron → +spike_in → spike_out
+                      down_proj(gated) + skip_proj(spike_in) → output_neuron → binary_residual → spike_out
 """
 
 import math
@@ -188,7 +188,7 @@ class SNNFFN(base.MemoryModule):
         )
         self.output_neuron.v = V_last_out.detach()
 
-        # 二进制残差（替代 SEW 十进制加法）
+        # 二进制残差
         if self.add_residual:
             return binary_residual(spike_out, spike_in_seq)
         return spike_out  # MoE shared expert: 残差由 MoE 层统一处理
@@ -212,6 +212,7 @@ class SNNFFN(base.MemoryModule):
         # AND 门：巧合检测
         gated = gate_spike * up_spike  # {0,1}^D_ff
 
-        # 降维 + 残差 → 输出神经元 → SEW
+        # 降维 + 残差 → 输出神经元
         I_out = self.down_proj(gated) + self.skip_proj(spike_in)  # R^D
-        return self.output_neuron(I_out) + spike_in  # SEW: {0,1}^D + {0,1}^D
+        # 残差：clamp 保证输出 {0,1}（binary_residual 需要完整 K=16 帧，单步无法用）
+        return (self.output_neuron(I_out) + spike_in).clamp(max=1)

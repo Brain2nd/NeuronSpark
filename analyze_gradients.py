@@ -381,7 +381,7 @@ def layer_gradient_profile(model, config, all_stats):
         for name, stats in all_stats.items():
             if not name.startswith(prefix):
                 continue
-            if stats['grad'] is None:
+            if 'grad' not in stats or stats.get('grad') is None:
                 continue
             gn = stats['grad_norm']
 
@@ -424,7 +424,7 @@ def param_group_comparison(model, all_stats):
     groups = defaultdict(list)
 
     for name, stats in all_stats.items():
-        if stats['grad'] is None:
+        if 'grad' not in stats or stats.get('grad') is None:
             continue
         gn = stats['grad_norm']
         n = stats['numel']
@@ -521,9 +521,9 @@ def beta_gradient_correlation(model, config):
     bins = [(0.0, 0.5), (0.5, 0.7), (0.7, 0.8), (0.8, 0.85),
             (0.85, 0.9), (0.9, 0.95), (0.95, 0.98), (0.98, 0.99), (0.99, 1.0)]
 
-    P(f"  {'β range':<12s}", end='')
+    print(f"  {'β range':<12s}", end='')
     for lo, hi in bins:
-        P(f"  [{lo:.2f},{hi:.2f})", end='')
+        print(f"  [{lo:.2f},{hi:.2f})", end='')
     P()
     P(f"  {'-'*120}")
 

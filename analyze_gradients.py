@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-梯度诊断脚本 v1.0 — 详细分析 checkpoint 每层每个参数的真实梯度情况（无补偿）
+梯度诊断脚本 v2.0 — 详细分析 checkpoint 每层每个参数的真实梯度情况（v10 纯 spike 架构）
 
 分析内容:
   Section 1: 模型概况 + checkpoint 元信息
@@ -9,7 +9,7 @@
   Section 4: 逐层梯度 norm 汇总
   Section 5: 参数组对比（b_beta vs b_alpha vs W_in vs ... 平均梯度规模）
   Section 6: β vs |grad(b_beta)| 相关性（高 β 是否梯度更小）
-  Section 7: 补偿无效性定量证明
+  Section 7: 时序梯度衰减分析（每层时序窗口 + binary_residual 深度梯度流）
   Section 8: 时序梯度流实测（每层独立实验，实测首尾 token 梯度比）
   Section 9: FFN / MoE 神经元梯度分析
   Section 10: 诊断总结
@@ -205,18 +205,6 @@ def static_analysis(model, config):
               f"{dead_pct(decay, 0.01):>10s}  {dead_pct(decay, 1e-4):>10s}")
             layer_data[f'r^{kv}_mean'] = decay.mean().item()
 
-        # ---- 输入神经元 ----
-        for nname in ['input_neuron1', 'input_neuron2']:
-            neuron = getattr(dec_layer, nname)
-            with torch.no_grad():
-                beta_n = torch.sigmoid(neuron.w)
-            P(f"\n    {nname} (D={D}):  β mean={beta_n.mean().item():.4f}  "
-              f"{quantiles_str(beta_n)}")
-            for kv, kl in zip(k_vals, k_labels):
-                decay = beta_n ** kv
-                P(f"      β^{kv:<5d} ({kl:22s}): mean={decay.mean().item():.3e}  "
-                  f"<0.01={dead_pct(decay, 0.01)}")
-
         # ---- Block 输出神经元 ----
         out_n = block.output_neuron
         with torch.no_grad():
@@ -240,12 +228,6 @@ def static_analysis(model, config):
             _analyze_ffn_neurons_static(ffn, 'FFN', D, K, TK_prod)
 
         report['layers'].append(layer_data)
-
-    # ---- 模型输出神经元 ----
-    subsec(f"Model output_neuron (D={D})")
-    with torch.no_grad():
-        beta_mo = torch.sigmoid(model.output_neuron.w)
-    P(f"    β mean={beta_mo.mean().item():.4f}  {quantiles_str(beta_mo)}")
 
     return report
 
@@ -301,9 +283,8 @@ def run_forward_backward(model, args, config):
         loss = output.last_loss.mean()
         loss.backward()
 
-    # 不调用 model.compensate_modulation_gradients()!
     P(f"  Loss = {loss.item():.4f}")
-    P(f"  注意: 以下梯度为原始 backward 梯度，未经 compensate_modulation_gradients 补偿")
+    P(f"  注意: 以下梯度为原始 backward 梯度")
 
     return loss.item()
 
@@ -454,8 +435,6 @@ def param_group_comparison(model, all_stats):
             groups['W_skip'].append((gn, n))
         elif 'W_out.weight' in name:
             groups['W_out'].append((gn, n))
-        elif 'input_neuron' in name:
-            groups['input_neurons'].append((gn, n))
         elif 'output_neuron' in name and 'snn_block' in name:
             groups['block_out_neuron'].append((gn, n))
         elif 'gate_proj' in name or 'up_proj' in name:
@@ -474,8 +453,6 @@ def param_group_comparison(model, all_stats):
             groups['moe_router'].append((gn, n))
         elif 'embed_tokens' in name:
             groups['embedding'].append((gn, n))
-        elif 'out_proj' in name or 'block_out_proj' in name or 'ffn_out_proj' in name:
-            groups['residual_proj'].append((gn, n))
         elif 'norm' in name:
             groups['norms'].append((gn, n))
         elif 'decode_proj' in name:
@@ -490,10 +467,10 @@ def param_group_comparison(model, all_stats):
     for gname in ['b_beta', 'b_alpha', 'b_omega', 'b_th',
                    'W_in', 'W_beta_x', 'W_alpha_x', 'W_th_x', 'W_omega_x',
                    'W_gate', 'W_skip', 'W_out',
-                   'input_neurons', 'block_out_neuron',
+                   'block_out_neuron',
                    'ffn_gate_up', 'ffn_down', 'ffn_skip', 'ffn_neurons',
                    'moe_expert_proj', 'moe_expert_neuron', 'moe_router',
-                   'residual_proj', 'norms', 'embedding', 'decode_proj', 'other']:
+                   'norms', 'embedding', 'decode_proj', 'other']:
         if gname not in groups or not groups[gname]:
             continue
         items = groups[gname]
@@ -587,22 +564,21 @@ def beta_gradient_correlation(model, config):
 # Section 7: Compensation futility analysis
 # ======================================================================
 
-def compensation_futility(model, config):
-    section("Section 7: 补偿无效性定量证明")
+def temporal_decay_analysis(model, config):
+    section("Section 7: 时序梯度衰减分析")
 
     K = config['K']
     TK_prod = 512 * K
 
-    P("  对比: 补偿倍率 1/[β(1-β)] vs 时序衰减 r^TK")
-    P("  补偿只消除 sigmoid 参数化的链式法则因子 β(1-β)。")
-    P("  但时序梯度衰减 r^TK 是数十个数量级更大的问题。")
+    P("  v10 架构: 纯 spike-to-spike，binary_residual (STE identity) 提供深度梯度流。")
+    P("  每层时序窗口 ~1/(1-β) 步，时序梯度衰减 r^TK 是正确的归纳偏置。")
+    P("  20 层 binary_residual 堆叠 → 有效上下文 ≈ num_layers × 时序窗口。")
     P()
 
     P(f"  {'Layer':>5s}  {'β_mean':>8s}  {'β_max':>8s}  "
-      f"{'1/β(1-β)_mean':>14s}  {'1/β(1-β)_max':>14s}  "
       f"{'r_mean':>8s}  {'r^{K}_mean':>12s}  {'r^{TK}_mean':>12s}  "
-      f"{'补偿后仍':>12s}")
-    P(f"  {'-'*115}")
+      f"{'时序窗口(步)':>14s}  {'时序窗口(token)':>14s}")
+    P(f"  {'-'*100}")
 
     for i, dec_layer in enumerate(model.layers):
         block = dec_layer.snn_block
@@ -611,28 +587,22 @@ def compensation_futility(model, config):
             omega = F.softplus(block.b_omega)
             r = torch.sqrt(beta**2 + omega**2).clamp(max=1.0)
 
-            # 补偿倍率
-            deriv = (beta * (1.0 - beta)).clamp(min=1e-6)
-            comp = 1.0 / deriv
-
-            # 时序衰减
             r_K = r ** K
             r_TK = r ** TK_prod
 
-            # "补偿后仍" = comp_mean × r_TK_mean（补偿放大后乘以时序衰减）
-            effective = comp.mean().item() * r_TK.mean().item()
+            # 有效时序窗口: 1/(1-r) 步 → /K tokens
+            window_steps = (1.0 / (1.0 - r + 1e-6)).mean().item()
+            window_tokens = window_steps / K
 
         P(f"  {i:5d}  {beta.mean().item():8.4f}  {beta.max().item():8.4f}  "
-          f"{comp.mean().item():14.1f}  {comp.max().item():14.1f}  "
           f"{r.mean().item():8.4f}  {r_K.mean().item():12.3e}  "
-          f"{r_TK.mean().item():12.3e}  {effective:12.3e}")
+          f"{r_TK.mean().item():12.3e}  {window_steps:14.1f}  {window_tokens:14.1f}")
 
     P()
-    P("  解读:")
-    P("  · 补偿倍率 ~100x（β=0.99 时 1/[0.99×0.01]=101）")
-    P("  · 时序衰减 r^8192 ~ 10^{-4} 到 10^{-36}")
-    P("  · 补偿后: 100 × 10^{-36} = 10^{-34}，仍然是零")
-    P("  · 结论: 补偿解决的是 O(100) 量级的问题，真正的问题是 O(10^{-36}) 的时序衰减")
+    P(f"  解读:")
+    P(f"  · 每层时序窗口 ~1/(1-r) 步 → /K tokens 的信息传递范围")
+    P(f"  · 20 层 binary_residual 堆叠: 有效上下文 ≈ 20 × 单层时序窗口")
+    P(f"  · 时序衰减 r^TK → 0 是正确的归纳偏置（每层处理局部信息，深度构建全局上下文）")
 
 
 # ======================================================================
@@ -648,14 +618,14 @@ def temporal_gradient_test(model, config, args):
     TK = seq_len * K
     batch = 1  # 节省显存
 
-    P(f"  方法: 对每层 — 构造 h(TK={TK}, B={batch}, D={D}), requires_grad=True")
-    P(f"         运行 layer.forward_parallel(h)")
-    P(f"         loss = h_out[-{K}:].sum()（仅最后 1 个 token 的 loss）")
-    P(f"         backward → 测量 ∂loss/∂h 在每个 token 位置的 norm")
+    P(f"  方法: 对每层 — 构造 x(TK={TK}, B={batch}, D={D}), requires_grad=True")
+    P(f"         运行 layer.forward_parallel(x)")
+    P(f"         loss = out[-{K}:].sum()（仅最后 1 个 token 的 loss）")
+    P(f"         backward → 测量 ∂loss/∂x 在每个 token 位置的 norm")
     P(f"         梯度比 = grad_norm[第1个token] / grad_norm[最后1个token]")
     P()
-    P(f"  注意: 残差连接使 ∂h_out[t]/∂h[t] 包含恒等分量，")
-    P(f"         因此 loss 所在 token 的梯度 ≈ 1。跨 token 梯度衰减来自 SNN 时序动力学。")
+    P(f"  v10: 纯 spike-to-spike，binary_residual (STE identity) 使 ∂out/∂in 包含恒等分量。")
+    P(f"        跨 token 梯度衰减来自 SNN 内部 PLIF 时序动力学。")
     P()
 
     from spikingjelly.activation_based import functional
@@ -673,20 +643,18 @@ def temporal_gradient_test(model, config, args):
 
             # 构造输入
             torch.manual_seed(42 + i)
-            h = torch.randn(TK, batch, D, device=args.device, dtype=torch.float32,
+            x = torch.randn(TK, batch, D, device=args.device, dtype=torch.float32,
                             requires_grad=True)
 
             # forward (不用 gradient checkpoint, 因为只跑单层)
-            with torch.no_grad():
-                pass  # 确保上下文干净
-            h_out = dec_layer.forward_parallel(h)
+            out = dec_layer.forward_parallel(x)
 
             # loss 仅来自最后 1 个 token
-            loss = h_out[-K:].sum()
+            loss = out[-K:].sum()
             loss.backward()
 
             # 收集每个 token 位置的梯度 norm
-            grad = h.grad.detach()  # (TK, B, D)
+            grad = x.grad.detach()  # (TK, B, D)
             token_norms = []
             for t in range(seq_len):
                 gn = grad[t * K:(t + 1) * K].norm().item()
@@ -710,7 +678,7 @@ def temporal_gradient_test(model, config, args):
             })
 
             # 清理
-            del h, h_out, loss, grad
+            del x, out, loss, grad
             if args.device == 'cuda':
                 torch.cuda.empty_cache()
 
@@ -827,7 +795,7 @@ def diagnosis_summary(model, config, static_report, all_stats):
     P(f"  [1] β 饱和: {total_high_beta}/{total_neurons} 隐神经元 β>0.95 "
       f"({total_high_beta/total_neurons*100:.1f}%)")
     P(f"      这些神经元的 sigmoid 导数 β(1-β) < 0.05×0.95 = 0.0475")
-    P(f"      参数化梯度衰减 ≤ 21× (可通过补偿解决)")
+    P(f"      参数化梯度衰减 ≤ 21×（由 optimizer 的 adaptive lr 处理）")
 
     # 2. 时序衰减统计
     total_dead = 0
@@ -879,13 +847,14 @@ def diagnosis_summary(model, config, static_report, all_stats):
     # 6. 根本矛盾
     P()
     P("  ┌─────────────────────────────────────────────────────────────────┐")
-    P("  │  根本矛盾:                                                      │")
-    P("  │    稳定性要求 r = √(β²+ω²) < 1 → 前向状态有界（不爆炸）         │")
-    P("  │    梯度流要求 r ≈ 1             → 反向梯度不消失                 │")
-    P("  │    乘法递推 V[t]=β·V[t-1]+u 下，两者矛盾                        │")
+    P("  │  v10 架构设计:                                                   │")
+    P("  │    稳定性: r = √(β²+ω²) < 1 → 前向状态有界（不爆炸）           │")
+    P("  │    时序窗口: 每层 ~1/(1-r) 步 → 局部信息处理                    │")
+    P("  │    深度梯度: binary_residual (STE identity mapping)               │")
+    P("  │    有效上下文: 20 层 × 时序窗口 → ~120 tokens                   │")
     P("  │                                                                 │")
-    P("  │  补偿 1/β(1-β) 修的是 O(100) 量级的参数化问题                    │")
-    P("  │  时序衰减 r^TK 是 O(10^{-4}~10^{-36}) 量级的根本问题            │")
+    P("  │  时序衰减 r^TK → 0 是正确的归纳偏置（类比 ConvNet 感受野增长）  │")
+    P("  │  深度梯度流由 binary_residual STE 保证（类比 ResNet skip）       │")
     P("  └─────────────────────────────────────────────────────────────────┘")
 
 
@@ -925,8 +894,8 @@ def main():
     # Section 6: β vs gradient correlation
     beta_gradient_correlation(model, config)
 
-    # Section 7: Compensation futility
-    compensation_futility(model, config)
+    # Section 7: Temporal decay analysis
+    temporal_decay_analysis(model, config)
 
     # Section 8: Temporal gradient test (clear gradients first)
     model.zero_grad()

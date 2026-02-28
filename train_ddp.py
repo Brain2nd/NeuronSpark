@@ -1,7 +1,8 @@
 """
-分布式训练脚本：SNN 语言模型预训练（DDP 多卡并行）
+分布式训练脚本：SNN 语言模型预训练（FSDP 多卡并行）
 
-基于 train.py 单卡脚本，使用 PyTorch DistributedDataParallel 实现数据并行。
+基于 train.py 单卡脚本，使用 PyTorch FullyShardedDataParallel (FSDP) 实现数据并行。
+FSDP 将参数/梯度/优化器状态分片到多卡，大幅节省每卡显存。
 训练逻辑、模型架构、超参数与单卡版完全一致。
 
 用法：
@@ -27,10 +28,23 @@ import math
 import argparse
 import warnings
 
+import functools
+
 import torch
 import torch.distributed as dist
 
-from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    BackwardPrefetch,
+    ShardingStrategy,
+)
+from torch.distributed.fsdp.api import (
+    StateDictType,
+    FullStateDictConfig,
+    FullOptimStateDictConfig,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from contextlib import nullcontext
@@ -42,6 +56,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from dataset import PretrainDataset
 from atomic_ops import SNNAdam
+from atomic_ops.snn_decoder_layer import SNNDecoderLayer
 
 warnings.filterwarnings('ignore')
 
@@ -99,61 +114,76 @@ def get_lr(it, total_iters, learning_rate, warmup_iters):
 # ============================================================
 
 def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, tokens_seen,
-                    health_report=None, max_keep=5):
-    """保存训练状态，每次不覆盖（带步数），仅保留最新 max_keep 个。"""
+                    health_report=None, max_keep=5, rank=0):
+    """保存训练状态（FSDP 版：所有 rank 参与 state_dict 聚合，仅 rank 0 写文件）。"""
     os.makedirs(save_dir, exist_ok=True)
-    raw_model = model.module if isinstance(model, DDP) else model
-    path = os.path.join(save_dir, f'ckpt_step{step}.pth')
-    ckpt_data = {
-        'model_state_dict': raw_model.state_dict(),
-        'optimizer_state': optimizer.state_dict(),
-        'scaler_state': scaler.state_dict(),
-        'step': step,
-        'epoch': epoch,
-        'best_loss': best_loss,
-        'tokens_seen': tokens_seen,
-        'model_config': {
-            'vocab_size': raw_model.vocab_size,
-            'D': raw_model.D,
-            'N': raw_model.N,
-            'K': raw_model.K,
-            'num_layers': raw_model.num_layers,
-            'D_ff': raw_model.D_ff,
-        },
-    }
-    # 附加健康检查报告
-    if health_report:
-        ckpt_data['health_report'] = health_report
-    torch.save(ckpt_data, path)
-    print(f"  → Checkpoint saved: {path}")
 
-    # 清理旧 checkpoint，仅保留最新 max_keep 个（按 step 数字排序，非字符串）
-    ckpts = sorted(
-        glob.glob(os.path.join(save_dir, 'ckpt_step*.pth')),
-        key=lambda p: int(os.path.basename(p).split('step')[1].split('.')[0]),
-    )
-    while len(ckpts) > max_keep:
-        old = ckpts.pop(0)
-        os.remove(old)
-        print(f"  → Removed old checkpoint: {old}")
+    # 所有 rank 必须参与 state_dict 聚合（collective 操作）
+    with FSDP.state_dict_type(
+        model,
+        StateDictType.FULL_STATE_DICT,
+        FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+        FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True),
+    ):
+        model_state = model.state_dict()
+        optim_state = FSDP.optim_state_dict(model, optimizer)
+
+    # 仅 rank 0 写文件
+    if rank == 0:
+        path = os.path.join(save_dir, f'ckpt_step{step}.pth')
+        ckpt_data = {
+            'model_state_dict': model_state,
+            'optimizer_state': optim_state,
+            'scaler_state': scaler.state_dict(),
+            'step': step,
+            'epoch': epoch,
+            'best_loss': best_loss,
+            'tokens_seen': tokens_seen,
+            'model_config': {
+                'vocab_size': model.vocab_size,
+                'D': model.D,
+                'N': model.N,
+                'K': model.K,
+                'num_layers': model.num_layers,
+                'D_ff': model.D_ff,
+            },
+        }
+        # 附加健康检查报告
+        if health_report:
+            ckpt_data['health_report'] = health_report
+        torch.save(ckpt_data, path)
+        print(f"  → Checkpoint saved: {path}")
+
+        # 清理旧 checkpoint，仅保留最新 max_keep 个（按 step 数字排序，非字符串）
+        ckpts = sorted(
+            glob.glob(os.path.join(save_dir, 'ckpt_step*.pth')),
+            key=lambda p: int(os.path.basename(p).split('step')[1].split('.')[0]),
+        )
+        while len(ckpts) > max_keep:
+            old = ckpts.pop(0)
+            os.remove(old)
+            print(f"  → Removed old checkpoint: {old}")
 
 
 def load_checkpoint(path, model, optimizer, scaler, device, rank):
-    """加载 checkpoint，恢复训练状态。"""
+    """加载 checkpoint，恢复训练状态（FSDP 版：所有 rank 参与）。"""
     Logger(f"Loading checkpoint from {path}...", rank)
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    # 所有 rank 都需要加载文件（FSDP 需要完整 state_dict 做分片）
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
 
-    raw_model = model.module if isinstance(model, DDP) else model
-
-    if 'model_state_dict' in ckpt:
-        raw_model.load_state_dict(ckpt['model_state_dict'], strict=False)
-    elif 'trainable_state_dict' in ckpt:
-        raw_model.load_state_dict(ckpt['trainable_state_dict'], strict=False)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+        if 'model_state_dict' in ckpt:
+            model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        elif 'trainable_state_dict' in ckpt:
+            model.load_state_dict(ckpt['trainable_state_dict'], strict=False)
 
     if 'optimizer_state' in ckpt:
         try:
-            optimizer.load_state_dict(ckpt['optimizer_state'])
-        except (ValueError, KeyError):
+            optim_state = FSDP.optim_state_dict_to_load(
+                model, optimizer, ckpt['optimizer_state']
+            )
+            optimizer.load_state_dict(optim_state)
+        except (ValueError, KeyError, RuntimeError):
             Logger("  Warning: Optimizer state incompatible, starting fresh.", rank)
 
     if 'scaler_state' in ckpt:
@@ -351,7 +381,7 @@ def print_health_report(report, rank=0):
 
 def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, args,
                 iter_per_epoch, tokens_seen, rank, world_size, writer=None):
-    """训练一个 epoch（DDP 版本）。"""
+    """训练一个 epoch（FSDP 版本）。"""
     # 设置 sampler 的 epoch 以保证每个 epoch 的 shuffle 不同
     sampler.set_epoch(epoch)
 
@@ -386,9 +416,8 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
             # 每 5000 步重校准 layer-wise LR (EMA α=0.3)
             global_step = step + 1; _recalib = (global_step == args.accumulation_steps) or (global_step % 5000 == 0)
             if _recalib:
-                _raw = model.module if isinstance(model, DDP) else model
                 _rms = [l.snn_block.W_in.weight.grad.float().pow(2).mean().sqrt().item()
-                        for l in _raw.layers]
+                        for l in model.layers]
                 _new = [_rms[0] / max(r, 1e-10) for r in _rms]
                 _prev = getattr(optimizer, '_layer_scales', None)
                 if _prev is not None:
@@ -451,19 +480,18 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
                 writer.add_scalar('train/mem_gb', mem_cur, global_step)
                 writer.add_scalar('train/mem_peak_gb', mem_peak, global_step)
 
-        # 定期保存（仅主进程，带步数，保留最新 5 个）
+        # 定期保存（所有 rank 参与 FSDP state_dict 聚合，仅 rank 0 写文件）
         if (step + 1) % args.save_interval == 0:
-            if is_main_process(rank):
-                model.eval()
-                global_step = epoch * iter_per_epoch + step + 1
-                # 保存时执行完整健康检查（含梯度检查）
-                health = snn_health_check(model, optimizer, batch_loss, global_step, rank, check_grad=True)
-                print_health_report(health, rank)
-                save_checkpoint(args.save_dir, model, optimizer, scaler,
-                                global_step, epoch, batch_loss, tokens_seen, health_report=health)
-                model.train()
-            if world_size > 1:
-                dist.barrier()
+            model.eval()
+            global_step = epoch * iter_per_epoch + step + 1
+            _save_loss = loss.item() * args.accumulation_steps
+            # 保存时执行完整健康检查（含梯度检查）
+            health = snn_health_check(model, optimizer, _save_loss, global_step, rank, check_grad=True)
+            print_health_report(health, rank)
+            save_checkpoint(args.save_dir, model, optimizer, scaler,
+                            global_step, epoch, _save_loss, tokens_seen,
+                            health_report=health, rank=rank)
+            model.train()
 
     return tokens_seen
 
@@ -473,7 +501,7 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
 # ============================================================
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SNN Language Model Pretraining (DDP)")
+    parser = argparse.ArgumentParser(description="SNN Language Model Pretraining (FSDP)")
 
     # SNN 模型参数
     parser.add_argument('--vocab_size', type=int, default=6144)
@@ -535,21 +563,34 @@ if __name__ == "__main__":
     # TensorBoard（仅主进程）
     writer = SummaryWriter(log_dir=os.path.join(args.tb_dir, args.out_dir)) if is_main_process(rank) else None
 
-    # 混合精度
-    ctx = torch.amp.autocast('cuda',
-                             dtype=torch.bfloat16 if args.dtype == 'bfloat16' else torch.float16)
+    # 混合精度：由 FSDP MixedPrecision 处理，不再需要 autocast
+    mp_dtype = torch.bfloat16 if args.dtype == 'bfloat16' else torch.float16
+    ctx = nullcontext()
 
     # ==================== 模型初始化 ====================
     model, tokenizer, device = init_model(args, local_rank, rank)
 
-    # DDP 包装
-    # gradient_as_bucket_view=True: param.grad 直接指向通信 bucket，
-    #   避免梯度拷贝，省 ~1× 模型参数量的 fp32 显存 (~5.5GB for 1.4B params)
-    # static_graph=True: 每次 forward 参与 backward 的参数集不变，
-    #   DDP 跳过 bucket 重建 + unused parameter 扫描
-    model = DDP(model, device_ids=[local_rank],
-                gradient_as_bucket_view=True,
-                static_graph=True)
+    # FSDP 包装（ZeRO-3：参数/梯度/优化器全分片）
+    fsdp_policy = functools.partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={SNNDecoderLayer},
+    )
+    fsdp_mixed_precision = MixedPrecision(
+        param_dtype=mp_dtype,
+        reduce_dtype=mp_dtype,
+        buffer_dtype=mp_dtype,
+    )
+    model = FSDP(
+        model,
+        auto_wrap_policy=fsdp_policy,
+        mixed_precision=fsdp_mixed_precision,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        forward_prefetch=True,
+        use_orig_params=True,
+        device_id=local_rank,
+        limit_all_gathers=True,
+    )
 
     # ==================== 数据加载 ====================
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_length)
@@ -570,20 +611,18 @@ if __name__ == "__main__":
     scaler = torch.amp.GradScaler('cuda', enabled=(args.dtype == 'float16'))
 
     # SNNAdam: Adam + 10 阶段神经动力学增强（对齐 HappyLLM 预训练无 weight decay）
-    _pg = model.module.get_param_groups()
+    _pg = model.get_param_groups()
 
     # dynamics 标记（SNNAdam Phase 1/4-10 使用）
     _dynamics_map = {'b_beta': 'b_beta', 'b_alpha': 'b_alpha', 'b_omega': 'b_omega',
                      'b_th': 'b_th'}
 
     # 神经元参数 lr_mult（surrogate gradient 天然较弱，需要更高 lr）
-    _neuron_keys = {'input_neurons', 'b_beta', 'b_alpha', 'b_th', 'b_omega',
-                    'block_output_neuron', 'ffn_neurons', 'ffn_expert_neurons',
-                    'output_neuron'}
+    _neuron_keys = {'b_beta', 'b_alpha', 'b_th', 'b_omega',
+                    'block_output_neuron', 'ffn_neurons', 'ffn_expert_neurons'}
 
     # ---- Layer-wise LR: 按层拆分参数组，第一次 accumulated batch 后就地校准 ----
-    _raw_model = model.module if isinstance(model, DDP) else model
-    _layer_map = _raw_model.get_layer_indices()
+    _layer_map = model.get_layer_indices()
     _no_layer_scale_keys = {'b_beta', 'b_alpha', 'b_omega', 'b_th'}
 
     param_groups = []
@@ -640,7 +679,7 @@ if __name__ == "__main__":
     effective_batch = args.batch_size * args.accumulation_steps * world_size
 
     Logger(f"\n{'='*60}", rank)
-    Logger(f"SNN Language Model Pretraining (DDP, {world_size} GPUs)", rank)
+    Logger(f"SNN Language Model Pretraining (FSDP, {world_size} GPUs)", rank)
     Logger(f"  Vocab:       {args.vocab_size}", rank)
     Logger(f"  Model:       D={args.D}, N={args.N}, K={args.K}, Layers={args.num_layers}, D_ff={args.D_ff}", rank)
     Logger(f"  Data:        {args.data_path}", rank)
@@ -676,12 +715,11 @@ if __name__ == "__main__":
             iter_per_epoch, tokens_seen, rank, world_size, writer,
         )
 
-    # 最终保存
-    if is_main_process(rank):
-        Logger(f"\nTraining finished. Total tokens seen: {tokens_seen:,}", rank)
-        Logger(f"Peak CUDA memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB", rank)
-        save_checkpoint(args.save_dir, model, optimizer, scaler,
-                        args.epochs * iter_per_epoch, args.epochs - 1, 0.0, tokens_seen)
+    # 最终保存（所有 rank 参与 FSDP state_dict 聚合）
+    Logger(f"\nTraining finished. Total tokens seen: {tokens_seen:,}", rank)
+    Logger(f"Peak CUDA memory: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB", rank)
+    save_checkpoint(args.save_dir, model, optimizer, scaler,
+                    args.epochs * iter_per_epoch, args.epochs - 1, 0.0, tokens_seen, rank=rank)
 
     if writer:
         writer.close()

@@ -210,29 +210,19 @@ class SNNBlock(base.MemoryModule):
         TK, batch, D = spike_in_seq.shape
         DN = self.D * self.N
 
-        # ====== Phase 1: 批量投影（合并 GEMM: 7 launch → 2 launch）======
+        # ====== Phase 1: 投影（独立 F.linear，FSDP 兼容）======
         flat = spike_in_seq.reshape(TK * batch, D)
 
-        # 5× D→DN 合并为 1 次 GEMM: (5*DN, D) @ (D, TK*B)^T
-        # clone() 避免 FSDP inplace shard/unshard 使 cat view 失效
-        W_dn5 = torch.cat([
-            self.W_in.weight.clone(), self.W_beta_x.weight.clone(),
-            self.W_alpha_x.weight.clone(), self.W_th_x.weight.clone(),
-            self.W_omega_x.weight.clone(),
-        ], dim=0)  # (5*DN, D)
-        proj_dn5 = F.linear(flat, W_dn5)  # (TK*B, 5*DN)
-        I_all, raw_beta, raw_alpha, raw_th, raw_omega = proj_dn5.split(DN, dim=-1)
-        I_all = I_all.reshape(TK, batch, DN)
-        raw_beta = raw_beta.reshape(TK, batch, DN)
-        raw_alpha = raw_alpha.reshape(TK, batch, DN)
-        raw_th = raw_th.reshape(TK, batch, DN)
-        raw_omega = raw_omega.reshape(TK, batch, DN)
+        # 5× D→DN 独立投影
+        I_all = F.linear(flat, self.W_in.weight).reshape(TK, batch, DN)
+        raw_beta = F.linear(flat, self.W_beta_x.weight).reshape(TK, batch, DN)
+        raw_alpha = F.linear(flat, self.W_alpha_x.weight).reshape(TK, batch, DN)
+        raw_th = F.linear(flat, self.W_th_x.weight).reshape(TK, batch, DN)
+        raw_omega = F.linear(flat, self.W_omega_x.weight).reshape(TK, batch, DN)
 
-        # 2× D→D 合并为 1 次 GEMM: (2*D, D) @ (D, TK*B)^T
-        W_d2 = torch.cat([self.W_gate.weight.clone(), self.W_skip.weight.clone()], dim=0)  # (2*D, D)
-        proj_d2 = F.linear(flat, W_d2).reshape(TK, batch, 2 * D)  # (TK, B, 2*D)
-        gate_all = torch.sigmoid(proj_d2[:, :, :D])
-        I_skip_all = proj_d2[:, :, D:]
+        # 2× D→D 独立投影
+        gate_all = torch.sigmoid(F.linear(flat, self.W_gate.weight).reshape(TK, batch, D))
+        I_skip_all = F.linear(flat, self.W_skip.weight).reshape(TK, batch, D)
 
         # ====== Phase 1b: 融合激活 + 稳定性约束（torch.compile → 单 kernel）======
         beta_all, u_hidden, v_th_all, omega_all = _fused_modulation_rf(

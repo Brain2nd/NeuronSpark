@@ -123,15 +123,11 @@ class SNNFFN(base.MemoryModule):
         D_ff = self.D_ff
         flat = spike_in_seq.reshape(TK * batch, D)
 
-        # ====== Phase 1: 批量投影（gate+up+skip 合并为 1 次 GEMM: 3 launch → 1） ======
-        # clone() 避免 FSDP inplace shard/unshard 使 cat view 失效
-        W_all = torch.cat([
-            self.gate_proj.weight.clone(), self.up_proj.weight.clone(),
-            self.skip_proj.weight.clone(),
-        ], dim=0)  # (2*D_ff + D, D)
-        proj_all = F.linear(flat, W_all)  # (TK*B, 2*D_ff + D)
-        I_gate_up = proj_all[:, :2 * D_ff].reshape(TK, batch, 2 * D_ff)
-        I_skip = proj_all[:, 2 * D_ff:].reshape(TK, batch, D)
+        # ====== Phase 1: 投影（独立 F.linear，FSDP 兼容）======
+        I_gate = F.linear(flat, self.gate_proj.weight).reshape(TK, batch, D_ff)
+        I_up = F.linear(flat, self.up_proj.weight).reshape(TK, batch, D_ff)
+        I_skip = F.linear(flat, self.skip_proj.weight).reshape(TK, batch, D)
+        I_gate_up = torch.cat([I_gate, I_up], dim=-1)  # (TK, batch, 2*D_ff)
 
         # ====== Phase 2: Gate+Up 合并 PLIF scan（row-param kernel） ======
         beta_gate = self.gate_neuron.beta  # (D_ff,)

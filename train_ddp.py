@@ -127,8 +127,11 @@ def save_checkpoint(save_dir, model, optimizer, scaler, step, epoch, best_loss, 
     torch.save(ckpt_data, path)
     print(f"  → Checkpoint saved: {path}")
 
-    # 清理旧 checkpoint，仅保留最新 max_keep 个
-    ckpts = sorted(glob.glob(os.path.join(save_dir, 'ckpt_step*.pth')))
+    # 清理旧 checkpoint，仅保留最新 max_keep 个（按 step 数字排序，非字符串）
+    ckpts = sorted(
+        glob.glob(os.path.join(save_dir, 'ckpt_step*.pth')),
+        key=lambda p: int(os.path.basename(p).split('step')[1].split('.')[0]),
+    )
     while len(ckpts) > max_keep:
         old = ckpts.pop(0)
         os.remove(old)

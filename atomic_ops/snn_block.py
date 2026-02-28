@@ -214,9 +214,11 @@ class SNNBlock(base.MemoryModule):
         flat = spike_in_seq.reshape(TK * batch, D)
 
         # 5× D→DN 合并为 1 次 GEMM: (5*DN, D) @ (D, TK*B)^T
+        # clone() 避免 FSDP inplace shard/unshard 使 cat view 失效
         W_dn5 = torch.cat([
-            self.W_in.weight, self.W_beta_x.weight, self.W_alpha_x.weight,
-            self.W_th_x.weight, self.W_omega_x.weight,
+            self.W_in.weight.clone(), self.W_beta_x.weight.clone(),
+            self.W_alpha_x.weight.clone(), self.W_th_x.weight.clone(),
+            self.W_omega_x.weight.clone(),
         ], dim=0)  # (5*DN, D)
         proj_dn5 = F.linear(flat, W_dn5)  # (TK*B, 5*DN)
         I_all, raw_beta, raw_alpha, raw_th, raw_omega = proj_dn5.split(DN, dim=-1)
@@ -227,7 +229,7 @@ class SNNBlock(base.MemoryModule):
         raw_omega = raw_omega.reshape(TK, batch, DN)
 
         # 2× D→D 合并为 1 次 GEMM: (2*D, D) @ (D, TK*B)^T
-        W_d2 = torch.cat([self.W_gate.weight, self.W_skip.weight], dim=0)  # (2*D, D)
+        W_d2 = torch.cat([self.W_gate.weight.clone(), self.W_skip.weight.clone()], dim=0)  # (2*D, D)
         proj_d2 = F.linear(flat, W_d2).reshape(TK, batch, 2 * D)  # (TK, B, 2*D)
         gate_all = torch.sigmoid(proj_d2[:, :, :D])
         I_skip_all = proj_d2[:, :, D:]

@@ -44,13 +44,6 @@ def test_binary_residual_output_legality():
     spike_a = fp16_encode(x_a, K)
     spike_b = fp16_encode(x_b, K)
 
-    # 旧 SEW: 十进制加法会产生 {0, 1, 2}
-    sew_result = spike_a + spike_b
-    sew_unique = sew_result.unique().tolist()
-    print(f"[Legality] SEW unique values: {sew_unique}")
-    assert 2.0 in sew_unique, "SEW should produce value 2 (for comparison)"
-
-    # 新 binary_residual: 只产生 {0, 1}
     br_result = binary_residual(spike_a, spike_b)
     br_unique = br_result.unique().tolist()
     print(f"[Legality] binary_residual unique values: {br_unique}")

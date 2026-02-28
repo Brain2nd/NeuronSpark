@@ -526,13 +526,21 @@ if _HAS_TRITON:
     def _fused_plif_bwd_rowparam_recomp_kernel(
         BETA_ROW_ptr, VTH_ROW_ptr, INIT_ptr,
         U_ptr, SPIKE_ptr,
-        GRAD_SPIKE_ptr, GRAD_VPOST_ptr,
+        GRAD_SPIKE_ptr,
         GRAD_BETA_ROW_ptr, GRAD_U_ptr, GRAD_VTH_ROW_ptr, GRAD_INIT_ptr,
-        VPOST_TEMP_ptr,
         K, num_cols, ALPHA,
         BLOCK: tl.constexpr,
     ):
-        """Backward with V_post recomputation. No V_post HBM load from forward."""
+        """Backward with V_post recomputation (memory-optimized).
+
+        Phase 1: Forward recompute V_post → reuse GRAD_U buffer
+        Phase 2: Reverse step k reads GRAD_U[k-1] (=V_post[k-1]),
+                 then overwrites GRAD_U[k] with grad_u[k].  No conflict.
+
+        Saves 2 large tensors vs original:
+          - grad_V_post_c  (always zero, replaced by constant 0)
+          - V_post_temp     (reuses GRAD_U buffer)
+        """
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
         mask = cols < num_cols
@@ -541,7 +549,7 @@ if _HAS_TRITON:
         vth = tl.load(VTH_ROW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         v_init_val = tl.load(INIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
-        # Phase 1: 前向重计算 V_post → 写入 temp buffer
+        # Phase 1: 前向重计算 V_post → 写入 GRAD_U buffer (临时复用)
         v = v_init_val
         for k in range(K):
             off = k * num_cols + cols
@@ -549,15 +557,17 @@ if _HAS_TRITON:
             spike = tl.load(SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
             v_pre = beta * v + u
             v = v_pre - vth * spike
-            tl.store(VPOST_TEMP_ptr + off, v, mask=mask)
+            tl.store(GRAD_U_ptr + off, v, mask=mask)    # V_post temp
 
         # Phase 2: 标准反向 scan
+        # GRAD_U[k] currently holds V_post[k]
+        # Reverse step k reads [k-1] then overwrites [k] — no conflict
         acc = tl.zeros([BLOCK], dtype=tl.float32)
         acc_grad_beta = tl.zeros([BLOCK], dtype=tl.float32)
         acc_grad_vth = tl.zeros([BLOCK], dtype=tl.float32)
 
         cached_v = tl.load(
-            VPOST_TEMP_ptr + (K - 1) * num_cols + cols, mask=mask, other=0.0,
+            GRAD_U_ptr + (K - 1) * num_cols + cols, mask=mask, other=0.0,
         ).to(tl.float32)
 
         for k_rev in range(K):
@@ -568,11 +578,10 @@ if _HAS_TRITON:
             spike = tl.load(SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
 
             g_s = tl.load(GRAD_SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
-            g_V = tl.load(GRAD_VPOST_ptr + off, mask=mask, other=0.0).to(tl.float32)
 
             if k > 0:
                 v_prev = tl.load(
-                    VPOST_TEMP_ptr + (k - 1) * num_cols + cols,
+                    GRAD_U_ptr + (k - 1) * num_cols + cols,
                     mask=mask, other=0.0,
                 ).to(tl.float32)
                 cached_v = v_prev
@@ -586,7 +595,8 @@ if _HAS_TRITON:
             sig = 1.0 / (1.0 + tl.exp(neg_ax))
             sg = ALPHA * sig * (1.0 - sig)
 
-            total_gV = g_V + acc
+            # g_V = 0 (no external gradient flows into V_post)
+            total_gV = acc
             grad_v_pre = g_s * sg + total_gV
 
             tl.store(GRAD_U_ptr + off, grad_v_pre, mask=mask)
@@ -655,17 +665,11 @@ if _HAS_TRITON:
                 grad_spike = torch.zeros_like(spike)
 
             grad_spike_c = grad_spike.contiguous()
-            # V_post gradient is always zero (None output), but we still need it
-            # for the backward kernel interface
-            grad_V_post_c = torch.zeros_like(spike)
 
             grad_beta_row = torch.empty_like(beta_row)
             grad_u = torch.empty_like(u)
             grad_v_th_row = torch.empty_like(v_th_row)
             grad_v_init = torch.empty_like(v_init)
-
-            # Temporary buffer for recomputed V_post (allocated here, freed after backward)
-            V_post_temp = torch.empty_like(u)
 
             BLOCK = _TritonPLIFRowParamRecompute._BLOCK
             grid = ((num_cols + BLOCK - 1) // BLOCK,)
@@ -673,9 +677,8 @@ if _HAS_TRITON:
             _fused_plif_bwd_rowparam_recomp_kernel[grid](
                 beta_row, v_th_row, v_init,
                 u, spike,
-                grad_spike_c, grad_V_post_c,
+                grad_spike_c,
                 grad_beta_row, grad_u, grad_v_th_row, grad_v_init,
-                V_post_temp,
                 K, num_cols, float(alpha),
                 BLOCK=BLOCK,
             )
@@ -954,17 +957,23 @@ if _HAS_TRITON:
     def _fused_rf_plif_bwd_recompute_kernel(
         BETA_ptr, OMEGA_ptr, VTH_ptr, VINIT_ptr, WINIT_ptr,
         U_ptr, SPIKE_ptr,
-        GRAD_SPIKE_ptr, GRAD_VPOST_ptr,
+        GRAD_SPIKE_ptr,
         GRAD_BETA_ptr, GRAD_OMEGA_ptr, GRAD_U_ptr, GRAD_VTH_ptr,
         GRAD_VINIT_ptr, GRAD_WINIT_ptr,
-        VPOST_TEMP_ptr, W_TEMP_ptr,
         K, num_cols, ALPHA,
         BLOCK: tl.constexpr,
     ):
-        """RF PLIF backward with V_post/W recomputation.
+        """RF PLIF backward with V_post/W recomputation (memory-optimized).
 
-        Phase 1: Forward recompute V_post/W into temp buffers
-        Phase 2: Standard reverse gradient with register caching
+        Phase 1: Forward recompute V_post/W → reuse GRAD_U / GRAD_VTH buffers
+        Phase 2: Reverse gradient — read V_post[k-1]/W[k-1], then overwrite
+                 with grad_u[k]/grad_v_th[k].  No conflict: reverse step k
+                 reads [k-1] before writing [k].
+
+        Saves 3 large tensors vs original:
+          - grad_V_post_c  (always zero, replaced by constant 0)
+          - V_post_temp     (reuses GRAD_U buffer)
+          - W_temp          (reuses GRAD_VTH buffer)
         """
         pid = tl.program_id(0)
         cols = pid * BLOCK + tl.arange(0, BLOCK)
@@ -973,7 +982,7 @@ if _HAS_TRITON:
         v_init_val = tl.load(VINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         w_init_val = tl.load(WINIT_ptr + cols, mask=mask, other=0.0).to(tl.float32)
 
-        # Phase 1: Forward recompute V_post, W → temp buffers
+        # Phase 1: Forward recompute V_post, W → GRAD_U / GRAD_VTH buffers
         v = v_init_val
         w = w_init_val
         for k in range(K):
@@ -989,16 +998,18 @@ if _HAS_TRITON:
             v = v_pre - vth * spike
             w = w_new
 
-            tl.store(VPOST_TEMP_ptr + off, v, mask=mask)
-            tl.store(W_TEMP_ptr + off, w, mask=mask)
+            tl.store(GRAD_U_ptr + off, v, mask=mask)    # V_post temp
+            tl.store(GRAD_VTH_ptr + off, w, mask=mask)   # W temp
 
         # Phase 2: Reverse gradient accumulation
+        # GRAD_U[k] currently holds V_post[k], GRAD_VTH[k] holds W[k]
+        # Reverse step k reads [k-1] then overwrites [k] — no conflict
         acc_v = tl.zeros([BLOCK], dtype=tl.float32)
         acc_w = tl.zeros([BLOCK], dtype=tl.float32)
 
         last_off = (K - 1) * num_cols + cols
-        cached_v = tl.load(VPOST_TEMP_ptr + last_off, mask=mask, other=0.0).to(tl.float32)
-        cached_w = tl.load(W_TEMP_ptr + last_off, mask=mask, other=0.0).to(tl.float32)
+        cached_v = tl.load(GRAD_U_ptr + last_off, mask=mask, other=0.0).to(tl.float32)
+        cached_w = tl.load(GRAD_VTH_ptr + last_off, mask=mask, other=0.0).to(tl.float32)
 
         for k_rev in range(K):
             k = K - 1 - k_rev
@@ -1010,17 +1021,16 @@ if _HAS_TRITON:
             spike = tl.load(SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
 
             g_s = tl.load(GRAD_SPIKE_ptr + off, mask=mask, other=0.0).to(tl.float32)
-            g_V = tl.load(GRAD_VPOST_ptr + off, mask=mask, other=0.0).to(tl.float32)
 
             v_post = cached_v
 
             if k > 0:
                 v_prev = tl.load(
-                    VPOST_TEMP_ptr + (k - 1) * num_cols + cols,
+                    GRAD_U_ptr + (k - 1) * num_cols + cols,
                     mask=mask, other=0.0,
                 ).to(tl.float32)
                 w_prev = tl.load(
-                    W_TEMP_ptr + (k - 1) * num_cols + cols,
+                    GRAD_VTH_ptr + (k - 1) * num_cols + cols,
                     mask=mask, other=0.0,
                 ).to(tl.float32)
                 cached_v = v_prev
@@ -1035,7 +1045,8 @@ if _HAS_TRITON:
             sig = 1.0 / (1.0 + tl.exp(neg_ax))
             sg = ALPHA * sig * (1.0 - sig)
 
-            total_gV = g_V + acc_v
+            # g_V = 0 (no external gradient flows into V_post)
+            total_gV = acc_v
             total_gW = acc_w
             grad_v_pre = g_s * sg + total_gV
 
@@ -1191,7 +1202,6 @@ if _HAS_TRITON:
             if grad_spike is None:
                 grad_spike = torch.zeros_like(spike)
             grad_spike_c = grad_spike.contiguous()
-            grad_V_post_c = torch.zeros_like(spike)
 
             grad_beta = torch.empty_like(beta)
             grad_omega = torch.empty_like(omega)
@@ -1200,19 +1210,15 @@ if _HAS_TRITON:
             grad_v_init = torch.empty_like(v_init)
             grad_w_init = torch.empty_like(w_init)
 
-            V_post_temp = torch.empty_like(u)
-            W_temp = torch.empty_like(u)
-
             BLOCK = _TritonRFPLIFRecompute._BLOCK
             grid = ((num_cols + BLOCK - 1) // BLOCK,)
 
             _fused_rf_plif_bwd_recompute_kernel[grid](
                 beta, omega, v_th, v_init, w_init,
                 u, spike,
-                grad_spike_c, grad_V_post_c,
+                grad_spike_c,
                 grad_beta, grad_omega, grad_u, grad_v_th,
                 grad_v_init, grad_w_init,
-                V_post_temp, W_temp,
                 K, num_cols, float(alpha),
                 BLOCK=BLOCK,
             )

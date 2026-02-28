@@ -26,7 +26,7 @@ from spikingjelly.activation_based import base, surrogate
 
 from .snn_ffn import SNNFFN
 from .parallel_scan import plif_rowparam_forward_alpha, plif_rowparam_forward_recompute
-from .moe_kernels import moe_combine
+from .fp16_codec import fp16_decode, fp16_encode, binary_encode_ste
 
 
 class MoESNNFFN(base.MemoryModule):
@@ -66,12 +66,13 @@ class MoESNNFFN(base.MemoryModule):
         self.top_k = top_k
         self.K = K
 
-        # 共享 expert（always active）
+        # 共享 expert（always active，残差由 MoE 层统一处理）
         self.shared_expert = SNNFFN(
             D=D, D_ff=D_ff_shared,
             output_v_threshold=output_v_threshold,
             num_layers=num_layers,
             layer_idx=layer_idx,
+            add_residual=False,
         )
 
         # ====== 堆叠路由 expert 参数（替代 nn.ModuleList） ======
@@ -97,7 +98,7 @@ class MoESNNFFN(base.MemoryModule):
         self.register_memory('expert_gu_v', 0.)
         self.register_memory('expert_out_v', 0.)
 
-        # Router: 基于连续 h 做路由（非 spike）
+        # Router: 基于 spike firing rate 做路由（v10: 不再依赖连续 h）
         self.router = nn.Linear(D, num_experts, bias=False)
 
         # DeepSeek-V3 expert_bias（非梯度参数，sign rule 更新）
@@ -325,13 +326,12 @@ class MoESNNFFN(base.MemoryModule):
 
         return spike_out
 
-    def forward_parallel(self, spike_in_seq, h):
+    def forward_parallel(self, spike_in_seq):
         """
-        并行前向传播。
+        并行前向传播（v10: router 使用 spike firing rate）。
 
         Args:
             spike_in_seq: (TK, B, D) — spike 输入
-            h: (TK, B, D) — 连续残差流（用于 routing 决策）
 
         Returns:
             spike_out: (TK, B, D)
@@ -342,9 +342,9 @@ class MoESNNFFN(base.MemoryModule):
         T = TK // K
         E = self.num_experts
 
-        # ---- Router: 连续 h 平均 K 步 → per-token routing ----
-        h_tokens = h.reshape(T, K, B, D).mean(dim=1)  # (T, B, D)
-        router_logits = self.router(h_tokens)  # (T, B, E)
+        # ---- Router: spike firing rate 平均 K 步 → per-token routing ----
+        spike_rate = spike_in_seq.reshape(T, K, B, D).mean(dim=1)  # (T, B, D), ∈ [0,1]
+        router_logits = self.router(spike_rate)  # (T, B, E)
 
         # Top-k 选择（DeepSeek-V3: 加 bias 影响选择，softmax 用原始 logits）
         biased_logits = router_logits + self.expert_bias
@@ -358,7 +358,7 @@ class MoESNNFFN(base.MemoryModule):
         counts = torch.bincount(top_k_idx.reshape(-1), minlength=E).float()
 
         # ---- 高效路由权重构建（scatter_add_ 替代 E 次 mask 循环）----
-        full_weights = torch.zeros(T, B, E, device=h.device, dtype=h.dtype)
+        full_weights = torch.zeros(T, B, E, device=spike_in_seq.device, dtype=spike_in_seq.dtype)
         full_weights.scatter_add_(-1, top_k_idx, routing_weights)
         # (T, B, E) → (TK, B, E)
         weights_tk = full_weights.unsqueeze(1).expand(T, K, B, E).reshape(TK, B, E)
@@ -366,28 +366,42 @@ class MoESNNFFN(base.MemoryModule):
         # ---- Shared expert: 始终处理所有 token ----
         shared_out = self.shared_expert.forward_parallel(spike_in_seq)  # (TK, B, D)
 
-        # ---- Routed experts ----
+        # ---- Routed experts: decode-combine-encode（保证 IEEE 754 位结构完整） ----
         if self.training:
             # 训练: 批量执行所有 expert（无循环）
-            expert_outs = self._batched_expert_forward(spike_in_seq)  # (E, TK, B, D)
+            expert_spikes = self._batched_expert_forward(spike_in_seq)  # (E, TK, B, D) binary
 
-            # Fused MoE combine: shared + Σ_e experts[e] × weights[:, e]
-            expert_outs_flat = expert_outs.reshape(E, TK * B, D)
-            shared_flat = shared_out.reshape(TK * B, D)
-            weights_flat = weights_tk.reshape(TK * B, E).contiguous()
-            out_flat = moe_combine(shared_flat, expert_outs_flat, weights_flat)
-            out = out_flat.reshape(TK, B, D)
+            # Decode 到 per-token 连续空间
+            shared_val = fp16_decode(shared_out, T, K)  # (B, T, D)
+            expert_vals = torch.stack(
+                [fp16_decode(expert_spikes[e], T, K) for e in range(E)], dim=0
+            )  # (E, B, T, D)
+
+            # Per-token 连续空间加权合并
+            # full_weights: (T, B, E) → (E, B, T, 1)
+            w = full_weights.permute(2, 1, 0).unsqueeze(-1)  # (E, B, T, 1)
+            combined = shared_val + (expert_vals * w).sum(dim=0)  # (B, T, D)
+
+            # 加残差: decode(spike_in) + combined
+            residual_val = fp16_decode(spike_in_seq, T, K)  # (B, T, D)
+            total = combined + residual_val  # (B, T, D)
+
+            # 重编码为二进制（STE backward）
+            out = binary_encode_ste(total)  # (TK, B, D) binary {0,1}
         else:
             # 推理: 仅运行选中的 expert（真正稀疏加速）
-            out = shared_out
+            out_val = fp16_decode(shared_out, T, K)  # (B, T, D)
             active_experts = top_k_idx.unique()
             for e_idx_val in active_experts:
                 e_idx = e_idx_val.item()
-                # 推理模式: 使用 single step 逐帧（不走 batched path）
-                # 或者可以用参数切片做 parallel path
-                expert_out = self._inference_expert_parallel(e_idx, spike_in_seq)
-                weight_tk = weights_tk[:, :, e_idx:e_idx + 1]  # (TK, B, 1)
-                out = out + expert_out * weight_tk
+                expert_spike = self._inference_expert_parallel(e_idx, spike_in_seq)
+                expert_val = fp16_decode(expert_spike, T, K)  # (B, T, D)
+                w_e = full_weights[:, :, e_idx].permute(1, 0).unsqueeze(-1)  # (B, T, 1)
+                out_val = out_val + expert_val * w_e
+            # 加残差
+            residual_val = fp16_decode(spike_in_seq, T, K)
+            total = out_val + residual_val
+            out = fp16_encode(total, 16)  # 推理不需 STE，直接 encode
 
         return out, {
             'expert_counts': counts.detach(),
@@ -448,19 +462,18 @@ class MoESNNFFN(base.MemoryModule):
         )
         return spike_out
 
-    def single_step_forward(self, spike_in, h):
+    def single_step_forward(self, spike_in):
         """
-        单步前向传播（推理/生成用）。
+        单步前向传播（推理/生成用，v10: router 使用 spike）。
 
         Args:
             spike_in: (B, D) — spike 输入
-            h: (B, D) — 连续残差流（用于 routing 决策）
 
         Returns:
             spike_out: (B, D)
         """
-        # Router: 单步直接用 h 做路由（无需 K 步平均）
-        router_logits = self.router(h)  # (B, E)
+        # Router: 单步直接用 spike 做路由（binary {0,1} 表示当前活跃特征）
+        router_logits = self.router(spike_in)  # (B, E)
         biased_logits = router_logits + self.expert_bias
         _, top_k_idx = biased_logits.topk(self.top_k, dim=-1)  # (B, k)
         top_k_original = router_logits.gather(-1, top_k_idx)

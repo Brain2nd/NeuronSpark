@@ -34,7 +34,8 @@ from spikingjelly.activation_based import base, layer, neuron, surrogate
 
 from .selective_plif import SelectivePLIFNode
 from .plif_node import PLIFNode
-from .parallel_scan import plif_rowparam_forward_sew, rf_plif_parallel_forward_recompute
+from .parallel_scan import plif_rowparam_forward_recompute, rf_plif_parallel_forward_recompute
+from .fp16_codec import binary_residual
 
 
 @torch.compile(backend='inductor', fullgraph=True)
@@ -275,15 +276,12 @@ class SNNBlock(base.MemoryModule):
         surr = self.output_neuron.get_surrogate(u_output)
         alpha = float(surr.alpha) if hasattr(surr, 'alpha') else 4.0
 
-        # P1: fused PLIF + SEW (spike_sew = plif_spike + spike_in) in single Triton kernel
-        spike_sew, V_post_output = plif_rowparam_forward_sew(
-            beta_out_row, u_output, v_th_out_row, v_init_output,
-            spike_in_seq, alpha,
+        # PLIF scan + 二进制残差（替代 SEW 十进制加法）
+        spike_out, V_last_output = plif_rowparam_forward_recompute(
+            beta_out_row, u_output, v_th_out_row, v_init_output, alpha,
         )
-
-        self.output_neuron.v = V_post_output[-1].detach()
-
-        return spike_sew
+        self.output_neuron.v = V_last_output.detach()
+        return binary_residual(spike_out, spike_in_seq)
 
     def single_step_forward(self, spike_in: torch.Tensor) -> torch.Tensor:
         """

@@ -96,3 +96,146 @@ def fp16_decode(spikes: Tensor, seq_len: int, K: int = 16) -> Tensor:
     subnormal_val = sign * (2.0 ** -14) * mant_frac
 
     return torch.where(is_normal, normal_val, subnormal_val)
+
+
+# ====== 二进制残差连接（替代 SEW 十进制加法） ======
+
+def _binary_residual_naive(spike_a: Tensor, spike_b: Tensor) -> Tensor:
+    """未融合 baseline（仅用于 benchmark 对比）: fp16_decode → add → fp16_encode。
+
+    ~20 个独立 kernel launch，8.6 ms/call。
+    """
+    TK = spike_a.shape[0]
+    T = TK // 16
+    val_a = fp16_decode(spike_a, T, 16)
+    val_b = fp16_decode(spike_b, T, 16)
+    return fp16_encode(val_a + val_b, 16)
+
+
+def _binary_residual_fwd(spike_a: Tensor, spike_b: Tensor) -> Tensor:
+    """内联 decode+add+encode 全流程，供 torch.compile 融合。
+
+    inductor 将 ~20 个独立 kernel（sign/exp/mant 加权求和、exp2、where、
+    clamp、bit shift...）融合为 2-3 个 fused kernel。
+
+    Benchmark (B=3, T=512, D=1024):
+      naive (unfused):  8.6 ms → compiled: 1.4 ms (6.3x 加速)
+    """
+    TK, B, D = spike_a.shape
+    T = TK // 16
+    K = 16
+    dtype = spike_a.dtype
+    device = spike_a.device
+
+    sa = spike_a.permute(1, 0, 2).reshape(B, T, K, D)
+    sb = spike_b.permute(1, 0, 2).reshape(B, T, K, D)
+
+    # 共享权重常量（torch.compile 捕获为 constant）
+    exp_w = torch.tensor([16., 8., 4., 2., 1.], device=device, dtype=dtype)
+    mant_w = torch.tensor(
+        [0.5, 0.25, 0.125, 0.0625, 0.03125,
+         0.015625, 0.0078125, 0.00390625,
+         0.001953125, 0.0009765625],
+        device=device, dtype=dtype,
+    )
+
+    # Decode spike_a (inline fp16_decode)
+    sign_a = 1.0 - 2.0 * sa[:, :, 0, :]
+    exp_a = (sa[:, :, 1:6, :] * exp_w.view(1, 1, 5, 1)).sum(dim=2)
+    mant_a = (sa[:, :, 6:, :] * mant_w.view(1, 1, 10, 1)).sum(dim=2)
+    normal_a = sign_a * torch.exp2(exp_a - 15.0) * (1.0 + mant_a)
+    subnormal_a = sign_a * (2.0 ** -14) * mant_a
+    val_a = torch.where(exp_a > 0, normal_a, subnormal_a)
+
+    # Decode spike_b (inline fp16_decode)
+    sign_b = 1.0 - 2.0 * sb[:, :, 0, :]
+    exp_b = (sb[:, :, 1:6, :] * exp_w.view(1, 1, 5, 1)).sum(dim=2)
+    mant_b = (sb[:, :, 6:, :] * mant_w.view(1, 1, 10, 1)).sum(dim=2)
+    normal_b = sign_b * torch.exp2(exp_b - 15.0) * (1.0 + mant_b)
+    subnormal_b = sign_b * (2.0 ** -14) * mant_b
+    val_b = torch.where(exp_b > 0, normal_b, subnormal_b)
+
+    # Add + Encode (inline fp16_encode)
+    val_sum = val_a + val_b
+    sum_fp16 = val_sum.float().clamp(-65504.0, 65504.0).half()
+    sum_int = sum_fp16.view(torch.int16)
+    shifts = torch.arange(15, -1, -1, device=device)
+    bits = ((sum_int.unsqueeze(2) >> shifts.view(1, 1, K, 1)) & 1).to(dtype)
+    return bits.reshape(B, T * K, D).permute(1, 0, 2).contiguous()
+
+
+# torch.compile 融合: ~20 kernel → 2-3 fused kernel, 6.3x 加速
+_binary_residual_compiled = torch.compile(
+    _binary_residual_fwd, backend='inductor', fullgraph=True,
+)
+
+
+class _BinaryResidual(torch.autograd.Function):
+    """二进制加法 autograd wrapper（torch.compile 融合版）。
+
+    Forward: 精确的 IEEE 754 二进制加法，inductor 融合 decode+add+encode。
+    Backward: STE identity gradient — 两条路径都传完整梯度。
+    """
+
+    @staticmethod
+    def forward(ctx, spike_a, spike_b):
+        return _binary_residual_compiled(spike_a, spike_b)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, grad_output
+
+
+def binary_residual(spike_a: Tensor, spike_b: Tensor) -> Tensor:
+    """二进制残差加法（替代 SEW 的十进制 spike_a + spike_b）。
+
+    将两个二值 spike 序列在 IEEE 754 float16 语义下正确相加：
+    decode → continuous add → re-encode，inductor 融合为 2-3 个 kernel。
+    输出严格 {0,1}，6.3x 快于未融合版本。
+
+    K=16 hardcoded（IEEE 754 float16 = 16 bits）。
+
+    Args:
+        spike_a: (TK, B, D) 二值 spike 序列
+        spike_b: (TK, B, D) 二值 spike 序列
+
+    Returns:
+        (TK, B, D) 二值 spike 序列，decode 后等于 decode(a) + decode(b)
+    """
+    return _BinaryResidual.apply(spike_a, spike_b)
+
+
+class _BinaryEncodeSTE(torch.autograd.Function):
+    """连续值 → 二进制编码，STE backward 传梯度。
+
+    用于 MoE combine 后重编码：forward 精确 encode，backward 用 mean-over-K
+    近似将 (TK, B, D) 梯度聚合回 (B, T, D)。
+    不 save_for_backward（只用 shape），省显存。
+    """
+
+    @staticmethod
+    def forward(ctx, continuous_btd):
+        ctx.B, ctx.T, ctx.D = continuous_btd.shape
+        return fp16_encode(continuous_btd, 16)  # (TK, B, D) binary
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        B, T, D = ctx.B, ctx.T, ctx.D
+        # grad_output: (T*16, B, D) → (B, T, 16, D) → mean over K → (B, T, D)
+        grad_btd = grad_output.permute(1, 0, 2).reshape(B, T, 16, D).mean(dim=2)
+        return grad_btd
+
+
+def binary_encode_ste(continuous_btd: Tensor) -> Tensor:
+    """连续值 → 二进制编码（STE backward）。
+
+    MoE combine 后重编码用：forward 精确，backward 将 K=16 帧梯度
+    平均聚合回 per-token 梯度。
+
+    Args:
+        continuous_btd: (B, T, D) 连续值
+
+    Returns:
+        (T*16, B, D) 二值 spike 序列
+    """
+    return _BinaryEncodeSTE.apply(continuous_btd)

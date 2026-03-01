@@ -95,6 +95,7 @@ class SNNBlock(base.MemoryModule):
         v_th_min: float = 0.1,
         output_v_threshold: float = 0.3,
         surrogate_function=surrogate.Sigmoid(alpha=4.0),
+        num_layers: int = 1,
     ):
         super().__init__()
         self.D = D
@@ -137,10 +138,10 @@ class SNNBlock(base.MemoryModule):
         )
 
         # ====== 参数初始化 ======
-        self._initialize_parameters()
+        self._initialize_parameters(num_layers)
 
-    def _initialize_parameters(self):
-        """功能引导初始化（v7.8: 含 ω 初始化）。"""
+    def _initialize_parameters(self, num_layers: int):
+        """功能引导初始化（v7.8: 含 ω 初始化 + W_out 深度缩放）。"""
         D, N = self.D, self.N
         K_ref = 16
 
@@ -190,12 +191,14 @@ class SNNBlock(base.MemoryModule):
         self.b_th.data.copy_(b_th_per_n.repeat(D))
         self.b_th.data.add_(torch.empty_like(self.b_th).normal_(0, 0.02))
 
-        # ====== 7. W_out 发放率均衡缩放 ======
+        # ====== 7. W_out 发放率均衡缩放 + 深度缩放 ======
         out_scale_per_n = 1.0 / torch.sqrt(target_p_fire)
         out_scale_per_n = out_scale_per_n / out_scale_per_n.mean()
         out_scale_DN = out_scale_per_n.repeat(D)
         with torch.no_grad():
             self.W_out.weight.mul_(out_scale_DN.unsqueeze(0))
+            # GPT-2 风格深度缩放: 1/√(2L)，2 因为每层有 SNNBlock + SNNFFN 两个子层
+            self.W_out.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
     def forward_parallel(self, spike_in_seq: torch.Tensor) -> torch.Tensor:
         """
@@ -213,16 +216,22 @@ class SNNBlock(base.MemoryModule):
         # ====== Phase 1: 投影（独立 F.linear，FSDP 兼容）======
         flat = spike_in_seq.reshape(TK * batch, D)
 
+        # 处理路径用 detach 的 input:
+        # - 参数梯度正常 (W.grad = ∂L/∂output × flat^T, 值不变)
+        # - 层间梯度仅通过 binary_residual skip 路径传递 (精确 1.0×/层)
+        # - 处理路径反向不回传到 spike_in (PyTorch 跳过 requires_grad=False)
+        flat_proj = flat.detach()
+
         # 5× D→DN 独立投影
-        I_all = F.linear(flat, self.W_in.weight).reshape(TK, batch, DN)
-        raw_beta = F.linear(flat, self.W_beta_x.weight).reshape(TK, batch, DN)
-        raw_alpha = F.linear(flat, self.W_alpha_x.weight).reshape(TK, batch, DN)
-        raw_th = F.linear(flat, self.W_th_x.weight).reshape(TK, batch, DN)
-        raw_omega = F.linear(flat, self.W_omega_x.weight).reshape(TK, batch, DN)
+        I_all = F.linear(flat_proj, self.W_in.weight).reshape(TK, batch, DN)
+        raw_beta = F.linear(flat_proj, self.W_beta_x.weight).reshape(TK, batch, DN)
+        raw_alpha = F.linear(flat_proj, self.W_alpha_x.weight).reshape(TK, batch, DN)
+        raw_th = F.linear(flat_proj, self.W_th_x.weight).reshape(TK, batch, DN)
+        raw_omega = F.linear(flat_proj, self.W_omega_x.weight).reshape(TK, batch, DN)
 
         # 2× D→D 独立投影
-        gate_all = torch.sigmoid(F.linear(flat, self.W_gate.weight).reshape(TK, batch, D))
-        I_skip_all = F.linear(flat, self.W_skip.weight).reshape(TK, batch, D)
+        gate_all = torch.sigmoid(F.linear(flat_proj, self.W_gate.weight).reshape(TK, batch, D))
+        I_skip_all = F.linear(flat_proj, self.W_skip.weight).reshape(TK, batch, D)
 
         # ====== Phase 1b: 融合激活 + 稳定性约束（torch.compile → 单 kernel）======
         beta_all, u_hidden, v_th_all, omega_all = _fused_modulation_rf(

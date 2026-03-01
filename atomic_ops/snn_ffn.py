@@ -96,13 +96,14 @@ class SNNFFN(base.MemoryModule):
         """初始化投影权重。
 
         - gate_proj, up_proj, skip_proj: Kaiming uniform
-        - down_proj: Kaiming uniform × 1/√(num_layers)，防深层梯度爆炸
+        - down_proj: Kaiming uniform × 1/√(2*num_layers)，GPT-2 风格深度缩放
+          2 因为每层有 SNNBlock + SNNFFN 两个子层
         """
         for lin in [self.gate_proj, self.up_proj, self.skip_proj]:
             nn.init.kaiming_uniform_(lin.weight, a=math.sqrt(5))
 
         nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
-        self.down_proj.weight.data.mul_(1.0 / math.sqrt(num_layers))
+        self.down_proj.weight.data.mul_(1.0 / math.sqrt(2 * num_layers))
 
     def forward_parallel(self, spike_in_seq: torch.Tensor) -> torch.Tensor:
         """
@@ -123,10 +124,13 @@ class SNNFFN(base.MemoryModule):
         D_ff = self.D_ff
         flat = spike_in_seq.reshape(TK * batch, D)
 
+        # 处理路径用 detach 的 input (同 SNNBlock)
+        flat_proj = flat.detach()
+
         # ====== Phase 1: 投影（独立 F.linear，FSDP 兼容）======
-        I_gate = F.linear(flat, self.gate_proj.weight).reshape(TK, batch, D_ff)
-        I_up = F.linear(flat, self.up_proj.weight).reshape(TK, batch, D_ff)
-        I_skip = F.linear(flat, self.skip_proj.weight).reshape(TK, batch, D)
+        I_gate = F.linear(flat_proj, self.gate_proj.weight).reshape(TK, batch, D_ff)
+        I_up = F.linear(flat_proj, self.up_proj.weight).reshape(TK, batch, D_ff)
+        I_skip = F.linear(flat_proj, self.skip_proj.weight).reshape(TK, batch, D)
         I_gate_up = torch.cat([I_gate, I_up], dim=-1)  # (TK, batch, 2*D_ff)
 
         # ====== Phase 2: Gate+Up 合并 PLIF scan（row-param kernel） ======

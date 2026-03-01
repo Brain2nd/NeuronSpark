@@ -65,6 +65,7 @@ class SNNDecoderLayer(base.MemoryModule):
         self.snn_block = SNNBlock(
             D=D, N=N, v_th_min=v_th_min,
             output_v_threshold=block_output_v_threshold,
+            num_layers=num_layers,
         )
 
         self.use_moe = use_moe

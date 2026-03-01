@@ -116,7 +116,7 @@ class MoESNNFFN(base.MemoryModule):
 
         投影权重:
         - gate/up/skip: Kaiming uniform per expert slice
-        - down: Kaiming uniform × 1/√(num_layers)
+        - down: Kaiming uniform × 1/√(2*num_layers)
 
         神经元参数:
         - w: normal_(init_w, 0.5)  where init_w = -log(tau-1), tau=2.0
@@ -135,9 +135,9 @@ class MoESNNFFN(base.MemoryModule):
             nn.init.kaiming_uniform_(self.expert_W_gus.data[e, D_ff:2 * D_ff, :], a=math.sqrt(5))
             # skip_proj: (D, D) — Kaiming uniform
             nn.init.kaiming_uniform_(self.expert_W_gus.data[e, 2 * D_ff:, :], a=math.sqrt(5))
-            # down_proj: (D, D_ff) — Kaiming uniform × 1/√(num_layers)
+            # down_proj: (D, D_ff) — Kaiming uniform × 1/√(2*num_layers)
             nn.init.kaiming_uniform_(self.expert_W_down.data[e], a=math.sqrt(5))
-            self.expert_W_down.data[e].mul_(1.0 / math.sqrt(num_layers))
+            self.expert_W_down.data[e].mul_(1.0 / math.sqrt(2 * num_layers))
 
         # ---- 神经元参数（匹配 PLIFNode.__init__）----
         init_w = -math.log(2.0 - 1.0)  # tau=2.0 → init_w=0
@@ -182,9 +182,12 @@ class MoESNNFFN(base.MemoryModule):
         TB = T * B
         flat = spike_in_seq.reshape(TK * B, D)
 
+        # 处理路径用 detach 的 input (同 SNNBlock/SNNFFN)
+        flat_proj = flat.detach()
+
         # ====== Phase 1: 批量 GEMM — gate+up+skip 投影（无 stack/cat） ======
         proj = torch.bmm(
-            flat.unsqueeze(0).expand(E, -1, -1),
+            flat_proj.unsqueeze(0).expand(E, -1, -1),
             self.expert_W_gus.transpose(1, 2),
         )
         I_gate_up = proj[:, :, :2 * D_ff].reshape(E, TK, B, 2 * D_ff)
@@ -422,8 +425,8 @@ class MoESNNFFN(base.MemoryModule):
         D_ff = self.D_ff
         flat = spike_in_seq.reshape(TK * B, D)
 
-        # gate+up+skip 投影
-        proj = F.linear(flat, self.expert_W_gus[e_idx])  # (TK*B, 2*D_ff+D)
+        # gate+up+skip 投影 (detach input)
+        proj = F.linear(flat.detach(), self.expert_W_gus[e_idx])  # (TK*B, 2*D_ff+D)
         I_gate_up = proj[:, :2 * D_ff].reshape(TK, B, 2 * D_ff)
         I_skip = proj[:, 2 * D_ff:].reshape(TK, B, D)
 

@@ -26,6 +26,12 @@ from atomic_ops.fp16_codec import fp16_encode, fp16_decode
 from atomic_ops.lateral_inhibition import LateralInhibition
 
 
+def _reset_snn(mod):
+    """Reset neuron states, unwrapping FSDP to avoid SpikingJelly warnings."""
+    inner = getattr(mod, '_fsdp_wrapped_module', mod)
+    functional.reset_net(inner)
+
+
 @dataclass
 class SNNModelOutput:
     """模型输出容器，对齐教程 CausalLMOutputWithPast 接口。"""
@@ -128,7 +134,7 @@ class SNNLanguageModel(nn.Module):
         spike = spike_seq
 
         def _layer_forward(layer_mod, x):
-            functional.reset_net(layer_mod)
+            _reset_snn(layer_mod)
             return layer_mod(x)  # 走 __call__ → forward()，触发 FSDP allgather
 
         for layer_module in self.layers:
@@ -181,7 +187,7 @@ class SNNLanguageModel(nn.Module):
 
         # 重置所有神经元（新序列的初始条件 V=0）
         for layer_module in self.layers:
-            functional.reset_net(layer_module)
+            _reset_snn(layer_module)
 
         # ====== Prefill: parallel 处理整个 prompt ======
         spike_seq = self.encode(prompt_ids)  # (prompt_len*K, batch, D)
@@ -255,7 +261,7 @@ class SNNLanguageModel(nn.Module):
 
         # 重置所有神经元状态
         for layer_module in self.layers:
-            functional.reset_net(layer_module)
+            _reset_snn(layer_module)
 
         # 三段式
         spike_seq = self.encode(token_ids)        # 输入边界

@@ -129,7 +129,7 @@ class SNNLanguageModel(nn.Module):
 
         def _layer_forward(layer_mod, x):
             functional.reset_net(layer_mod)
-            return layer_mod.forward_parallel(x)
+            return layer_mod(x)  # 走 __call__ → forward()，触发 FSDP allgather
 
         for layer_module in self.layers:
             spike = checkpoint(
@@ -187,7 +187,7 @@ class SNNLanguageModel(nn.Module):
         spike_seq = self.encode(prompt_ids)  # (prompt_len*K, batch, D)
         spike = spike_seq
         for layer_module in self.layers:
-            spike = layer_module.forward_parallel(spike)
+            spike = layer_module(spike)
 
         # Output path: spike → fp16_decode → proj → norm → logits
         decoded = fp16_decode(spike, prompt_len, K=self.K)
@@ -208,10 +208,10 @@ class SNNLanguageModel(nn.Module):
             emb = self.embed_tokens(next_token)       # (batch, 1, D)
             spike_frames = fp16_encode(emb, K=self.K)  # (K, batch, D)
 
-            # K 帧通过 SNN（forward_parallel 复用 Triton parallel scan）
+            # K 帧通过 SNN（走 forward() 触发 FSDP allgather）
             spike = spike_frames
             for layer_module in self.layers:
-                spike = layer_module.forward_parallel(spike)
+                spike = layer_module(spike)
 
             # Output path: spike → fp16_decode → proj → logits
             decoded = fp16_decode(spike, 1, K=self.K)  # (batch, 1, D)

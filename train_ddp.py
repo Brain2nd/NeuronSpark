@@ -563,9 +563,10 @@ if __name__ == "__main__":
     # TensorBoard（仅主进程）
     writer = SummaryWriter(log_dir=os.path.join(args.tb_dir, args.out_dir)) if is_main_process(rank) else None
 
-    # 混合精度：由 FSDP MixedPrecision 处理，不再需要 autocast
+    # 混合精度：FSDP MixedPrecision 处理参数/通信 dtype，
+    # autocast 处理计算 dtype（因为模型内部调用 forward_parallel 绕过 FSDP forward hook）
     mp_dtype = torch.bfloat16 if args.dtype == 'bfloat16' else torch.float16
-    ctx = nullcontext()
+    ctx = torch.amp.autocast('cuda', dtype=mp_dtype)
 
     # ==================== 模型初始化 ====================
     model, tokenizer, device = init_model(args, local_rank, rank)

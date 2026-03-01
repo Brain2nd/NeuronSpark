@@ -87,9 +87,26 @@ class SNNDecoderLayer(base.MemoryModule):
                 layer_idx=layer_idx,
             )
 
+    def forward(self, spike_in):
+        """
+        前向传播（FSDP 入口）：代理到 forward_parallel。
+
+        FSDP 只拦截 __call__ → forward() 路径来 allgather 参数。
+        必须通过此方法而非直接调 forward_parallel()。
+
+        Args:
+            spike_in: (TK, batch, D) — binary spike {0, 1}
+
+        Returns:
+            spike_out: (TK, batch, D) — binary spike {0, 1}
+        """
+        return self.forward_parallel(spike_in)
+
     def forward_parallel(self, spike_in):
         """
         并行前向传播：纯 spike-to-spike。
+
+        注意：多卡 FSDP 时必须通过 forward() 调用，不要直接调此方法。
 
         Args:
             spike_in: (TK, batch, D) — binary spike {0, 1}

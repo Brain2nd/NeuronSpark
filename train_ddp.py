@@ -416,8 +416,16 @@ def train_epoch(epoch, model, train_loader, sampler, optimizer, scaler, ctx, arg
             # 每 5000 步重校准 layer-wise LR (EMA α=0.3)
             global_step = step + 1; _recalib = (global_step == args.accumulation_steps) or (global_step % 5000 == 0)
             if _recalib:
-                _rms = [l.snn_block.W_in.weight.grad.float().pow(2).mean().sqrt().item()
-                        for l in model.layers]
+                # FSDP FULL_SHARD: 每 rank 只持有部分梯度分片，其余 .grad=None
+                _rms = []
+                for l in model.layers:
+                    g = l.snn_block.W_in.weight.grad
+                    _rms.append(g.float().pow(2).mean().sqrt().item() if g is not None else 0.0)
+                # 跨 rank 取 MAX 统一（各 rank 持有不同分片）
+                if world_size > 1:
+                    _rms_t = torch.tensor(_rms, device=f'cuda:{local_rank}')
+                    dist.all_reduce(_rms_t, op=dist.ReduceOp.MAX)
+                    _rms = _rms_t.tolist()
                 _new = [_rms[0] / max(r, 1e-10) for r in _rms]
                 _prev = getattr(optimizer, '_layer_scales', None)
                 if _prev is not None:

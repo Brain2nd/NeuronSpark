@@ -1,0 +1,5 @@
+torch>=2.1.0
+transformers>=4.40.0
+tensorboard>=2.14.0
+spikingjelly>=0.0.0.0.14
+triton>=3.0.0

@@ -1,8 +1,7 @@
-"""ops.triton.sd_scan: the TMA chunk-scan forward (``chunk_scan_fwd_tma``, prefill) and the intra-chunk dCB / ddA backward
-(``dda_tma`` + ``dda_asm``)
-
-each against its float64 reference at B 1 x L 512 and a partial-chunk length (the forward at the prefill shapes is
-checked against this kernel in ``tests/ops/test_sd_prefill.py`` and ``tests/ops/gluon/test_sd_chunk_scan_fwd.py``).
+"""ops.triton.sd_scan: the TMA chunk-scan forward (``chunk_scan_fwd_tma``, prefill) against its float64 reference at
+B 1 x L 512 and a partial-chunk length (the forward at the prefill shapes is checked against this kernel in
+``tests/ops/test_sd_prefill.py`` and ``tests/ops/gluon/test_sd_chunk_scan_fwd.py``; the backward's dda pieces in
+``tests/ops/gluon/test_sd_dda.py``).
 
 Every comparison is the per-operator rule of ``neuronspark.utils.testing``.
 """
@@ -15,9 +14,6 @@ from neuronspark.ops.triton.mamba import BMM_CHUNK_FWD, CHUNK_CUMSUM_FWD_TRAIN, 
 from neuronspark.ops.triton.sd_scan import (
     chunk_scan_fwd_tma,
     chunk_scan_fwd_tma_ref,
-    dda_asm,
-    dda_ref,
-    dda_tma,
 )
 from neuronspark.ops.gluon.sd_chunk_states import chunk_states_train
 from neuronspark.utils.testing import assert_all_match, rand_tensor
@@ -57,11 +53,3 @@ def test_fwd_vs_reference(device, B, L):
     args = (o["CB"], o["x"], o["dt"], o["dA"], o["C"], o["states"], o["D"])
     with torch.no_grad():
         assert_all_match({"out": chunk_scan_fwd_tma(*args)}, {"out": chunk_scan_fwd_tma_ref(*args)}, prefix="fwd_ref")
-
-
-@pytest.mark.parametrize("B,L", REF_SHAPES, ids=[f"B{b}_L{l}" for b, l in REF_SHAPES])
-def test_dda_vs_reference(device, B, L):
-    o = operands(B, L, device)
-    dcbp, v = dda_tma(o["x"], o["dt"], o["dA"], o["dout"], o["CB"])
-    rdcb, rdda = dda_ref(o["x"], o["dt"], o["dA"], o["dout"], o["CB"])
-    assert_all_match({"dCB": dcbp.sum(2), "ddA_intra": dda_asm(v)}, {"dCB": rdcb, "ddA_intra": rdda}, prefix="dda_ref")

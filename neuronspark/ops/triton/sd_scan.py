@@ -1,7 +1,8 @@
 """SD chunk scan kernels: the chunk-scan forward with TMA loads (inference prefill calls that end in a partial chunk;
-the arithmetic reference of the Gluon forward), two pieces of the training backward (the intra-chunk dCB and ddA, the
-ddA assembly) and the float64 references of the chunk scan's forward and input backward (the training kernels of both
-are Gluon: :mod:`neuronspark.ops.gluon.sd_chunk_scan_fwd` / :mod:`neuronspark.ops.gluon.sd_chunk_scan_dx`).
+the arithmetic reference of the Gluon forward), the ddA assembly of the training backward (its intra-chunk pieces are
+the Gluon :mod:`neuronspark.ops.gluon.sd_dda`) and the float64 references of the chunk scan's forward and input
+backward (the training kernels of both are Gluon: :mod:`neuronspark.ops.gluon.sd_chunk_scan_fwd` /
+:mod:`neuronspark.ops.gluon.sd_chunk_scan_dx`).
 
 Internal pieces (not registry ops), all for the SD call of the SSD scan (ngroups 1, D of shape (nheads,), no z, no
 seq_idx, dstate <= 128, headdim a power of two):
@@ -10,20 +11,14 @@ seq_idx, dstate <= 128, headdim a power of two):
   ``_chunk_scan_fwd`` with descriptor (TMA) loads of C[m] (1, BM, N), states_h (P, N), CB[m, k] (BM, BK) and x_h[k]
   (1, BK, P); one K loop with the stock causal mask.  out[m] = exp(dA_m) C_m states^T + sum_{k <= m}
   bf16(CB[m, k] exp(min(dA_m - dA_k, 0)) dt_k) x_k + D x_m, rounded once to x's dtype.
-* ``dda_tma(x, dt, dA_cumsum, dout, cb) -> (dCB partials, V)``: per (lower tile I >= J, b c, head split) the
-  intra-chunk products g_h = (dout_h[I] x_h[J]^T) dt_J exp(min(dA_I - dA_J, 0)); dCB partials = sum over the split's
-  heads (masked to rows >= cols), V = the per-head row / column sums of g_h * CB (rows > cols) for the assembly; the
-  next head's dt / dA rows are loaded one iteration ahead.
 * ``dda_asm(v) -> ddA_intra`` (b, h, c, chunk) fp32: ddA[k] = sum_{m >= k} sum_{n < k} T[m, n] from the V grid
   (mamba_ssm ``_chunk_scan_bwd_ddAcs_stable``'s quantity, summation order changed).
 
 Numerics vs the stock mamba_ssm kernels: the same per-element expressions, dot shapes and K order (the stock bf16
 rounding points kept); the reduction orders of the ddA partial sums are fp32-rounding class.  Checked with the per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the references below.
-``dda_tma`` builds its lower-tile table on the first call (a documented first-call cache keyed by (NB, device)); that
-call must not be inside a CUDA-graph capture (it raises).
 
-Launch constants: forward (BM 64, BK 32, 4 warps, 3 stages; the prefill configuration); dda (BS 32, NB 8, 2 warps, 3 stages, 24 heads per program, lower tiles only,
-next-head prefetch, no FTZ); dda assembly 1 warp.  TMA descriptors: sm_90+.
+Launch constants: forward (BM 64, BK 32, 4 warps, 3 stages; the prefill configuration); the ddA assembly 1 warp over the
+(BS 32, NB 8) V grid.  TMA descriptors: sm_90+.
 
 The forward kernel is mamba_ssm 2.3.2.post1's ``ssd_chunk_scan.py`` ``_chunk_scan_fwd_kernel`` (Apache-2.0, see
 NOTICE) with the descriptor loads and masks stated in its docstring; the epilogue is the stock code.
@@ -31,7 +26,6 @@ NOTICE) with the descriptor loads and masks stated in its docstring; the epilogu
 from __future__ import annotations
 
 import math
-from typing import Dict, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -44,81 +38,19 @@ from neuronspark.ops.triton._ptx import _ex2ftz
 from neuronspark.ops.triton.sd_states import _chunked, _desc3, _ex2ftz_ref, _exp_f32
 
 __all__ = [
-    "FWD_CFG", "DDA_CFG", "DDA_ASM_WARPS",
-    "chunk_scan_fwd_tma", "dda_tma", "dda_asm",
+    "FWD_CFG", "DDA_BS", "DDA_NB", "DDA_ASM_WARPS",
+    "chunk_scan_fwd_tma", "dda_asm",
     "chunk_scan_fwd_tma_ref", "chunk_scan_dx_ref", "dda_ref", "ssd_forward_ref", "softplus_ref", "chunk_cumsum_fwd_ref",
 ]
 
 # ------------------------------------------------------------------------------------------------ launch constants
 FWD_CFG = (64, 32, 4, 3)            # BM, BK, num_warps, num_stages
-DDA_CFG = (32, 8, 2, 3, 24)         # BS, NB (chunk = BS NB), num_warps, num_stages, heads per program
+DDA_BS, DDA_NB = 32, 8              # the V grid of the assembly: sub-tile edge, sub-tiles per chunk side (chunk = BS NB)
 DDA_ASM_WARPS = 1
 
-# (NB, device index) -> int32 table of the lower tiles I * NB + J (J <= I): a documented first-call cache
-_TIJ: Dict[Tuple[int, int], torch.Tensor] = {}
 
 
 # ------------------------------------------------------------------------------------------------ kernels
-@triton.jit
-def _dda_kernel(XD, DD, DT, DA, CB, V, DCBP, nchunks, nheads, hpp,
-                stb, sth, stc, sab, sah, sac, scb, scc, scm,
-                svb, svh, svc, sqb, sqc, sqs, sqm, TIJ,
-                P: tl.constexpr, BS: tl.constexpr, NB: tl.constexpr):
-    """program = (lower tile t of TIJ (t -> I * NB + J), b * nchunks + c, head split).  A program with I > J also
-    stores the zero tile (J, I) of its split (the upper tiles get no program).  dout_h[I] / x_h[J] are (1, BS, P) TMA
-    boxes (rows t >= seqlen read as zeros); the next head's dt row and dA rows / cols are loaded one iteration ahead
-    (the last head re-reads its own)."""
-    t = tl.program_id(0)
-    bc = tl.program_id(1)
-    sp = tl.program_id(2)
-    b = bc // nchunks
-    c = bc - b * nchunks
-    t = tl.load(TIJ + t)
-    I = t // NB
-    J = t - I * NB
-    r = tl.arange(0, BS)
-    rows = I * BS + r
-    cols = J * BS + r
-    qb = DCBP + b * sqb + c * sqc + sp * sqs + rows[:, None] * sqm + cols[None, :]
-    if I > J:
-        tl.store(DCBP + b * sqb + c * sqc + sp * sqs + cols[:, None] * sqm + rows[None, :],
-                 tl.zeros((BS, BS), dtype=tl.float32))
-    if J > I:
-        tl.store(qb, tl.zeros((BS, BS), dtype=tl.float32))
-    else:
-        h0 = sp * hpp
-        h1 = tl.minimum(h0 + hpp, nheads)
-        cb = tl.load(CB + b * scb + c * scc + rows[:, None] * scm + cols[None, :])
-        cb = tl.where(rows[:, None] > cols[None, :], cb, 0.0)
-        vb = V + b * svb + c * svc + (I * NB + J) * (2 * BS)
-        dacc = tl.zeros((BS, BS), dtype=tl.float32)
-        tr = c * (BS * NB) + I * BS
-        tcl = c * (BS * NB) + J * BS
-        dt_c = tl.load(DT + b * stb + h0 * sth + c * stc + cols)
-        ab0 = DA + b * sab + h0 * sah + c * sac
-        da_r = tl.load(ab0 + rows)
-        da_c = tl.load(ab0 + cols)
-        for h in range(h0, h1):
-            dI = DD.load([b, tr, h * P]).reshape(BS, P)
-            xJ = XD.load([b, tcl, h * P]).reshape(BS, P)
-            hn = tl.minimum(h + 1, h1 - 1)
-            dt_n = tl.load(DT + b * stb + hn * sth + c * stc + cols)
-            abn = DA + b * sab + hn * sah + c * sac
-            da_rn = tl.load(abn + rows)
-            da_cn = tl.load(abn + cols)
-            g = tl.dot(dI, tl.trans(xJ))
-            g *= dt_c[None, :]
-            g *= tl.exp(tl.minimum(da_r[:, None] - da_c[None, :], 0.0))
-            dacc += g
-            tt = g * cb
-            tl.store(vb + h * svh + r, tl.sum(tt, axis=1))
-            tl.store(vb + h * svh + BS + r, tl.sum(tt, axis=0))
-            dt_c = dt_n
-            da_r = da_rn
-            da_c = da_cn
-        tl.store(qb, tl.where(rows[:, None] >= cols[None, :], dacc, 0.0))
-
-
 @triton.jit
 def _dda_asm_kernel(V, OUT, svb, svh, svc, sob, soh, soc, BS: tl.constexpr, NB: tl.constexpr):
     """Per (head, chunk, batch), V layout tile = I * NB + J: every load issued first (the (NB, NB, BS) row-sum and
@@ -198,47 +130,9 @@ def _fwd_kernel(CBD, XD, X, OUT, DT, DA, CD, SD, D,
 
 
 # ------------------------------------------------------------------------------------------------ launchers
-def dda_tma(x, dt, dA_cumsum, dout, cb):
-    """(dCB head-split partials (batch, nchunks, nsplit, 1, chunk, chunk) fp32, V (batch, nheads, nchunks,
-    NB * NB * 2 BS) fp32 row / column sums for ``dda_asm``).  x / dout (b, l, h, P) bf16 with a contiguous (h, P)
-    part; dt / dA_cumsum (b, h, nc, chunk) fp32 with unit last stride; cb (b, nc, 1, chunk, chunk) fp32."""
-    require_cuda(x, "dda_tma")
-    batch, seqlen, nheads, headdim = x.shape
-    _, _, nchunks, chunk = dt.shape
-    BS, NB, nw, st, hcfg = DDA_CFG
-    if BS * NB != chunk or dout.shape != x.shape or tuple(cb.shape) != (batch, nchunks, 1, chunk, chunk):
-        raise RuntimeError(f"neuronspark.dda_tma: shapes x {tuple(x.shape)} dout {tuple(dout.shape)} cb {tuple(cb.shape)} "
-                           f"chunk {chunk} BS {BS} NB {NB}")
-    if cb.dtype != torch.float32 or dt.stride(-1) != 1 or dA_cumsum.stride(-1) != 1 or cb.stride(-1) != 1:
-        raise RuntimeError("neuronspark.dda_tma: fp32 CB and unit last strides of dt / dA_cumsum / CB expected")
-    hpp = min(max(hcfg, 1), nheads)
-    nsplit = math.ceil(nheads / hpp)
-    v = torch.empty((batch, nheads, nchunks, NB * NB * 2 * BS), dtype=torch.float32, device=x.device)
-    dcbp = torch.empty((batch, nchunks, nsplit, 1, chunk, chunk), dtype=torch.float32, device=x.device)
-    xd = _desc3(x, BS)
-    dd = _desc3(dout, BS)
-    key = (NB, x.device.index)
-    tij = _TIJ.get(key)
-    if tij is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("neuronspark.dda_tma: the lower-tile table is built on the first (eager) call; first call "
-                               "inside a CUDA-graph capture")
-        tij = torch.tensor([i * NB + j for i in range(NB) for j in range(i + 1)], dtype=torch.int32, device=x.device)
-        _TIJ[key] = tij
-    grid = (NB * (NB + 1) // 2, batch * nchunks, nsplit)
-    with torch.cuda.device(x.device.index):
-        _dda_kernel[grid](
-            xd, dd, dt, dA_cumsum, cb, v, dcbp, nchunks, nheads, hpp,
-            dt.stride(0), dt.stride(1), dt.stride(2), dA_cumsum.stride(0), dA_cumsum.stride(1), dA_cumsum.stride(2),
-            cb.stride(0), cb.stride(1), cb.stride(3), v.stride(0), v.stride(1), v.stride(2),
-            dcbp.stride(0), dcbp.stride(1), dcbp.stride(2), dcbp.stride(4), tij,
-            P=headdim, BS=BS, NB=NB, num_warps=nw, num_stages=st)
-    return dcbp, v
-
-
 def dda_asm(v):
-    """The intra-chunk ddA (batch, nheads, nchunks, chunk) fp32 from the V grid of ``dda_tma``."""
-    BS, NB = DDA_CFG[0], DDA_CFG[1]
+    """The intra-chunk ddA (batch, nheads, nchunks, chunk) fp32 from the V grid of ``gluon.sd_dda.dda_gluon``."""
+    BS, NB = DDA_BS, DDA_NB
     batch, nheads, nchunks, _ = v.shape
     out = torch.empty((batch, nheads, nchunks, BS * NB), dtype=torch.float32, device=v.device)
     with torch.cuda.device(v.device.index):
@@ -353,7 +247,7 @@ def chunk_scan_dx_ref(x, dt, dA_cumsum, B, CB, dout, dstates, D, dx):
 
 
 def dda_ref(x, dt, dA_cumsum, dout, cb):
-    """float64 reference of ``dda_tma`` + ``dda_asm`` (mamba_ssm ``_chunk_scan_bwd_dcb`` and
+    """float64 reference of ``gluon.sd_dda.dda_gluon`` + ``dda_asm`` (mamba_ssm ``_chunk_scan_bwd_dcb`` and
     ``_chunk_scan_bwd_ddAcs_stable`` math): g_h[m, n] = (dout_h[m] . x_h[n]) dt_n exp(min(dA_m - dA_n, 0));
     dCB[m, n] = sum_h g_h[m, n] for n <= m (0 above); ddA_intra[k] = sum_{m >= k} sum_{n < k} g_h[m, n] CB[m, n] (n < m).
     Returns (dCB (b, c, 1, chunk, chunk) fp32, ddA_intra (b, h, c, chunk) fp32)."""

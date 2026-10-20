@@ -15,7 +15,7 @@ The sequence (each step's order and operands are fixed):
   1. ``gluon.sd_dstates.dstates_train``: dstates (bf16), the state-passing ddA workspace, the passed states (bf16);
   2. ``gluon.sd_chunk_scan_dx.chunk_scan_dx_gluon``: dx, ddt (fp32 per position), dD;
   3. ``sd_states.db_tma`` / ``dc_tma``: dB / dC head-split partials and the ddA_next / ddA_prev workspaces;
-  4. ``sd_scan.dda_tma``: dCB head-split partials and the V grid of the intra-chunk ddA;
+  4. ``gluon.sd_dda.dda_gluon``: dCB head-split partials and the V grid of the intra-chunk ddA;
   5. ``splits_sum``: dB, dC, dCB = sums over the head-split axis (one launch);
   6. vendored ``_bmm_chunk_bwd`` twice: dB += C dCB, dC += B dCB^T (dot operands bf16: the fp32 dCB is rounded to bf16
      for the dot, fp32 accumulation + residual, bf16 store into the given buffers);
@@ -51,7 +51,8 @@ from neuronspark.ops.triton.mamba import (
     _chunk_cumsum_bwd_kernel,
 )
 from neuronspark.ops.gluon.sd_chunk_scan_dx import chunk_scan_dx_gluon
-from neuronspark.ops.triton.sd_scan import chunk_scan_dx_ref, dda_asm, dda_ref, dda_tma, softplus_ref
+from neuronspark.ops.gluon.sd_dda import dda_gluon
+from neuronspark.ops.triton.sd_scan import chunk_scan_dx_ref, dda_asm, dda_ref, softplus_ref
 from neuronspark.ops.gluon.sd_dstates import dstates_train, dstates_train_ref
 from neuronspark.ops.triton.sd_states import _chunked, db_tma, db_tma_ref, dc_tma, dc_tma_ref
 
@@ -241,7 +242,7 @@ def bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB
     dx, ddt, dD = chunk_scan_dx_gluon(x, dt, dA_cumsum, B, CB, dout, dstates, D, dx)
     dB_p, ws_db, nt_db = db_tma(x, dt, dA_cumsum, dstates, B, ngroups)
     dC_p, ws_dc, nt_dc = dc_tma(states.to(x.dtype), dA_cumsum, dout, C, ngroups)
-    dcb_p, ddA_v = dda_tma(x, dt, dA_cumsum, dout, CB)
+    dcb_p, ddA_v = dda_gluon(x, dt, dA_cumsum, dout, CB)
     dB, dC, dCB = splits_sum((dB_p, 2), (dC_p, 2), (dcb_p, 2))
     dCB = dCB.to(CB.dtype)
     _bmm_chunk_bwd(C, dCB, residual=dB, out=dB_given, config=BMM_CHUNK_BWD_TRAIN)

@@ -1,8 +1,10 @@
 """NeuronSpark: a spiking language model (1.27 B parameters) and its operators.
 
-24 layers in a 3:1 ratio: 18 spiking layers (a membrane-potential selective state space with a bipolar
-soma read-out) and 6 memory layers (pool attention with a lexical read-out, a spiking FFN of PLIF neurons and a
-product-key memory), plus model-level lexical n-gram memory and induction match matrices.
+Dendritic neuron layers and hippocampal layers in a fixed 3:1 pattern.  A dendritic neuron layer is a population of
+somata with dendritic compartments (membrane potentials with an input-dependent leak, released through a bipolar soft
+threshold); a hippocampal layer adds an episodic slot memory written by PLIF write-gate neurons, a copy pathway, a
+spiking FFN of PLIF neurons and a product-key associative memory.  The model level holds a lexical n-gram memory and
+induction match matrices.
 
 Importing the package has no side effects: it sets no process-wide state, reads no environment variable and registers
 nothing with other libraries.  The model classes are imported on first access.

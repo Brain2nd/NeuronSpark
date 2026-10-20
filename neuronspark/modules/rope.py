@@ -1,10 +1,10 @@
-"""Rotary position tables of the memory layers and the interleaved RoPE reference.
+"""Rotary position tables of the hippocampal layers and the interleaved RoPE reference.
 
 Every memory head rotates its ``dk / 2`` pairs ``(x[2j], x[2j + 1])`` with the per-head frequency ladder
 ``theta_j = base^(-2j / dk)``, ``j = 0 .. dk/2 - 1`` (dk = 256): head ``h`` reads the table columns
 ``[h * dk/2, (h + 1) * dk/2)``, and all heads share the same ladder.  The tables are fp32 ``(max_seq_len, D_key / 2)``
 = (8192, 768), computed on the CPU (device-independent values) and then moved to the requested device.  They
-are non-persistent buffers of the memory layer (not in the checkpoint).
+are non-persistent buffers of the hippocampal layer (not in the checkpoint).
 
 ``apply_rope_interleaved_ref(x, cos, sin)``: ``y[2p] = x[2p] * c - x[2p+1] * s`` and ``y[2p+1] = x[2p+1] * c +
 x[2p] * s`` evaluated in ``x``'s dtype (each product and each sum rounded to that dtype); the caller passes ``cos`` /

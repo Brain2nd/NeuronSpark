@@ -18,7 +18,7 @@ except for the third-party material listed below, which keeps its own license.
      neuronspark/ops/triton/mamba/softplus.py           <- mamba_ssm/ops/triton/softplus.py
 
    Adapted code (structure derived from mamba_ssm; marked "adapted from mamba_ssm (Apache-2.0)" in the file header):
-     neuronspark/ops/spiking_prefill.py        composition of the chunked scan forward (mamba_ssm/ops/triton/ssd_combined.py,
+     neuronspark/ops/dendritic_prefill.py        composition of the chunked scan forward (mamba_ssm/ops/triton/ssd_combined.py,
                                           _mamba_chunk_scan_combined_fwd)
      neuronspark/utils/generation.py      decoding loop, sampling, CUDA-graph decode cache (mamba_ssm/utils/generation.py)
 
@@ -30,9 +30,9 @@ except for the third-party material listed below, which keeps its own license.
 
    Kernel bodies transcribed from fla-core's normalization kernels (rms_norm / layer_norm_fwd), with the reduction
    layout and rounding points kept:
-     neuronspark/ops/triton/spiking_prenorm.py       spiking-layer pre-norm forward / backward
-     neuronspark/ops/triton/spiking_gated_norm.py    gated RMSNorm of the spiking-layer prefill path
-     neuronspark/ops/triton/spiking_step.py          pre-norm rows kernel of the prefill / decode path and the gated-norm
+     neuronspark/ops/triton/dendritic_prenorm.py       dendritic-layer pre-norm forward / backward
+     neuronspark/ops/triton/dendritic_gated_norm.py    gated RMSNorm of the dendritic-layer prefill path
+     neuronspark/ops/triton/dendritic_step.py          pre-norm rows kernel of the prefill / decode path and the gated-norm
                                                 lines of the decode step kernels
 
    MIT License text:
@@ -55,7 +55,7 @@ except for the third-party material listed below, which keeps its own license.
 
    Kernels that reproduce the arithmetic order of ATen CUDA kernels (reduction trees, scans, top-k selection,
    softmax / cross-entropy sequences) follow the structure of those kernels:
-     neuronspark/ops/triton/mem_norms.py     row reductions of the RMS norms (at::native reduce kernel order)
+     neuronspark/ops/triton/hippo_norms.py     row reductions of the RMS norms (at::native reduce kernel order)
      neuronspark/ops/triton/cumsum.py        outer-dimension inclusive scan
      neuronspark/ops/triton/pkm_topk.py      top-k selection (radix select + bitonic sort semantics)
      neuronspark/ops/triton/lm_tail.py       softmax / cross-entropy and reduction sequences

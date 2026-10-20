@@ -1,15 +1,16 @@
-"""Copy arbitration of the memory layer: the novelty predictor, the confidence-gated read gain and the PKM copy gate.
+"""Copy arbitration of the hippocampal layer: the novelty predictor, the confidence-gated read gain and the PKM copy
+gate.
 
 The copy detector's statistics are model-level (:mod:`neuronspark.modules.copy_detector`: the maximum and the
 logsumexp of the 32-scaled cosines of the order-1 lexical rows over the strict past s <= t - 2, one computation per
-call shared by the six memory layers).  Each layer turns them into its confidence with its own calibrated sink
+call shared by the six hippocampal layers).  Each layer turns them into its confidence with its own calibrated sink
 ``pkm_copy_tau`` (a PKM buffer):
 
     pi  = exp(32 max - logaddexp(32 tau, lse))                                 (T, B) fp32, no gradient
 
 and uses it at two sites:
 
-* read gain (``memory_read_copy_gain`` kappa = 4.0) with the novelty predictor c of this layer:
+* read gain (``hippocampal_read_copy_gain`` kappa = 4.0) with the novelty predictor c of this layer:
       c   = sigmoid( z . w + b + rms(r) . v )                                  (T, B) fp32, with gradient
       f   = (kappa pi) c                                                       fp32
       h'  = h + bf16(f32(r) (1 + f))                                           r = the centred attention residual
@@ -21,7 +22,7 @@ and uses it at two sites:
       rho = 2 sigmoid(-strength pi)                                            (T, B) fp32, no gradient
 
 Parameters (state-dict keys, registered flat on the layer): ``copy_novelty_w`` (D,) = 0, ``copy_novelty_b`` (1,) =
-``memory_copy_novelty_gate_init`` (4.0), ``copy_novelty_v`` (D,) = 0.
+``hippocampal_copy_novelty_gate_init`` (4.0), ``copy_novelty_v`` (D,) = 0.
 
 The supervised copy switch (the model-level auxiliary loss) scores the predictor's logit on the detached inputs; the
 whole-row forward hands it ``(z.detach(), r.detach(), pi)`` per layer (``aux_out``), and
@@ -44,16 +45,16 @@ NOVELTY_RMS_EPS = 1e-6
 
 
 class CopyGateMixin:
-    """Mixin of :class:`neuronspark.modules.memory_layer.MemoryLayer`; reads ``pkm_copy_tau`` /
+    """Mixin of :class:`neuronspark.modules.hippocampal_layer.HippocampalLayer`; reads ``pkm_copy_tau`` /
     ``pkm_copy_strength`` registered by :class:`neuronspark.modules.pkm.PKMMixin`."""
 
     def _build_copy_gate(self, config, device, dtype, init: str) -> None:
         D = int(config.D)
         f32 = torch.float32 if dtype is None else dtype
-        self.read_copy_gain = float(config.memory_read_copy_gain)
+        self.read_copy_gain = float(config.hippocampal_read_copy_gain)
         if init == "launch":
             w = torch.zeros(D, device=device, dtype=f32)
-            b = torch.full((1,), float(config.memory_copy_novelty_gate_init), device=device, dtype=f32)
+            b = torch.full((1,), float(config.hippocampal_copy_novelty_gate_init), device=device, dtype=f32)
             v = torch.zeros(D, device=device, dtype=f32)
         else:
             w = torch.empty(D, device=device, dtype=f32)
@@ -68,7 +69,7 @@ class CopyGateMixin:
         """(T, B) fp32 pi of this layer from the model-level statistics ``(maximum, lse)`` (each (T, B) fp32) and the
         layer's sink ``pkm_copy_tau``; no gradient."""
         if not (isinstance(copy_stats, (tuple, list)) and len(copy_stats) == 2):
-            raise RuntimeError("memory layer: the copy-detector statistics must be the pair (maximum, lse)")
+            raise RuntimeError("hippocampal layer: the copy-detector statistics must be the pair (maximum, lse)")
         stats = copy_stats if isinstance(copy_stats, CopyStats) else CopyStats(*copy_stats)
         with torch.no_grad(), torch.autocast(stats.maximum.device.type, enabled=False):
             return copy_pi(stats, self.pkm_copy_tau)

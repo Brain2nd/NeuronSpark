@@ -1,10 +1,11 @@
 """Value-residual mix and GLU tail of a prefill call in one kernel.
 
-The value residual of a memory layer mixes its values with the per-head gate of the centred normed input, and the GLU
+The value residual of a hippocampal layer mixes its values with the per-head gate of the centred normed input, and the
+GLU
 tail adds its addend to the last head's channels (:mod:`neuronspark.modules.pool_attention`)::
 
     lam[t, b, c] = lam0[c] + tanh(f32(gl[t, b, c // (D / H)]))
-    m            = bf16(f32(v) * (1 + lam))            memory layer 0 (carry None)
+    m            = bf16(f32(v) * (1 + lam))            hippocampal layer 0 (carry None)
                  = bf16(f32(v) + lam * f32(carry))     later layers (carry = layer 0's value stream)
     out          = m;  out[..., D - d:] = bf16(f32(m[..., D - d:]) + glu_add)          (d = glu_add.shape[-1])
 
@@ -119,7 +120,8 @@ def _vr_mix_prefill_fake(v, carry, gl, lam0, glu_add):
 def vr_mix_prefill(v: torch.Tensor, carry: Optional[torch.Tensor], gl: torch.Tensor, lam0: torch.Tensor,
                    glu_add: torch.Tensor) -> torch.Tensor:
     """(T, B, D) bf16 contiguous mixed value stream (see the module docstring): ``v`` (T, B, D) bf16 and ``carry``
-    (T, B, D) bf16 or None (memory layer 0) at any strides, ``gl`` (T, B, H) the bf16 gate projection, ``lam0`` (D,)
+    (T, B, D) bf16 or None (hippocampal layer 0) at any strides, ``gl`` (T, B, H) the bf16 gate projection, ``lam0``
+    (D,)
     fp32 contiguous the static mix, ``glu_add`` (T, B, d) fp32 the GLU addend of the last d channels.  No autograd."""
     return torch.ops.neuronspark.vr_mix_prefill(v, carry, gl, lam0, glu_add)
 
@@ -127,7 +129,8 @@ def vr_mix_prefill(v: torch.Tensor, carry: Optional[torch.Tensor], gl: torch.Ten
 # ================================================================================================ reference
 def vr_mix_prefill_ref(v: torch.Tensor, carry: Optional[torch.Tensor], gl: torch.Tensor, lam0: torch.Tensor,
                        glu_add: torch.Tensor) -> torch.Tensor:
-    """The memory layer's torch chain (same arguments and output as :func:`vr_mix_prefill`): the fp32 tanh of the gate
+    """The hippocampal layer's torch chain (same arguments and output as :func:`vr_mix_prefill`): the fp32 tanh of the
+    gate
     projection repeated over each head's channels plus the static mix, the value residual, the GLU tail."""
     H, D, d = int(gl.shape[-1]), int(v.shape[-1]), int(glu_add.shape[-1])
     lam = lam0.view(1, 1, -1) + torch.tanh(gl.to(torch.float32)).repeat_interleave(D // H, dim=-1)

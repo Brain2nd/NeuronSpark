@@ -22,7 +22,7 @@ pytestmark = pytest.mark.cuda
 
 CFG = NeuronSparkConfig()
 V = CFG.vocab_size
-ORDERS = tuple(CFG.memory_induction_bias_orders)
+ORDERS = tuple(CFG.hippocampal_induction_bias_orders)
 CHUNKS = (37, 1, 1, 128, 1, 64, 3)                      # 235 tokens: fits a 512-slot ring
 
 

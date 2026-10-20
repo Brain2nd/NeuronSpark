@@ -1,4 +1,4 @@
-"""The memory layer's qkv short convolution: depthwise, kernel 4, causal, no bias, on the (T, B, C) projection.
+"""The hippocampal layer's qkv short convolution: depthwise, kernel 4, causal, no bias, on the (T, B, C) projection.
 
 Operators (registry names):
 

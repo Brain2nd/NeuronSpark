@@ -1,4 +1,4 @@
-"""Product-key memory (PKM) read of the memory layer.
+"""Product-key memory (PKM) read of the hippocampal layer.
 
 From the FFN input x_hat = ffn_norm(h') (T, B, D) fp32 (H = 4 heads, n = 128 sub-keys per half, k = 16, dh = 64,
 dv = 768, one shared table of n^2 = 16384 slots):
@@ -77,17 +77,17 @@ def _half_query_scores(qh: torch.Tensor, kh: torch.Tensor) -> torch.Tensor:
 
 
 class PKMMixin:
-    """Mixin of :class:`neuronspark.modules.memory_layer.MemoryLayer` (the product-key memory read)."""
+    """Mixin of :class:`neuronspark.modules.hippocampal_layer.HippocampalLayer` (the product-key memory read)."""
 
     def _build_pkm(self, config, layer_idx: int, device, dtype, init: str) -> None:
         D = int(config.D)
-        H, n = int(config.memory_pkm_heads), int(config.memory_pkm_subkeys)
-        dq, dv = int(config.memory_pkm_query_dim), int(config.memory_pkm_value_dim)
+        H, n = int(config.hippocampal_pkm_heads), int(config.hippocampal_pkm_subkeys)
+        dq, dv = int(config.hippocampal_pkm_query_dim), int(config.hippocampal_pkm_value_dim)
         f32 = torch.float32 if dtype is None else dtype
-        self.pkm_heads, self.pkm_n, self.pkm_k = H, n, int(config.memory_pkm_topk)
+        self.pkm_heads, self.pkm_n, self.pkm_k = H, n, int(config.hippocampal_pkm_topk)
         self.pkm_half, self.pkm_dv = dq // 2, dv
-        self.pkm_launch_ratio = float(config.memory_pkm_launch_ratio)
-        self.pkm_kmeans_iters = int(config.memory_pkm_kmeans_iters)
+        self.pkm_launch_ratio = float(config.hippocampal_pkm_launch_ratio)
+        self.pkm_kmeans_iters = int(config.hippocampal_pkm_kmeans_iters)
         li = linear_init(init)
         if init == "launch":
             with forked_rng(device, PKM_SEED_BASE, layer_idx):
@@ -113,7 +113,7 @@ class PKMMixin:
             self.pkm_log_gain = nn.Parameter(torch.empty(2 * H, device=device, dtype=f32))
         scalar = dict(device=device, dtype=torch.float32)
         self.register_buffer("pkm_copy_strength",
-                             torch.tensor(float(config.memory_pkm_copy_gate_strength), **scalar))
+                             torch.tensor(float(config.hippocampal_pkm_copy_gate_strength), **scalar))
         self.register_buffer("pkm_copy_tau", torch.ones((), **scalar))
         self.register_buffer("pkm_calibrated", torch.zeros((), **scalar))
         self.register_buffer("pkm_launch_rms_res", torch.zeros((), **scalar))
@@ -136,8 +136,9 @@ class PKMMixin:
         if float(self.pkm_calibrated) > 0.5:
             self._pkm_ready = True
             return
-        raise RuntimeError("memory layer: the product-key memory was neither calibrated (neuronspark.utils.calibration)"
-                           " nor loaded from a calibrated checkpoint (pkm_calibrated = 0)")
+        raise RuntimeError("hippocampal layer: the product-key memory was neither calibrated "
+                           "(neuronspark.utils.calibration) nor loaded from a calibrated checkpoint (pkm_calibrated = "
+                           "0)")
 
     # ------------------------------------------------------------------------------------------------ shared pieces
     def _pkm_queries(self, q: torch.Tensor, T: int, B: int) -> torch.Tensor:

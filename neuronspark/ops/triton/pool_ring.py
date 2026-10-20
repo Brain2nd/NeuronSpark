@@ -1,7 +1,7 @@
-"""Inference ring kernels of the memory layers' pool read.
+"""Inference ring kernels of the hippocampal layers' pool read.
 
 Inside an inference cache every memory head keeps a ring of the last ``W`` synaptic events (``utils/cache.py``
-``MemoryState``): ``pool_k`` (B, H, W, dk) bf16 unit key tags, ``pool_gv`` (B, H, W, dv) bf16 tagged values
+``HippocampalState``): ``pool_k`` (B, H, W, dk) bf16 unit key tags, ``pool_gv`` (B, H, W, dv) bf16 tagged values
 ``bf16(sigmoid(g + wbias - sparsity)) * v`` and ``pool_cum`` (B, H, W) fp32 absolute eligibility clocks (+inf = empty
 slot).  Token ``t`` of a call writes slot ``(ring_ptr + t) % W``.  The pool read of a query row is
 
@@ -10,10 +10,11 @@ slot).  Token ``t`` of a call writes slot ``(ring_ptr + t) % W``.  The pool read
     p      = softmax_w(s + bias)                                   (fp32)
     out    = bf16(bf16(p) . gv)
 
-which is the bf16-autocast expression chain of the memory layer's inference forward (two bf16 bmm calls, the clock bias
-cast to the pattern dtype, an fp32 softmax).  The last head additionally reads the ring with ``M = 4`` extra queries.
-The induction term is formed in the kernels from the bool match matrices of the model-level induction state (``m_n``
-for the orders 2, 3, 4; products with m in {0, 1} are exact, so the term's value does not depend on contraction).
+which is the bf16-autocast expression chain of the hippocampal layer's inference forward (two bf16 bmm calls, the clock
+bias cast to the pattern dtype, an fp32 softmax).  The last head additionally reads the ring with ``M = 4`` extra
+queries. The induction term is formed in the kernels from the bool match matrices of the model-level induction state
+(``m_n`` for the orders 2, 3, 4; products with m in {0, 1} are exact, so the term's value does not depend on
+contraction).
 
 Operators (each: private launcher, ``torch.library`` custom op with a fake, public function, pure-torch ``*_ref``):
 
@@ -23,14 +24,14 @@ Operators (each: private launcher, ``torch.library`` custom op with a fake, publ
     times the tagged values, an fp32 partial read per (row, query, chunk); the partials are summed over the chunks in
     fp32 and rounded to bf16.  Only the row's live slots are read: the ``L = min(pos + 1, W)`` slots ending at this
     step's slot ``ring_ptr % W`` (every other slot has an infinite clock: weight 0 in the softmax).  Deterministic (fixed
-    chunk order, no atomics).  Compiled without FMA contraction.  The memory layer reads the ring with this kernel at
+    chunk order, no atomics). Compiled without FMA contraction. The hippocampal layer reads the ring with this kernel at
     decode batch sizes 1 and 32 (``RING_READ_KERNEL_BATCHES``); at the other sizes it reads with the torch expression
     chain (the module's own torch form), which ``ring_read_t1_ref`` evaluates.
 ``xq_form_t1``  decode step: the last head's extra-query formation in one kernel per (row, query): the rank-r
     projection (bf16 operands, fp32 sum, bf16 result), SiLU (bf16 result), interleaved RoPE in bf16 arithmetic (each
     product and sum rounded to bf16), L2 normalisation, division and the gain ``exp(clamp(psi, -3, 3)) * head_gain`` in
-    fp32, one rounding to bf16 at the store.  The memory layer uses it at the decode batch sizes whose ring read is the
-    torch chain.
+    fp32, one rounding to bf16 at the store.  The hippocampal layer uses it at the decode batch sizes whose ring read is
+    the torch chain.
 ``ring_write_prefill``  prefill (T >= 2): the call's ring write as one kernel over the (t, b, h) rows: the k row's fp32
     norm (Triton's row sum of the squares, sqrt), ``max(norm, 1e-12)``, the fp32 division, one rounding to bf16 into
     ``pool_k``; the q row the same way times the head's fp32 gain, stored fp32 (the recall's query); the fp32 gate
@@ -82,8 +83,9 @@ __all__ = [
 ]
 
 # ================================================================================================ fixed launch constants
-# Decode ring read (split-W): the decode batch sizes at which the memory layer reads the ring with this kernel; at every
-# other size it reads with the torch expression chain of the memory layer.
+# Decode ring read (split-W): the decode batch sizes at which the hippocampal layer reads the ring with this kernel; at
+# every
+# other size it reads with the torch expression chain of the hippocampal layer.
 RING_READ_KERNEL_BATCHES = (1, 32)
 # query rows of a program's dot tile: row 0 the head's query, rows 1..M the extra queries of the last head (padded)
 RING2_QUERY_ROWS = 16
@@ -452,9 +454,10 @@ def ring_read_t1_ref(q: torch.Tensor, xq: Optional[torch.Tensor], cum_t: torch.T
                      pool_gv: torch.Tensor, pool_cum: torch.Tensor, pos: torch.Tensor, ring_ptr: torch.Tensor,
                      matches: Optional[Sequence[torch.Tensor]], beta: Optional[torch.Tensor],
                      gain: float) -> torch.Tensor:
-    """The torch expression chain of the T = 1 ring read (the memory layer's T = 1 decode branch and the extra-query
-    read at T = 1) over all W slots under bf16 autocast (its einsums are bf16 bmm calls with bf16 outputs), the slots
-    outside the live range set to -inf before the bias cast.  Same arguments and output as :func:`ring_read_t1`.  Run it
+    """The torch expression chain of the T = 1 ring read (the hippocampal layer's T = 1 decode branch and the
+    extra-query read at T = 1) over all W slots under bf16 autocast (its einsums are bf16 bmm calls with bf16 outputs),
+    the slots outside the live range set to -inf before the bias cast.  Same arguments and output as
+    :func:`ring_read_t1`.  Run it
     under ``regime("infer")`` for the inference GEMM settings."""
     xq = _t1_xq(xq)
     ms = _t1_matches(matches)
@@ -772,7 +775,7 @@ def ring_write_prefill(k_h: torch.Tensor, q_h: torch.Tensor, g_h: torch.Tensor, 
     ring_ptr (1,) int64 at the start of the call.  Returns the gained unit queries (T, B, H, 256) fp32.
 
     Operands with a unit channel stride run the kernel; operands whose channel dimension is strided (the T = 2 conv
-    form) run :func:`ring_write_prefill_ref`, the expression chain of the memory layer's prefill on that layout.
+    form) run :func:`ring_write_prefill_ref`, the expression chain of the hippocampal layer's prefill on that layout.
     The ring clocks are written by the caller."""
     _check_ring_write(k_h, q_h, g_h, v_h, qgain, wbias, pool_k, pool_gv, ring_ptr, T, B, H, W)
     if not _ring_write_layout_ok(k_h, q_h, g_h, v_h):
@@ -1169,7 +1172,7 @@ def ring_recall_prefill_ref(q4: torch.Tensor, k_ring: torch.Tensor, gv_ring: tor
                             ct3: Optional[torch.Tensor], p0: torch.Tensor, ind4, scale: float, T: int, B: int, G: int,
                             W: int, dk: int, dv: int, out_dtype: torch.dtype, xq: bool = False,
                             hr: int = 0) -> torch.Tensor:
-    """The torch expressions of the prefill ring read (the memory layer's ring-chunk branch; the extra-query read)
+    """The torch expressions of the prefill ring read (the hippocampal layer's ring-chunk branch; the extra-query read)
     under the inference forward's bf16 autocast: bf16 bmm scores, the clock bias with this call's later slots at -inf
     plus the induction term, cast to bf16, an fp32 softmax over all W slots, a bf16 bmm with the values.  Same
     arguments and output as :func:`ring_recall_prefill`."""

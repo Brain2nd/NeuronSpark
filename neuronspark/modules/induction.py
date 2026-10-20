@@ -1,4 +1,4 @@
-"""Induction match matrices of the memory layers' pool attention (model level, pure torch, bool).
+"""Induction match matrices of the hippocampal layers' pool attention (model level, pure torch, bool).
 
 Whole row (:func:`induction_match_matrices`): one (B, T, T) bool matrix per order n in ``orders`` (1.27B: (2, 3, 4)),
 ascending::
@@ -6,7 +6,7 @@ ascending::
     m_n[b, t, j] = 1[j <= t - 1] * prod_{i = 0 .. n-1} 1[x_{t-i} == x_{j-1-i}]
 
 with every compared index in range (an index before the row start never matches).  The matrices are nested
-(m_4 is a subset of m_3, of m_2).  Each memory layer forms its additive pool term ``sum_n beta[n, h] m_n`` from them
+(m_4 is a subset of m_3, of m_2). Each hippocampal layer forms its additive pool term ``sum_n beta[n, h] m_n`` from them
 with its own ``pool_ind_beta``.
 
 Inference (:func:`induction_session_match`): the cache keeps a keys ring

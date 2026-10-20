@@ -2,7 +2,7 @@
 
 The last memory head reads its ring with M extra queries (1.27B: M = 4, dk = 256).  Query m of row (t, b) is formed
 from its bf16 projection ``q_m`` (T, B, dk) (``bf16(u[..., r m : r m + r] @ pool_xq_b[m]^T)``, a cuBLAS GEMM outside
-this op) by the expressions of the memory layer under the bf16 autocast of the inference regime::
+this op) by the expressions of the hippocampal layer under the bf16 autocast of the inference regime::
 
     x   = silu(q_m)                                   fp32 x / (1 + expf(-x)), rounded to bf16
     y   = rope(x, bf16(cos), bf16(sin))               interleaved pairs: y_2p = bf16(bf16(x_2p c) - bf16(x_2p+1 s)),
@@ -187,7 +187,7 @@ def xq_queries_prefill(qs: Sequence[torch.Tensor], psi: torch.Tensor, head_gain:
 # ================================================================================================ reference
 def xq_queries_prefill_ref(qs: Sequence[torch.Tensor], psi: torch.Tensor, head_gain: torch.Tensor, cos: torch.Tensor,
                            sin: torch.Tensor) -> torch.Tensor:
-    """The memory layer's torch formation of the extra queries after their projections, under the bf16 autocast of
+    """The hippocampal layer's torch formation of the extra queries after their projections, under the bf16 autocast of
     the inference regime (same arguments as :func:`xq_queries_prefill`): SiLU and the interleaved RoPE as bf16 ops,
     ``F.normalize`` (fp32 under autocast), the gain ``exp(psi_m) * f32(head_gain)`` in fp32 and the product with the
     unit query; stacked and permuted to (B, M, T, dk).  Returns the fp32 queries."""

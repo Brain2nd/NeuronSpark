@@ -1,5 +1,5 @@
-"""Pool attention of the memory layer: the softmax-mixing retrieval pool over tagged synaptic events, with its value
-residual, GLU tail, RoPE, PLIF write gate, GDN-family decay clock, induction bias and extra queries.
+"""Pool attention of the hippocampal layer: the softmax-mixing retrieval pool over tagged synaptic events, with its
+value residual, GLU tail, RoPE, PLIF write gate, GDN-family decay clock, induction bias and extra queries.
 
 Whole-row math (one layer call, layer input h (T, B, D) fp32 after the lexical read, z = frozen_rms_norm(h) fp32;
 H = 6 heads, dk = dv = 256; bf(.) = RNE to bf16, f(.) = widen to fp32):
@@ -8,8 +8,9 @@ H = 6 heads, dk = dv = 256; bf(.) = RNE to bf16, f(.) = widen to fp32):
     q, k, v = split(qkv);   v = silu(v)                                       bf16
     lam  = pool_value_residual + anchor + repeat_256(tanh(f(bf(zc @ pool_vr_gate^T))))   (T, B, 1536) fp32,
            zc = (z_t - sum_{j<t} z_j / max(t, 1)) [t > 0]
-    v    = bf(f(v) (1 + lam))                       memory layer 0 (its post-SiLU v is the carry of the later layers)
-         = bf(f(v) + lam f(carry))                  memory layers 1 .. 5
+    v    = bf(f(v) (1 + lam))                       hippocampal layer 0 (its post-SiLU v is the carry of the later
+    layers)
+         = bf(f(v) + lam f(carry))                  hippocampal layers 1 .. 5
     v[..., 1280:] = bf(f(v[..., 1280:]) + f(bf(bf(silu(f(bf(z A^T))) f(bf(z B^T))) @ U^T)))     GLU tail, last head
     q, k = rope(silu(q)), rope(silu(k))            interleaved pairs, every head on the head-width ladder (base 1e4)
     g    = gate_neuron(z)                           PLIF spikes (T, B, 1536) fp32
@@ -67,7 +68,7 @@ from neuronspark.modules.linear import Linear, ShortConvWeight
 from neuronspark.modules.norms import RMSNorm
 from neuronspark.modules.plif import PLIFNeuron, centred_running_step, forked_rng, linear_init
 from neuronspark.modules.rope import apply_rope_interleaved_ref, rope_head_band_tables
-from neuronspark.utils.cache import MemoryState
+from neuronspark.utils.cache import HippocampalState
 
 __all__ = [
     "PoolAttentionMixin",
@@ -134,7 +135,7 @@ def pool_write_bias_spectrum_init(H: int, span: float) -> torch.Tensor:
 
 
 def value_residual_anchor(pair: Sequence[float], d_value: int, heads: int, device=None) -> torch.Tensor:
-    """(D_value,) fp32 anchor of a later memory layer's value-residual mix: ``pair[0]`` on head 0's channels,
+    """(D_value,) fp32 anchor of a later hippocampal layer's value-residual mix: ``pair[0]`` on head 0's channels,
     ``pair[1]`` on the last head's, log-uniform in between when both are positive (linear otherwise)."""
     heads, d_value = int(heads), int(d_value)
     if heads < 2 or d_value % heads:
@@ -161,7 +162,7 @@ def value_residual_anchor(pair: Sequence[float], d_value: int, heads: int, devic
 
 # ------------------------------------------------------------------------------------------------ the mixin
 class PoolAttentionMixin:
-    """Mixin of :class:`neuronspark.modules.memory_layer.MemoryLayer`.
+    """Mixin of :class:`neuronspark.modules.hippocampal_layer.HippocampalLayer`.
 
     Parameters (shape; launch): ``W_decay.weight`` (256, 1536; 0), ``decay_A_log_delta`` (256; 0),
     ``pool_bias_gain_delta`` / ``pool_dendritic_gain_delta`` / ``pool_write_bias`` (6; 0), ``pool_glu_a`` /
@@ -179,8 +180,8 @@ class PoolAttentionMixin:
     """
 
     # ------------------------------------------------------------------------------------------------ build
-    def _build_pool_attention(self, config, layer_idx: int, mem_index: int, device, dtype, init: str) -> None:
-        D, Dk, Dv, H = int(config.D), int(config.D_key), int(config.D_value), int(config.memory_heads)
+    def _build_pool_attention(self, config, layer_idx: int, hippocampal_index: int, device, dtype, init: str) -> None:
+        D, Dk, Dv, H = int(config.D), int(config.D_key), int(config.D_value), int(config.hippocampal_heads)
         dk, dv = Dk // H, Dv // H
         f32 = torch.float32 if dtype is None else dtype
         launch = init == "launch"
@@ -191,18 +192,18 @@ class PoolAttentionMixin:
                 return nn.Parameter(torch.full(shape, float(fill), device=device, dtype=f32))
             return nn.Parameter(torch.empty(shape, device=device, dtype=f32))
 
-        self.D_key, self.D_value, self.memory_heads = Dk, Dv, H
-        self.memory_head_dim, self.memory_value_head_dim = dk, dv
-        self.memory_base_decay = float(config.memory_base_decay)
-        self.write_sparsity = float(config.memory_write_sparsity)
-        self.match_scale = float(config.memory_dendritic_scale)
-        self.induction_orders = tuple(int(n) for n in config.memory_induction_bias_orders)
-        self.xq_count = int(config.memory_pool_extra_queries)
-        self.xq_rank = int(config.memory_pool_extra_query_rank)
-        self.xq_out_rank = int(config.memory_pool_extra_query_out_rank)
-        self.glu_rank = int(config.memory_pool_value_glu_rank)
-        self.mem_index = int(mem_index)
-        self.value_residual_first = self.mem_index == 0
+        self.D_key, self.D_value, self.hippocampal_heads = Dk, Dv, H
+        self.hippocampal_head_dim, self.hippocampal_value_head_dim = dk, dv
+        self.hippocampal_base_decay = float(config.hippocampal_base_decay)
+        self.write_sparsity = float(config.hippocampal_write_sparsity)
+        self.match_scale = float(config.hippocampal_dendritic_scale)
+        self.induction_orders = tuple(int(n) for n in config.hippocampal_induction_bias_orders)
+        self.xq_count = int(config.hippocampal_pool_extra_queries)
+        self.xq_rank = int(config.hippocampal_pool_extra_query_rank)
+        self.xq_out_rank = int(config.hippocampal_pool_extra_query_out_rank)
+        self.glu_rank = int(config.hippocampal_pool_value_glu_rank)
+        self.hippocampal_index = int(hippocampal_index)
+        self.value_residual_first = self.hippocampal_index == 0
         # ---- decay (GDN family, vector width dk shared by the heads)
         self.W_decay = Linear(D, dk, device=device, dtype=dtype, init=li)
         if launch:
@@ -234,11 +235,11 @@ class PoolAttentionMixin:
         if self.value_residual_first:
             anchor = torch.zeros((Dv,), dtype=torch.float32, device=device)
         else:
-            pairs = config.memory_pool_value_residual_anchor
-            if not 1 <= self.mem_index <= len(pairs):
-                raise ValueError(f"memory layer rank {self.mem_index}: no value-residual anchor pair ({len(pairs)} "
-                                 "pairs for memory layers 1 ..)")
-            anchor = value_residual_anchor(pairs[self.mem_index - 1], Dv, H, device)
+            pairs = config.hippocampal_pool_value_residual_anchor
+            if not 1 <= self.hippocampal_index <= len(pairs):
+                raise ValueError(f"hippocampal layer rank {self.hippocampal_index}: no value-residual anchor pair "
+                                 f"({len(pairs)} pairs for hippocampal layers 1 ..)")
+            anchor = value_residual_anchor(pairs[self.hippocampal_index - 1], Dv, H, device)
         self.register_buffer("pool_value_residual_anchor", anchor, persistent=True)
         # ---- extra queries of the last head
         M, r, ro = self.xq_count, self.xq_rank, self.xq_out_rank
@@ -254,7 +255,7 @@ class PoolAttentionMixin:
                     nn.init.xavier_uniform_(b)
                 nn.init.xavier_uniform_(self.pool_xq_out_in)
         self.register_buffer("pool_write_bias_spectrum",
-                             pool_write_bias_spectrum_init(H, config.memory_pool_write_bias_spectrum_span).to(
+                             pool_write_bias_spectrum_init(H, config.hippocampal_pool_write_bias_spectrum_span).to(
                                  device=device), persistent=True)
         # ---- projections, the write-gate neuron, the qkv short conv, the output norm / gate / projection
         qkv = 2 * Dk + Dv
@@ -262,7 +263,8 @@ class PoolAttentionMixin:
         self.gate_neuron = PLIFNeuron(D, config.init_tau, centred=False, alpha=config.plif_surrogate_alpha,
                                       eta_rank=config.plif_eta_proj_rank, device=device, dtype=dtype, impl=self.impl,
                                       init=init)
-        self.qkv_conv = ShortConvWeight(qkv, int(config.memory_short_conv), device=device, dtype=dtype, init="empty")
+        self.qkv_conv = ShortConvWeight(qkv, int(config.hippocampal_short_conv), device=device, dtype=dtype,
+                                        init="empty")
         if launch:
             with torch.no_grad():
                 # the depthwise Conv1d's default draw, then the identity launch (pass-through: last tap 1)
@@ -287,7 +289,7 @@ class PoolAttentionMixin:
             self.attn_out_proj.weight.normal_(std=float(out_std))
 
     def _build_induction_bias(self, config, device, dtype, init: str) -> None:
-        n = len(self.induction_orders) * self.memory_heads
+        n = len(self.induction_orders) * self.hippocampal_heads
         f32 = torch.float32 if dtype is None else dtype
         t = torch.zeros(n, device=device, dtype=f32) if init == "launch" else torch.empty(n, device=device, dtype=f32)
         self.pool_ind_beta = nn.Parameter(t)
@@ -318,24 +320,26 @@ class PoolAttentionMixin:
 
     def induction_beta(self) -> torch.Tensor:
         """(orders, H) view of pool_ind_beta (flat index n * H + h)."""
-        return self.pool_ind_beta.view(len(self.induction_orders), self.memory_heads)
+        return self.pool_ind_beta.view(len(self.induction_orders), self.hippocampal_heads)
 
     # ------------------------------------------------------------------------------------------------ shared pieces
     def _check_ind(self, ind, shape: Tuple[int, int, int]) -> Tuple[torch.Tensor, ...]:
         if (not isinstance(ind, (tuple, list)) or len(ind) != len(self.induction_orders)
                 or any(not isinstance(m, torch.Tensor) or tuple(m.shape) != tuple(shape) or m.dtype != torch.bool
                        for m in ind)):
-            raise RuntimeError(f"memory layer: the induction bias needs one bool {tuple(shape)} match tensor per order "
+            raise RuntimeError(f"hippocampal layer: the induction bias needs one bool {tuple(shape)} match tensor per "
+                               f"order "
                                f"{self.induction_orders}, got "
                                f"{None if not isinstance(ind, (tuple, list)) else [tuple(getattr(m, 'shape', ())) for m in ind]}")
         return tuple(ind)
 
     def _memory_decay(self, logit: torch.Tensor) -> torch.Tensor:
-        """(T, B, 256, 1) fp32 decay a = exp(-bf16(exp(A_log)) softplus(f32(logit))) * memory_base_decay from the bf16
+        """(T, B, 256, 1) fp32 decay a = exp(-bf16(exp(A_log)) softplus(f32(logit))) * hippocampal_base_decay from the
+        bf16
         decay logit (T, B, 256)."""
         rate = torch.exp(self.decay_A_log).to(logit.dtype)
         a = torch.exp(-rate * F.softplus(logit.float()))
-        a = a * self.memory_base_decay
+        a = a * self.hippocampal_base_decay
         return a.to(torch.float32).unsqueeze(-1)
 
     @staticmethod
@@ -346,7 +350,7 @@ class PoolAttentionMixin:
 
     def _clock_increments(self, a: torch.Tensor, T: int, B: int) -> torch.Tensor:
         """(T, B, H) fp32 gained clock increments of every head (inference): the shared mean log decay times gamma_h."""
-        H = self.memory_heads
+        H = self.hippocampal_heads
         _a = a.reshape(T, B, -1).float().clamp_min(DECAY_FLOOR)
         la = _a.log().mean(dim=-1, keepdim=True).expand(T, B, H)
         return la * self.pool_bias_gains().view(1, 1, H)
@@ -368,8 +372,8 @@ class PoolAttentionMixin:
     @staticmethod
     def _check_carry(carry: Optional[torch.Tensor], v: torch.Tensor) -> None:
         if carry is None or tuple(carry.shape) != tuple(v.shape) or carry.dtype != v.dtype:
-            raise RuntimeError("memory layer: the value residual needs the first memory layer's value stream of this "
-                               f"call as the carry ({tuple(v.shape)} {v.dtype}), got "
+            raise RuntimeError("hippocampal layer: the value residual needs the first hippocampal layer's value stream "
+                               f"of this call as the carry ({tuple(v.shape)} {v.dtype}), got "
                                f"{None if carry is None else (tuple(carry.shape), carry.dtype)}")
 
     def _glu_addend(self, z: torch.Tensor) -> torch.Tensor:
@@ -381,13 +385,13 @@ class PoolAttentionMixin:
     def _glu_tail_torch(self, v: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         """v with the GLU addend added to the last head's value channels (inference, torch)."""
         gv = self._glu_addend(z)
-        dvh = self.memory_value_head_dim
+        dvh = self.hippocampal_value_head_dim
         return torch.cat([v[..., :self.D_value - dvh], (v[..., self.D_value - dvh:].float() + gv).to(v.dtype)], dim=-1)
 
     def _xq_band(self, t: torch.Tensor) -> torch.Tensor:
         """The last head's column band of a (..., D_key / 2) RoPE table."""
-        half = self.memory_head_dim // 2
-        lo = (self.memory_heads - 1) * half
+        half = self.hippocampal_head_dim // 2
+        lo = (self.hippocampal_heads - 1) * half
         return t[..., lo:lo + half]
 
     def _xq_queries_torch(self, z: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, q_dtype: torch.dtype,
@@ -396,7 +400,7 @@ class PoolAttentionMixin:
         rotation): unit rotated SiLU projections times exp(clamp(psi, -3, 3)) and the last head's match gain in the
         query dtype.  A prefill call forms the same queries with :meth:`_xq_queries_prefill`."""
         lin = self._ops.linear
-        H, M, r = self.memory_heads, self.xq_count, self.xq_rank
+        H, M, r = self.hippocampal_heads, self.xq_count, self.xq_rank
         head_gain = self.pool_query_gain(q_dtype)[H - 1]
         cos5, sin5 = self._xq_band(cos), self._xq_band(sin)
         u = lin(z, self.pool_xq_a)
@@ -416,7 +420,7 @@ class PoolAttentionMixin:
         (``ops.xq_queries_prefill``), rounded once to bf16 -- the rounding the ring read applies to its queries."""
         o = self._ops
         lin = o.linear
-        H, M, r = self.memory_heads, self.xq_count, self.xq_rank
+        H, M, r = self.hippocampal_heads, self.xq_count, self.xq_rank
         head_gain = self.pool_query_gain(q_dtype)[H - 1]
         cos5, sin5 = self._xq_band(cos), self._xq_band(sin)
         u = lin(z, self.pool_xq_a)
@@ -441,7 +445,7 @@ class PoolAttentionMixin:
         o = self._ops
         lin = o.linear
         T, B, D = (int(s) for s in h.shape)
-        H, dk, dv = self.memory_heads, self.memory_head_dim, self.memory_value_head_dim
+        H, dk, dv = self.hippocampal_heads, self.hippocampal_head_dim, self.hippocampal_value_head_dim
         ind = self._check_ind(ind, (B, T, T))
         # qkv projection (on the (T * B, D) view) and the causal short conv
         qkv = lin(z.reshape(T * B, D), self.qkv_proj.weight).view(T, B, -1)
@@ -508,7 +512,7 @@ class PoolAttentionMixin:
         induction term as the head; mask and tagging formed again for this read)."""
         o = self._ops
         lin = o.linear
-        M, r, dv = self.xq_count, self.xq_rank, self.memory_value_head_dim
+        M, r, dv = self.xq_count, self.xq_rank, self.hippocampal_value_head_dim
         cos5, sin5 = self._xq_band(cos), self._xq_band(sin)
         zc = z.contiguous()
         u = lin(zc, self.pool_xq_a)
@@ -538,16 +542,16 @@ class PoolAttentionMixin:
         hist.copy_(full[:, :, full.shape[2] - hist.shape[2]:])
         return out.permute(2, 0, 1).contiguous()
 
-    def _attention_prefill(self, h: torch.Tensor, z: torch.Tensor, ind, carry, st: MemoryState, pos0: torch.Tensor,
+    def _attention_prefill(self, h: torch.Tensor, z: torch.Tensor, ind, carry, st: HippocampalState, pos0: torch.Tensor,
                            ptr0: torch.Tensor, W: int):
         """Prefill attention sub-block (T >= 2) over the carried rings: (r bf16 centred residual, carry_out)."""
         o = self._ops
         lin = o.linear
         T, B, D = (int(s) for s in h.shape)
-        H, dk, dv = self.memory_heads, self.memory_head_dim, self.memory_value_head_dim
+        H, dk, dv = self.hippocampal_heads, self.hippocampal_head_dim, self.hippocampal_value_head_dim
         matches = self._check_ind(ind, (B, T, W))
         if T > W:
-            raise RuntimeError(f"memory layer: a call of {T} tokens exceeds the ring capacity {W}")
+            raise RuntimeError(f"hippocampal layer: a call of {T} tokens exceeds the ring capacity {W}")
         qkv = lin(z, self.qkv_proj.weight)
         if T >= 3:
             qkv = o.short_conv_silu_prefill(qkv, st.conv_hist, self.qkv_conv.weight)      # the conv and its SiLU
@@ -598,14 +602,14 @@ class PoolAttentionMixin:
         return self._out_proj_centred(self._out_norm_gate_infer(attn, h)), carry_out
 
     # ------------------------------------------------------------------------------------------------ decode
-    def _attention_step(self, h: torch.Tensor, z: torch.Tensor, ind, carry, st: MemoryState, pos0: torch.Tensor,
+    def _attention_step(self, h: torch.Tensor, z: torch.Tensor, ind, carry, st: HippocampalState, pos0: torch.Tensor,
                         ptr0: torch.Tensor, W: int):
         """Single-token attention sub-block over the carried rings: (r bf16 centred residual, carry_out).  Every
         state write is in place (CUDA-graph replay safe)."""
         o = self._ops
         lin = o.linear
         T, B, D = (int(s) for s in h.shape)
-        H, dk, dv, M = self.memory_heads, self.memory_head_dim, self.memory_value_head_dim, self.xq_count
+        H, dk, dv, M = self.hippocampal_heads, self.hippocampal_head_dim, self.hippocampal_value_head_dim, self.xq_count
         matches = self._check_ind(ind, (B, 1, W))
         qkv = lin(z, self.qkv_proj.weight)
         qkv = o.short_conv_step(qkv[0], st.conv_hist, self.qkv_conv.weight).unsqueeze(0)
@@ -659,7 +663,7 @@ class PoolAttentionMixin:
 
     def _induction_ring_terms(self, matches, beta: torch.Tensor) -> torch.Tensor:
         """(B, H, T, W) fp32 induction terms of every head from the ring-layout matches: m_1 b_1, then + m_n b_n."""
-        H = self.memory_heads
+        H = self.hippocampal_heads
         out = matches[0].unsqueeze(1).to(torch.float32) * beta[0].view(1, H, 1, 1)
         for n in range(1, len(matches)):
             out = out + matches[n].unsqueeze(1).to(torch.float32) * beta[n].view(1, H, 1, 1)
@@ -678,10 +682,10 @@ class PoolAttentionMixin:
             return wb
         return cached[1]
 
-    def _ring_read_step_torch(self, q_h, cum_abs, st: MemoryState, term, out_dtype) -> torch.Tensor:
+    def _ring_read_step_torch(self, q_h, cum_abs, st: HippocampalState, term, out_dtype) -> torch.Tensor:
         """(1, B, H dv) T = 1 ring read of every head over all W slots (empty slots: +inf clocks), torch chain."""
         T, B, H, _ = (int(s) for s in q_h.shape)
-        dv = self.memory_value_head_dim
+        dv = self.hippocampal_value_head_dim
         qh = q_h[0].to(st.pool_k.dtype).float()                                  # (B, H, dk)
         scores = torch.einsum("bhd,bhwd->bhw", qh, st.pool_k.float()) * self.match_scale
         bias = cum_abs[0].unsqueeze(-1) - st.pool_cum                            # (B, H, W)
@@ -691,14 +695,14 @@ class PoolAttentionMixin:
         out = torch.einsum("bhw,bhwd->bhd", probs.to(st.pool_gv.dtype).float(), st.pool_gv.float())
         return out.reshape(1, B, H * dv).to(out_dtype)
 
-    def _xq_read_step_torch(self, z, cos, sin, q_dtype, term5, st: MemoryState, ptr0, W: int,
+    def _xq_read_step_torch(self, z, cos, sin, q_dtype, term5, st: HippocampalState, ptr0, W: int,
                             out_dtype) -> torch.Tensor:
         """(1, B, dv) T = 1 addend of the extra queries: ``ops.xq_form_t1`` forms the queries, the torch chain reads the
         last head's ring (+ the head's induction term) and the two output maps project."""
         o = self._ops
         lin = o.linear
         T, B = int(z.shape[0]), int(z.shape[1])
-        H = self.memory_heads
+        H = self.hippocampal_heads
         u = lin(z, self.pool_xq_a)
         psi = lin(z, self.pool_xq_gain_proj)
         head_gain = self.pool_query_gain(q_dtype)[H - 1:H].to(torch.float32)

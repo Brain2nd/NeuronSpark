@@ -1,5 +1,5 @@
-"""PLIF neuron population of the memory layers: TTT-eta projected-gate leaky integration with the bipolar soft-reset
-release, plus the small helpers shared by the memory-layer modules.
+"""PLIF neuron population of the hippocampal layers: TTT-eta projected-gate leaky integration with the bipolar
+soft-reset release, plus the small helpers shared by the hippocampal-layer modules.
 
 Per channel c and row b, input x (T, B, C) (fp32 for the attention-side ``gate_neuron`` and the centred
 ``input_neuron2``, bf16 for the spiking FFN's gate / up neurons):
@@ -72,7 +72,7 @@ V_TH_INIT = (0.15, 0.40)
 W_INIT_STD = 0.5
 # clamp of the launch retained fraction inside the b_eta logit
 _ONE_M_BETA_EPS = 1e-6
-# construction modes of every memory-layer module
+# construction modes of every hippocampal-layer module
 INITS = ("launch", "empty")
 
 
@@ -106,7 +106,7 @@ def forked_rng(device: Optional[Union[str, torch.device]], base: int, layer_idx:
 def rows_rmsnorm(ops, x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None, zero_centered: bool = False,
                  out_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     """``ops.rmsnorm_rows`` on the (rows, N) view of ``x`` (..., N), returned in ``x``'s leading shape (prefill and
-    decode norms of the memory layer)."""
+    decode norms of the hippocampal layer)."""
     shape = tuple(x.shape)
     n = int(shape[-1])
     y = ops.rmsnorm_rows(x.reshape(-1, n), eps, weight=weight, zero_centered=zero_centered, out_dtype=out_dtype)
@@ -149,7 +149,7 @@ class PLIFNeuron(nn.Module):
 
     ``init_tau``: a scalar launch time constant (> 1) or a ``(tau_min, tau_max)`` spectrum laid out log-uniformly over
     the channels.  ``centred``: the eta projection reads the strictly-past-centred input (the FFN input neuron of the
-    memory layer).  ``alpha``: surrogate slope of the backward.  ``impl``: ``"kernel"`` or ``"ref"`` (the operator
+    hippocampal layer).  ``alpha``: surrogate slope of the backward.  ``impl``: ``"kernel"`` or ``"ref"`` (the operator
     namespace, :mod:`neuronspark.ops`).
 
     ``forward(x, state=None, pos=None)``: ``x`` (T, B, C); ``state`` the population's :class:`PLIFState` of an inference

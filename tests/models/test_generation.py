@@ -2,7 +2,7 @@
 
 * CUDA-graph decode against eager decode: the same tokens fed to both (teacher forcing with the eager run's tokens),
   the per-step logits by the per-operator rule (decode batch sizes 1, 2, 8, 32: the ring-kernel and torch-chain routes
-  and every spiking-layer step route); the free-running greedy agreement is reported;
+  and every dendritic-layer step route); the free-running greedy agreement is reported;
 * a chunked prefill (4 calls of 256 tokens) against one prefill of 1024 tokens: the cache counters and the integer state
   exactly, the logits and the floating state reported (a one-ulp difference between call lengths is amplified by the
   spikes and the top-k selection);

@@ -1,4 +1,4 @@
-"""ops.triton.pool_ring: the inference ring kernels of the memory layers' pool read.
+"""ops.triton.pool_ring: the inference ring kernels of the hippocampal layers' pool read.
 
 The decode read (``ring_read_t1``, with and without the extra queries and the induction term, and under CUDA-graph
 replay), the extra-query formation (``xq_form_t1``), the prefill ring write (``ring_write_prefill``, also on the
@@ -166,7 +166,7 @@ _ROPE = {}
 
 
 def _rope_band(device):
-    """the last head's band of the memory layers' RoPE tables, fp32 (8192, 128)."""
+    """the last head's band of the hippocampal layers' RoPE tables, fp32 (8192, 128)."""
     if device not in _ROPE:
         cos, sin = rope_head_band_tables(H * DK, H, 8192, 10000.0, device=device)
         lo = (H - 1) * (DK // 2)

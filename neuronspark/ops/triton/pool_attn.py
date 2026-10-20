@@ -1,4 +1,4 @@
-"""The memory layers' pool attention (training): softmax over ``scale * q k^T + mask``, times the tagged values.
+"""The hippocampal layers' pool attention (training): softmax over ``scale * q k^T + mask``, times the tagged values.
 
 Operator (registry name): ``pool_attention(q, k, v, mask, scale, kshared)``.
 

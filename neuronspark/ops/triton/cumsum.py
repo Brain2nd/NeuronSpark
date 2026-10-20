@@ -1,4 +1,4 @@
-"""Cumulative sums over the time axis and the carried running means of the memory layer.
+"""Cumulative sums over the time axis and the carried running means of the hippocampal layer.
 
 Operators (registry names):
 

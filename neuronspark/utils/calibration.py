@@ -8,7 +8,7 @@ the PKM buffers (``pkm_copy_tau``, ``pkm_calibrated``, ``pkm_launch_rms_res`` / 
 
 :func:`calibrate_fresh_model` runs, in order:
 
-1. :func:`calibrate_plif_threshold_match`: for every memory layer in depth order (the shallower layers already
+1. :func:`calibrate_plif_threshold_match`: for every hippocampal layer in depth order (the shallower layers already
    matched), the input x of ``input_neuron2`` is recorded over the calibration rows, the gate operands are recomputed
    in fp32 outside autocast (``z = w_eta x + b_eta + eta_U (eta_V xc)`` with xc the strictly-past-centred input,
    ``eta = sigmoid(z)``, ``a = 1 - eta``, ``drive = eta x``), and each channel's threshold ``v_th`` is bisected
@@ -20,10 +20,10 @@ the PKM buffers (``pkm_copy_tau``, ``pkm_calibrated``, ``pkm_launch_rms_res`` / 
 2. :func:`calibrate_pkm`: pass A records the unit half-queries of every product-key memory and the copy detector's
    per-position maxima; the sub-keys become the unit centroids of a spherical k-means of the half-queries (fp64 on the
    CPU, k-means++ seeding from a generator seeded ``mechanism_init_seed(996_500, layer_idx)``,
-   ``memory_pkm_kmeans_iters`` Lloyd iterations, empty clusters re-seeded); ``pkm_copy_tau`` becomes the 0.9 quantile
-   of the maxima.  Pass B (with the calibrated sub-keys) measures rms(y - mean_c y) of the read and rms of the
-   attention residual; ``pkm_o.weight *= memory_pkm_launch_ratio * rms(res) / rms(y)``; the buffers record the launch
-   values and ``pkm_calibrated = 1``.
+   ``hippocampal_pkm_kmeans_iters`` Lloyd iterations, empty clusters re-seeded); ``pkm_copy_tau`` becomes the 0.9
+   quantile of the maxima.  Pass B (with the calibrated sub-keys) measures rms(y - mean_c y) of the read and rms of the
+   attention residual; ``pkm_o.weight *= hippocampal_pkm_launch_ratio * rms(res) / rms(y)``; the buffers record the
+   launch values and ``pkm_calibrated = 1``.
 
 During every calibration forward a product-key memory that is not calibrated adds nothing to its layer and the layer's
 read gain is not applied (the base function), so each layer is calibrated on the operands of the calibrated shallower
@@ -174,9 +174,9 @@ def _backbone(model):
 
 
 def _refuse_calibrated(backbone) -> None:
-    done = [l.layer_idx for l in backbone.memory_layers if float(l.pkm_calibrated) > 0.5 or l.pkm_ready]
+    done = [l.layer_idx for l in backbone.hippocampal_layers if float(l.pkm_calibrated) > 0.5 or l.pkm_ready]
     if done:
-        raise RuntimeError(f"launch calibration: memory layers {done} are calibrated already (a loaded checkpoint "
+        raise RuntimeError(f"launch calibration: hippocampal layers {done} are calibrated already (a loaded checkpoint "
                            "carries its calibrated values); the calibration runs on a fresh launch only")
 
 
@@ -184,7 +184,7 @@ def _check_batches(backbone, batches: Sequence[torch.Tensor], rows: Optional[int
     if not isinstance(batches, (list, tuple)) or not batches:
         raise ValueError("launch calibration: batches must be a non-empty list of (B, T) token-id tensors")
     dev = backbone.embed_tokens.weight.device
-    chunk = int(backbone.config.spiking_chunk_size)
+    chunk = int(backbone.config.dendritic_chunk_size)
     out = []
     for b in batches:
         if not isinstance(b, torch.Tensor) or b.dim() != 2 or b.dtype not in (torch.int64, torch.int32):
@@ -192,7 +192,7 @@ def _check_batches(backbone, batches: Sequence[torch.Tensor], rows: Optional[int
         if b.device != dev:
             raise ValueError(f"launch calibration: a batch on {b.device}, the model on {dev}")
         if backbone.impl == "kernel" and int(b.shape[1]) % chunk != 0:
-            raise ValueError(f"launch calibration: T = {int(b.shape[1])} is not a multiple of spiking_chunk_size "
+            raise ValueError(f"launch calibration: T = {int(b.shape[1])} is not a multiple of dendritic_chunk_size "
                              f"{chunk}")
         out.append(b.to(torch.int64))
     total = sum(int(b.shape[0]) for b in out)
@@ -321,7 +321,7 @@ def _simulate_release(a: torch.Tensor, drive: torch.Tensor, theta: torch.Tensor,
 @torch.no_grad()
 def calibrate_plif_threshold_match(model, batches: Sequence[torch.Tensor], skip: int = THRESHOLD_SKIP,
                                    iterations: int = THRESHOLD_ITERATIONS) -> Dict[str, dict]:
-    """Threshold matching of every memory layer's ``input_neuron2`` (step 1 of the module docstring).  ``batches``:
+    """Threshold matching of every hippocampal layer's ``input_neuron2`` (step 1 of the module docstring).  ``batches``:
     the calibration rows as (B, T) token-id tensors on the model's device.  Returns the per-population report."""
     backbone = _backbone(model)
     _refuse_calibrated(backbone)
@@ -330,7 +330,7 @@ def calibrate_plif_threshold_match(model, batches: Sequence[torch.Tensor], skip:
     p_fixed = float(backbone.config.plif_threshold_match_p)
     names = {id(m): n for n, m in backbone.named_modules()}
     report: Dict[str, dict] = {}
-    for layer in backbone.memory_layers:
+    for layer in backbone.hippocampal_layers:
         neuron = layer.input_neuron2
         name = f"{names[id(layer)]}.input_neuron2"
         x = _capture_neuron_input(backbone, neuron, batches)
@@ -378,14 +378,14 @@ def calibrate_plif_threshold_match(model, batches: Sequence[torch.Tensor], skip:
 # ================================================================================================ PKM calibration
 @torch.no_grad()
 def calibrate_pkm(model, batches: Sequence[torch.Tensor]) -> Dict[str, dict]:
-    """Product-key memory calibration of every memory layer (step 2 of the module docstring).  ``batches``: the
+    """Product-key memory calibration of every hippocampal layer (step 2 of the module docstring).  ``batches``: the
     calibration rows as (B, T) token-id tensors on the model's device.  Returns the per-layer report."""
     backbone = _backbone(model)
     _refuse_calibrated(backbone)
     batches = _check_batches(backbone, batches, None)
-    layers = backbone.memory_layers
+    layers = backbone.hippocampal_layers
     if not layers:
-        raise ValueError("calibrate_pkm: the model has no memory layer")
+        raise ValueError("calibrate_pkm: the model has no hippocampal layer")
     names = {id(m): n for n, m in backbone.named_modules()}
     report: Dict[str, dict] = {names[id(l)]: {} for l in layers}
     # ---- pass A: launch half-queries -> spherical k-means sub-keys; copy maxima -> pkm_copy_tau

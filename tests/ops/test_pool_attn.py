@@ -1,4 +1,4 @@
-"""ops.triton.pool_attn: the memory layers' pool attention (training).
+"""ops.triton.pool_attn: the hippocampal layers' pool attention (training).
 
 One pool head (``kshared=False``) and the four extra queries sharing the last head's keys / values / mask
 (``kshared=True``), at B 8, T 1024 and a short row: the bf16 output and the gradients of q, k, v and the mask, against

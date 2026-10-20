@@ -62,86 +62,87 @@ _SPECS: List[OpSpec] = [
     _op("linear", "neuronspark.ops.linear", "x weight",
         "(..., N) bf16; backward: dx in x.dtype, dW fp32 as weight.grad", "train prefill decode",
         doc="x (..., K) fp32|bf16, weight (N, K) fp32; inference: the bf16 weight cache when present"),
-    # ---------------------------------------------------------------------------------------------- spiking layer
-    _op("spiking_norm", _T + "spiking_prenorm", "h gain eps",
+    # ---------------------------------------------------------------------------------------------- dendritic neuron
+    # layer
+    _op("dendritic_norm", _T + "dendritic_prenorm", "h gain eps",
         "hn bf16, same shape and layout as h", "train",
         doc="h (T, B, D) fp32 with unit last stride, gain (D,) fp32"),
-    _op("spiking_resid_norm", _T + "spiking_prenorm", "h upd gain_next eps",
+    _op("dendritic_resid_norm", _T + "dendritic_prenorm", "h upd gain_next eps",
         "(h_new (T, B, D) fp32, hn_next (T, B, D) bf16)", "train",
         doc="h (T, B, D) fp32, upd (T, B, D) bf16, gain_next (D,) fp32: h_new = h + upd.float(), hn_next = norm(h_new)"),
-    _op("spiking_chunk_scan_soma", "neuronspark.ops.spiking_combined",
+    _op("dendritic_chunk_scan_soma", "neuronspark.ops.dendritic_combined",
         "zxbcdt conv_w conv_b dt_bias A D theta gamma * alpha chunk_size",
         "xs (B*T, 9216) bf16; grads for zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma", "train",
         doc="zxbcdt (B, T, 18832) bf16, conv_w (9472, 4) fp32, conv_b (9472,), dt_bias (144,), A (144,) fp32 = "
             "-exp(A_log), D (144,), theta (9216,), gamma (9216,); alpha = 8.0, chunk_size = 256; T % 256 == 0"),
-    _op("spiking_prenorm_rows", _T + "spiking_step", "x gain eps",
+    _op("dendritic_prenorm_rows", _T + "dendritic_step", "x gain eps",
         "(M, D) bf16", "prefill decode",
         doc="x (M, D) fp32 rows, gain (D,) fp32"),
-    _op("spiking_conv_silu_prefill", _T + "spiking_conv", "xBC conv_w conv_b tail",
+    _op("dendritic_conv_silu_prefill", _T + "dendritic_conv", "xBC conv_w conv_b tail",
         "(xbc (B, T, 9472) bf16 contiguous, tail_new (B, 9472, 3) fp32)", "prefill",
         doc="xBC (B, T, 9472) bf16 strided view of the projection, conv_w (9472, 4), conv_b (9472,), "
             "tail (B, 9472, 3) fp32 = the previous three inputs"),
-    _op("spiking_chunk_scan_prefill", "neuronspark.ops.spiking_prefill",
+    _op("dendritic_chunk_scan_prefill", "neuronspark.ops.dendritic_prefill",
         "x dt A Bm Cm D dt_bias initial_state * chunk_size",
         "(y (B, T, 144, 64) bf16, final_state (B, 144, 64, 128) fp32)", "prefill",
         doc="x (B, T, 144, 64) bf16, dt (B, T, 144) bf16, A (144,) fp32, Bm / Cm (B, T, 1, 128) bf16, D (144,), "
             "dt_bias (144,), initial_state (B, 144, 64, 128) fp32; chunk_size = 256"),
-    _op("spiking_gated_norm_soma", _T + "spiking_gated_norm", "y z theta gamma eps",
+    _op("dendritic_gated_norm_soma", _T + "dendritic_gated_norm", "y z theta gamma eps",
         "x (M, 9216) bf16 = bf16(S(n, theta) * gamma), n the bf16 gated RMSNorm (unit weight)", "prefill",
         doc="y (M, 9216) bf16, z (M, 9216) bf16 (strided view of the projection), theta / gamma (9216,) fp32"),
-    _op("spiking_step_core", _T + "spiking_step",
+    _op("dendritic_step_core", _T + "dendritic_step",
         "proj conv_state ssm_state conv_w conv_b A dt_bias D theta gamma eps",
         "xs (B, 9216) bf16", "decode", mutates="conv_state ssm_state",
         doc="proj (B, 18832) bf16, conv_state (B, 9472, 3) fp32, ssm_state (B, 144, 64, 128) bf16|fp32 (stored in its "
             "own dtype), conv_w (9472, 4), conv_b, A (144,), dt_bias, D, theta (9216,), gamma (9216,)"),
-    _op("spiking_res_add", _T + "spiking_residual", "h upd",
+    _op("dendritic_res_add", _T + "dendritic_residual", "h upd",
         "(T, B, 1536) fp32 contiguous = h + upd.float()", "prefill",
         doc="h (T, B, 1536) fp32 residual stream, upd (T, B, 1536) bf16 with unit last stride (the transposed view of "
             "the (B, T, 1536) W_out output)"),
     # ---------------------------------------------------------------------------------------------- memory norms
-    _op("row_rmsnorm", _T + "mem_norms", "x weight eps",
+    _op("row_rmsnorm", _T + "hippo_norms", "x weight eps",
         "(T, B, C) fp32", "train",
         doc="x (T, B, C) fp32|bf16, weight (C,) fp32 or None (gain 1)"),
-    _op("rmsnorm_rows", _T + "mem_norms", "x eps weight zero_centered out_dtype",
+    _op("rmsnorm_rows", _T + "hippo_norms", "x eps weight zero_centered out_dtype",
         "(M, N) in out_dtype (default x.dtype)", "prefill decode",
         doc="x (M, N) any float, weight (N,) fp32 or None, zero_centered: gain 1 + weight; N % 128 == 0, N <= 4096"),
-    _op("rmsnorm_gate_rows", _T + "mem_norms", "x eps weight gate",
+    _op("rmsnorm_gate_rows", _T + "hippo_norms", "x eps weight gate",
         "(..., N) bf16 = bf16(sigmoid(gate) * zero-centred RMSNorm(x))", "prefill decode",
         doc="x (..., 1536) fp32, weight (1536,) fp32 (zero-centred), gate (..., 1536) bf16 output-gate logits"),
-    _op("out_norm_gate", _T + "mem_norms", "attn w gate_logits eps",
+    _op("out_norm_gate", _T + "hippo_norms", "attn w gate_logits eps",
         "(T, B, 1536) fp32 = zero-centred RMSNorm(attn) * sigmoid(gate_logits)", "train",
         doc="attn (T, B, 1536) fp32, w (1536,) fp32 (zero-centred), gate_logits (T, B, 1536) bf16"),
-    _op("nov_norm", _T + "mem_norms", "r eps",
+    _op("nov_norm", _T + "hippo_norms", "r eps",
         "(T, B, 1536) fp32", "train",
         doc="r (T, B, 1536) bf16"),
     # ---------------------------------------------------------------------------------------------- memory heads / rope
-    _op("pool_heads", _T + "mem_heads", "q k gate gain wbias H dk",
+    _op("pool_heads", _T + "hippo_heads", "q k gate gain wbias H dk",
         "(qn [H x (T, B, dk) fp32], kn [H x (T, B, dk) fp32], g [H x (T, B) fp32])", "train",
         doc="q, k (T, B, 1536) bf16 after RoPE, gate (T, B, 1536) fp32, gain (6,) bf16 match gain, wbias (6,) fp32"),
-    _op("value_split", _T + "mem_heads", "v H dv",
+    _op("value_split", _T + "hippo_heads", "v H dv",
         "H tensors (T, B, dv) bf16", "train",
         doc="v (T, B, 1536) bf16"),
-    _op("silu_rope", _T + "mem_rope", "x cos sin",
+    _op("silu_rope", _T + "hippo_rope", "x cos sin",
         "(T, B, C) bf16 = rope(silu(x))", "train",
         doc="x (T, B, C) bf16, cos / sin (T, 768) bf16"),
-    _op("rope_paired", _T + "mem_rope", "x cos sin",
+    _op("rope_paired", _T + "hippo_rope", "x cos sin",
         "(T, B, C) bf16", "train",
         doc="x (T, B, C) bf16, cos / sin (T, 768) bf16"),
-    _op("rope_interleaved", _T + "mem_rope", "x cos sin",
+    _op("rope_interleaved", _T + "hippo_rope", "x cos sin",
         "(T, B, C) bf16", "prefill",
         doc="x (T, B, C) bf16, cos / sin broadcastable bf16"),
     # ---------------------------------------------------------------------------------------------- memory residual glue
-    _op("value_residual", _T + "mem_residual", "v lam carry glu_add",
+    _op("value_residual", _T + "hippo_residual", "v lam carry glu_add",
         "v' (T, B, 1536) bf16", "train",
-        doc="v (T, B, 1536) bf16, lam fp32 mix, carry (T, B, 1536) bf16 or None (memory layer 0), "
-            "glu_add (T, B, 256) fp32"),
-    _op("zc_center", _T + "mem_residual", "z zcum",
+        doc="v (T, B, 1536) bf16, lam fp32 mix, carry (T, B, 1536) bf16 or None (hippocampal layer 0), glu_add (T, B, "
+            "256) fp32"),
+    _op("zc_center", _T + "hippo_residual", "z zcum",
         "(T, B, C) fp32 contiguous", "train",
         doc="z (T, B, C) fp32, zcum (T, B, C) fp32 running sum"),
-    _op("read_gain_residual", _T + "mem_residual", "h r f",
+    _op("read_gain_residual", _T + "hippo_residual", "h r f",
         "h' (T, B, D) fp32", "train prefill decode",
         doc="h (T, B, D) fp32, r (T, B, D) bf16, f (T, B) fp32 read gain"),
-    _op("pkm_tail", _T + "mem_residual", "h ffn y rho",
+    _op("pkm_tail", _T + "hippo_residual", "h ffn y rho",
         "h_out (T, B, D) fp32", "train prefill decode",
         doc="h (T, B, D) fp32, ffn (T, B, D) bf16, y (T, B, D) bf16, rho (T, B) fp32 (no gradient)"),
     # ---------------------------------------------------------------------------------------------- cumulative sums
@@ -295,9 +296,10 @@ def check_all_signatures(names: Iterable[str] = ()) -> None:
 
 
 # ================================================================================================== memory prefill block
-# The memory layers' prefill operators (copy-detector statistics, extra-query formation, lexical read, value-residual
+# The hippocampal layers' prefill operators (copy-detector statistics, extra-query formation, lexical read,
+# value-residual
 # mix), registered into OPS after the main table.
-_MEMORY_PREFILL_SPECS: List[OpSpec] = [
+_HIPPOCAMPAL_PREFILL_SPECS: List[OpSpec] = [
     _op("copy_stats_prefill", _T + "copy_stats", "ring ring_ptr pos T",
         "(maximum, lse) each (T, B) fp32 contiguous; -inf where a query has no valid slot", "prefill",
         doc="ring (B, W, 96) fp32 unit operands (the call's own written at (ring_ptr + t) % W), ring_ptr (1,) int64 "
@@ -312,12 +314,13 @@ _MEMORY_PREFILL_SPECS: List[OpSpec] = [
             "beta (1,) fp32, eps = 1e-6"),
     _op("vr_mix_prefill", _T + "vr_mix", "v carry gl lam0 glu_add",
         "(T, B, 1536) bf16 contiguous value stream after the value-residual mix and the GLU tail", "prefill",
-        doc="v (T, B, 1536) bf16, carry (T, B, 1536) bf16 or None (memory layer 0), gl (T, B, 6) bf16 gate projection, "
+        doc="v (T, B, 1536) bf16, carry (T, B, 1536) bf16 or None (hippocampal layer 0), gl (T, B, 6) bf16 gate "
+            "projection, "
             "lam0 (1536,) fp32 contiguous static mix, glu_add (T, B, 256) fp32 GLU addend of the last head"),
 ]
-for _mem_spec in _MEMORY_PREFILL_SPECS:
-    if _mem_spec.name in OPS:
-        raise RuntimeError(f"neuronspark.ops.registry: duplicate operator name {_mem_spec.name!r}")
-    OPS[_mem_spec.name] = _mem_spec
-_SPECS.extend(_MEMORY_PREFILL_SPECS)
-del _mem_spec
+for _hippocampal_spec in _HIPPOCAMPAL_PREFILL_SPECS:
+    if _hippocampal_spec.name in OPS:
+        raise RuntimeError(f"neuronspark.ops.registry: duplicate operator name {_hippocampal_spec.name!r}")
+    OPS[_hippocampal_spec.name] = _hippocampal_spec
+_SPECS.extend(_HIPPOCAMPAL_PREFILL_SPECS)
+del _hippocampal_spec

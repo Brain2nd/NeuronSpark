@@ -1,4 +1,4 @@
-"""Model-level lexical n-gram memory: hashed n-gram tables read once per call and shared by the six memory layers.
+"""Model-level lexical n-gram memory: hashed n-gram tables read once per call and shared by the six hippocampal layers.
 
 ``forward(ids (B, T)) -> m (T, B, M)`` fp32 with ``M = sum_n heads_n * dim_n`` (1.27B: 96 + 2 * 16 + 2 * 16 = 160)::
 

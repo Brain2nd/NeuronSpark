@@ -1,4 +1,4 @@
-"""Spiking FFN of the memory layer (state-dict prefix ``snn_ffn.``).
+"""Dendritic FFN of the hippocampal layer (state-dict prefix ``snn_ffn.``).
 
     g   = gate_neuron(bf16(z @ gate_proj^T))        (T, B, D_ff) bf16 spikes (PLIF, scalar launch tau)
     u   = up_neuron(bf16(z @ up_proj^T))            (T, B, D_ff) bf16 spikes
@@ -6,7 +6,7 @@
 
 ``z`` is the spike output of the layer's ``input_neuron2`` (fp32).  Every projection is the fp32-weight-gradient linear
 op (bf16 operands, fp32 accumulation, bf16 output).  The two neurons carry their own membranes in an inference call
-(``gate_state`` / ``up_state``, the ``ffn_gate`` / ``ffn_up`` entries of the layer's ``MemoryState``).
+(``gate_state`` / ``up_state``, the ``ffn_gate`` / ``ffn_up`` entries of the layer's ``HippocampalState``).
 
 Launch (``init="launch"``, global RNG stream, in this order): the four projections' PyTorch default draws, the gate
 neuron's and the up neuron's draws, then gate_proj / up_proj Xavier-uniform, down_proj N(0, out_std), skip_proj 0.

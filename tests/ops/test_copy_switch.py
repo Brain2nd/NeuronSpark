@@ -1,4 +1,4 @@
-"""ops.triton.copy_switch: the copy-switch auxiliary loss of the six memory layers.
+"""ops.triton.copy_switch: the copy-switch auxiliary loss of the six hippocampal layers.
 
 * the aux value and the gradients of every layer's predictor (w, v, b) at B 8 x T 1024, D 1536, against the
   pure-torch reference (boolean (B, T, T) labels, detached predictor logits, pi-weighted binary cross entropy);

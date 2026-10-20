@@ -10,11 +10,11 @@ Checkpoint directory format (written by :func:`save_pretrained`, read by :func:`
   with its own key names, every key under the prefix ``backbone.`` (:data:`PREFIX`)::
 
       backbone.embed_tokens.weight                  (vocab_size, D) fp32, also the tied readout weight (stored once)
-      backbone.layers.{i}.mixer_a.<name>            spiking layer i: pre_norm_gain, in_proj.weight, conv_weight,
-      conv_bias,
+      backbone.layers.{i}.mixer_a.<name>            dendritic neuron layer i: pre_norm_gain, in_proj.weight,
+      conv_weight, conv_bias,
                                                     dt_bias, A_log, D, gamma, W_out, rho (fp32)
-      backbone.layers.{i}.<name>                    memory layer i: 70 fp32 parameters and 11 fp32 persistent buffers
-      backbone.norm.weight                          (D,) fp32 final RMSNorm gain
+      backbone.layers.{i}.<name>                    hippocampal layer i: 70 fp32 parameters and 11 fp32 persistent
+      buffers backbone.norm.weight                          (D,) fp32 final RMSNorm gain
       backbone.balance_stack.projs.{k}.weight       (w_k, D) fp32 readout-balance projections
       backbone.lexical_memory.tables.{k}            (rows, dim) fp32 lexical n-gram tables
       backbone.lexical_memory.hash_{mult,add,wrap}  int64 lexical hash constants
@@ -25,13 +25,13 @@ Checkpoint directory format (written by :func:`save_pretrained`, read by :func:`
 
 :func:`verify_state_dict` requires exactly the model's key set with the model's shapes and dtypes and the configured
 tensor / element counts; the lexical hash constants must equal their recomputation from the hash seed (integers,
-compared exactly), every memory layer's value-residual anchor must equal the configuration's anchor (per-operator rule
-of :mod:`neuronspark.utils.testing`), and every memory layer must carry ``pkm_calibrated = 1`` (the launch
+compared exactly), every hippocampal layer's value-residual anchor must equal the configuration's anchor (per-operator
+rule of :mod:`neuronspark.utils.testing`), and every hippocampal layer must carry ``pkm_calibrated = 1`` (the launch
 calibration's values) unless ``allow_uncalibrated``.
 
 Loading never writes a parameter after ``load_state_dict``: the model is built with ``init="empty"`` (no random draw;
-every PLIF ``b_eta`` comes from the file), loaded strictly, and the memory layers mark their product-key memory ready
-from the loaded ``pkm_calibrated`` buffer.
+every PLIF ``b_eta`` comes from the file), loaded strictly, and the hippocampal layers mark their product-key memory
+ready from the loaded ``pkm_calibrated`` buffer.
 
 Structure follows mamba_ssm ``utils/hf.py`` (``load_config_hf`` / ``load_state_dict_hf``), for local paths.
 """
@@ -138,19 +138,19 @@ def expected_state_layout(config: NeuronSparkConfig) -> Tuple[Dict[str, Tuple[Tu
     return dict(params), dict(buffers)
 
 
-def _expected_anchor(config: NeuronSparkConfig, mem_index: int) -> torch.Tensor:
+def _expected_anchor(config: NeuronSparkConfig, hippocampal_index: int) -> torch.Tensor:
     from neuronspark.modules.pool_attention import value_residual_anchor
 
-    if mem_index == 0:
+    if hippocampal_index == 0:
         return torch.zeros((int(config.D_value),), dtype=torch.float32)
-    pairs = config.memory_pool_value_residual_anchor
-    return value_residual_anchor(pairs[mem_index - 1], int(config.D_value), int(config.memory_heads))
+    pairs = config.hippocampal_pool_value_residual_anchor
+    return value_residual_anchor(pairs[hippocampal_index - 1], int(config.D_value), int(config.hippocampal_heads))
 
 
 def verify_state_dict(config: NeuronSparkConfig, state_dict: Mapping[str, torch.Tensor],
                       allow_uncalibrated: bool = False) -> Dict[str, Any]:
     """Raise unless ``state_dict`` (``backbone.*`` keys) is a complete checkpoint for ``config`` (see the module
-    docstring).  Returns a summary (tensor and element counts, the uncalibrated memory layers)."""
+    docstring).  Returns a summary (tensor and element counts, the uncalibrated hippocampal layers)."""
     params, buffers, hashes = _layout(config)
     want = set(params) | set(buffers)
     have = set(state_dict)
@@ -187,31 +187,31 @@ def verify_state_dict(config: NeuronSparkConfig, state_dict: Mapping[str, torch.
         if got != tuple(values):
             raise RuntimeError(f"checkpoint: {key} {list(got)} differs from the constants of lexical_memory_hash_seed "
                                f"{config.lexical_memory_hash_seed} {list(values)}")
-    for layer_idx in config.memory_layer_ids:
+    for layer_idx in config.hippocampal_layer_ids:
         key = f"{PREFIX}layers.{layer_idx}.pool_value_residual_anchor"
         got = state_dict[key].detach()
-        exp = _expected_anchor(config, config.memory_index(layer_idx)).to(got.device)
+        exp = _expected_anchor(config, config.hippocampal_index(layer_idx)).to(got.device)
         res = match_stats(got.to(torch.float32), exp, key)
         if not res.passed:
-            raise RuntimeError(f"checkpoint: the value-residual anchor differs from the configuration's "
-                               f"memory_pool_value_residual_anchor: {res}")
-    uncalibrated = [i for i in config.memory_layer_ids
+            raise RuntimeError("checkpoint: the value-residual anchor differs from the configuration's "
+                               f"hippocampal_pool_value_residual_anchor: {res}")
+    uncalibrated = [i for i in config.hippocampal_layer_ids
                     if not float(state_dict[f"{PREFIX}layers.{i}.pkm_calibrated"]) > 0.5]
     if uncalibrated and not allow_uncalibrated:
-        raise RuntimeError(f"checkpoint: memory layers {uncalibrated} carry pkm_calibrated = 0 (the product-key memory "
-                           "was never calibrated); pass allow_uncalibrated=True to load it for calibration")
+        raise RuntimeError(f"checkpoint: hippocampal layers {uncalibrated} carry pkm_calibrated = 0 (the product-key "
+                           "memory was never calibrated); pass allow_uncalibrated=True to load it for calibration")
     return {"state_tensors": n_param + n_buf, "parameter_tensors": n_param, "parameter_elements": e_param,
-            "buffer_tensors": n_buf, "buffer_elements": e_buf, "uncalibrated_memory_layers": uncalibrated}
+            "buffer_tensors": n_buf, "buffer_elements": e_buf, "uncalibrated_hippocampal_layers": uncalibrated}
 
 
 # ------------------------------------------------------------------------------------------------ models
 def load_pretrained(path: _PathLike, device: Union[str, torch.device] = "cuda", allow_uncalibrated: bool = False,
-                    impl: str = "kernel", inference_spiking_state_dtype: Optional[str] = None,
+                    impl: str = "kernel", inference_dendritic_state_dtype: Optional[str] = None,
                     model_cls: Optional[Type] = None):
     """Build and load a :class:`NeuronSparkLMHeadModel` (or ``model_cls``) from a checkpoint directory.
 
-    1. :func:`load_config`; ``inference_spiking_state_dtype`` (``"bfloat16"`` / ``"float32"``) replaces the
-       configuration's spiking-layer state storage option when given;
+    1. :func:`load_config`; ``inference_dendritic_state_dtype`` (``"bfloat16"`` / ``"float32"``) replaces the
+       configuration's dendritic-layer state storage option when given;
     2. the tensors onto ``device``, :func:`verify_state_dict`;
     3. the model built with ``init="empty"`` on ``device`` (fp32, no random draw), ``load_state_dict(strict=True)``;
     4. post-load checks: the lexical hash buffers, the product-key memories marked ready, fp32 parameters.
@@ -221,8 +221,8 @@ def load_pretrained(path: _PathLike, device: Union[str, torch.device] = "cuda", 
     if model_cls is None:
         from neuronspark.models.neuronspark_lm import NeuronSparkLMHeadModel as model_cls
     config = load_config(path)
-    if inference_spiking_state_dtype is not None:
-        config = dataclasses.replace(config, inference_spiking_state_dtype=str(inference_spiking_state_dtype))
+    if inference_dendritic_state_dtype is not None:
+        config = dataclasses.replace(config, inference_dendritic_state_dtype=str(inference_dendritic_state_dtype))
     sd = load_state_dict(path, device=device)
     verify_state_dict(config, sd, allow_uncalibrated=allow_uncalibrated)
     model = model_cls(config, device=device, dtype=torch.float32, impl=impl, init="empty")
@@ -230,11 +230,11 @@ def load_pretrained(path: _PathLike, device: Union[str, torch.device] = "cuda", 
     del sd
     backbone = model.backbone
     backbone.lexical_memory.check_hash_buffers()
-    for layer in backbone.memory_layers:
+    for layer in backbone.hippocampal_layers:
         calibrated = float(layer.pkm_calibrated) > 0.5
         if calibrated and not layer.pkm_ready:
-            raise RuntimeError(f"load_pretrained: memory layer {layer.layer_idx} holds pkm_calibrated = 1 but was not "
-                               "marked ready by the state-dict load")
+            raise RuntimeError(f"load_pretrained: hippocampal layer {layer.layer_idx} holds pkm_calibrated = 1 but was "
+                               "not marked ready by the state-dict load")
     check_fp32_parameters(model)
     return model
 

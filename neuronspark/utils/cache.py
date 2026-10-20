@@ -7,16 +7,16 @@ decode step stays valid across replays and across :meth:`InferenceParams.reset`.
 
 State per row (W = ``max_seqlen``, the ring capacity shared by every ring; 1.27B shapes):
 
-* ``SpikingState`` (18 spiking layers): ``conv`` (9472, 3) fp32, the last three conv inputs (lags t-3, t-2, t-1; their
-  values are bf16-exact); ``ssm`` (144, 64, 128) in the cache's spiking-layer state dtype (bf16 by default, fp32 as the
-  option).
-* ``MemoryState`` (6 memory layers): ``conv_hist`` (4608, 3) fp32 qkv conv history; ``pool_k`` / ``pool_gv``
+* ``DendriticState`` (18 dendritic neuron layers): ``conv`` (9472, 3) fp32, the last three conv inputs (lags t-3, t-2,
+  t-1; their values are bf16-exact); ``ssm`` (144, 64, 128) in the cache's dendritic-layer state dtype (bf16 by default,
+  fp32 as the option).
+* ``HippocampalState`` (6 hippocampal layers): ``conv_hist`` (4608, 3) fp32 qkv conv history; ``pool_k`` / ``pool_gv``
   (6, W, 256) bf16 key and gated-value rings; ``pool_cum`` (6, W) fp32 absolute write clocks (+inf = empty slot);
   ``pool_run`` (6,) fp32 carried clock; ``vr_sum`` (1536,) fp32 running sum of the value-residual gate input; the four
   PLIF membranes (``gate_neuron``, ``input_neuron2`` with its running input sum, ``ffn_gate``, ``ffn_up``).
 * model level: ``LexicalState.win`` (2,) int64 last n_max - 1 ids; ``InductionState.keys`` (W, 4) int64 ring of the
   four ids preceding each written slot and ``win`` (4,) the last four ids; ``CopyState.u`` (W, 96) fp32 ring of the
-  unit order-1 lexical vectors (one ring for all memory layers: the operand is model level).
+  unit order-1 lexical vectors (one ring for all hippocampal layers: the operand is model level).
 * counters: ``pos`` (B,) int64 tokens consumed per row (RoPE positions, running-mean counts, live ring length) and
   ``ring_ptr`` (1,) int64: the next slot of every ring is ``ring_ptr % W``.
 
@@ -24,8 +24,9 @@ Reset values (:meth:`InferenceParams.reset`, in place): zeros, except ``pool_cum
 the pad id ``V`` (= vocab_size).  ``pool_k`` / ``pool_gv`` are zero at allocation and are not reset: a slot is read only
 where its clock is finite.
 
-The spiking-layer state dtype is the model's one numerics option (``NeuronSparkConfig.inference_spiking_state_dtype``,
-overridable per allocation); the cache prints one line per process naming the dtype in use.
+The dendritic-layer state dtype is the model's one numerics option
+(``NeuronSparkConfig.inference_dendritic_state_dtype``, overridable per allocation); the cache prints one line per
+process naming the dtype in use.
 """
 from __future__ import annotations
 
@@ -36,15 +37,15 @@ from typing import Dict, Iterator, List, Optional, Tuple, Union
 import torch
 
 __all__ = [
-    "SpikingState",
+    "DendriticState",
     "PLIFState",
-    "MemoryState",
+    "HippocampalState",
     "LexicalState",
     "InductionState",
     "CopyState",
     "InferenceParams",
-    "resolve_spiking_state_dtype",
-    "announce_spiking_state_dtype",
+    "resolve_dendritic_state_dtype",
+    "announce_dendritic_state_dtype",
     "RING_MULTIPLE",
     "DEFAULT_MAX_SEQLEN",
     "MAX_DECODE_BATCH",
@@ -57,29 +58,29 @@ DEFAULT_MAX_SEQLEN = 2048
 # largest decode batch the decode kernels' fixed launch tables cover
 MAX_DECODE_BATCH = 32
 
-_SPIKING_STATE_DTYPES = {"bfloat16": torch.bfloat16, "float32": torch.float32}
+_DENDRITIC_STATE_DTYPES = {"bfloat16": torch.bfloat16, "float32": torch.float32}
 # documented first-call cache: the dtypes already announced in this process
 _ANNOUNCED: set = set()
 
 
-def resolve_spiking_state_dtype(value: Union[str, torch.dtype]) -> torch.dtype:
+def resolve_dendritic_state_dtype(value: Union[str, torch.dtype]) -> torch.dtype:
     """``"bfloat16"`` / ``"float32"`` (or the torch dtypes) -> torch dtype; anything else raises."""
     if isinstance(value, torch.dtype):
         if value not in (torch.bfloat16, torch.float32):
-            raise ValueError(f"spiking-layer state dtype must be torch.bfloat16 or torch.float32, got {value}")
+            raise ValueError(f"dendritic-layer state dtype must be torch.bfloat16 or torch.float32, got {value}")
         return value
-    if value not in _SPIKING_STATE_DTYPES:
-        raise ValueError(f"spiking-layer state dtype must be one of {tuple(_SPIKING_STATE_DTYPES)}, got {value!r}")
-    return _SPIKING_STATE_DTYPES[value]
+    if value not in _DENDRITIC_STATE_DTYPES:
+        raise ValueError(f"dendritic-layer state dtype must be one of {tuple(_DENDRITIC_STATE_DTYPES)}, got {value!r}")
+    return _DENDRITIC_STATE_DTYPES[value]
 
 
-def announce_spiking_state_dtype(dtype: torch.dtype) -> None:
-    """Print, once per process and dtype, which spiking-layer state storage the inference cache uses."""
+def announce_dendritic_state_dtype(dtype: torch.dtype) -> None:
+    """Print, once per process and dtype, which dendritic-layer state storage the inference cache uses."""
     name = "bfloat16" if dtype == torch.bfloat16 else "float32"
     if name in _ANNOUNCED:
         return
     _ANNOUNCED.add(name)
-    print(f"neuronspark: inference spiking-layer state stored in {name} (default bfloat16; option float32)",
+    print(f"neuronspark: inference dendritic-layer state stored in {name} (default bfloat16; option float32)",
           file=sys.stderr, flush=True)
 
 
@@ -89,18 +90,19 @@ def _zeros(shape, dtype, device) -> torch.Tensor:
 
 # ------------------------------------------------------------------------------------------------ per-layer states
 @dataclass
-class SpikingState:
-    """Recurrent state of one spiking layer: ``conv`` (B, conv_dim, width - 1) fp32, ``ssm`` (B, nheads, head_dim,
-    state_size) in the spiking-layer state dtype."""
+class DendriticState:
+    """Recurrent state of one dendritic neuron layer: ``conv`` (B, conv_dim, width - 1) fp32, ``ssm`` (B, nheads,
+    head_dim,
+    state_size) in the dendritic-layer state dtype."""
 
     conv: torch.Tensor
     ssm: torch.Tensor
 
     @classmethod
     def allocate(cls, batch_size: int, conv_dim: int, conv_width: int, nheads: int, head_dim: int, state_size: int,
-                 ssm_dtype: torch.dtype, device: torch.device) -> "SpikingState":
+                 ssm_dtype: torch.dtype, device: torch.device) -> "DendriticState":
         return cls(conv=_zeros((batch_size, conv_dim, conv_width - 1), torch.float32, device),
-                   ssm=_zeros((batch_size, nheads, head_dim, state_size), resolve_spiking_state_dtype(ssm_dtype),
+                   ssm=_zeros((batch_size, nheads, head_dim, state_size), resolve_dendritic_state_dtype(ssm_dtype),
                               device))
 
     def reset(self) -> None:
@@ -137,8 +139,8 @@ class PLIFState:
 
 
 @dataclass
-class MemoryState:
-    """Recurrent state of one memory layer (see the module docstring for shapes)."""
+class HippocampalState:
+    """Recurrent state of one hippocampal layer (see the module docstring for shapes)."""
 
     conv_hist: torch.Tensor
     pool_k: torch.Tensor
@@ -154,7 +156,7 @@ class MemoryState:
     @classmethod
     def allocate(cls, batch_size: int, max_seqlen: int, *, qkv_dim: int, conv_width: int, heads: int,
                  key_head_dim: int, value_head_dim: int, value_dim: int, d_model: int, d_ff: int,
-                 device: torch.device) -> "MemoryState":
+                 device: torch.device) -> "HippocampalState":
         B, W = int(batch_size), int(max_seqlen)
         st = cls(
             conv_hist=_zeros((B, qkv_dim, conv_width - 1), torch.float32, device),
@@ -248,20 +250,20 @@ class CopyState:
 # ------------------------------------------------------------------------------------------------ the cache
 @dataclass
 class InferenceParams:
-    """The whole inference cache (mamba's ``InferenceParams`` plus the NeuronSpark state).
+    """The whole inference cache: the per-layer states plus the position and ring counters.
 
     ``max_seqlen`` is the ring capacity W (a multiple of 512, at most the RoPE table length); ``seqlen_offset`` counts
     the tokens consumed on the host side (it only selects prefill vs decode and checks capacity; captured graphs read
-    the device counters ``pos`` / ``ring_ptr``).  ``layers`` maps a layer index to its ``SpikingState`` /
-    ``MemoryState``.
+    the device counters ``pos`` / ``ring_ptr``).  ``layers`` maps a layer index to its ``DendriticState`` /
+    ``HippocampalState``.
     """
 
     max_seqlen: int
     max_batch_size: int
     pos: torch.Tensor
     ring_ptr: torch.Tensor
-    spiking_state_dtype: torch.dtype
-    layers: Dict[int, Union[SpikingState, MemoryState]]
+    dendritic_state_dtype: torch.dtype
+    layers: Dict[int, Union[DendriticState, HippocampalState]]
     lexical: LexicalState
     induction: InductionState
     copy: CopyState
@@ -281,13 +283,13 @@ class InferenceParams:
             raise ValueError(f"InferenceParams: pos must be ({B},) int64, got {tuple(self.pos.shape)} {self.pos.dtype}")
         if self.ring_ptr.shape != (1,) or self.ring_ptr.dtype != torch.int64:
             raise ValueError("InferenceParams: ring_ptr must be (1,) int64")
-        self.spiking_state_dtype = resolve_spiking_state_dtype(self.spiking_state_dtype)
+        self.dendritic_state_dtype = resolve_dendritic_state_dtype(self.dendritic_state_dtype)
         for i, st in self.layers.items():
-            if isinstance(st, SpikingState) and st.ssm.dtype != self.spiking_state_dtype:
-                raise ValueError(f"InferenceParams: layer {i} spiking-layer state is {st.ssm.dtype}, the cache "
-                                 f"declares {self.spiking_state_dtype}")
+            if isinstance(st, DendriticState) and st.ssm.dtype != self.dendritic_state_dtype:
+                raise ValueError(f"InferenceParams: layer {i} dendritic-layer state is {st.ssm.dtype}, the cache "
+                                 f"declares {self.dendritic_state_dtype}")
         if self.announce:
-            announce_spiking_state_dtype(self.spiking_state_dtype)
+            announce_dendritic_state_dtype(self.dendritic_state_dtype)
 
     @staticmethod
     def allocate_counters(batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -306,7 +308,7 @@ class InferenceParams:
                                f"capacity {self.max_seqlen} (allocate the cache with a larger max_seqlen)")
 
     def reset(self, max_seqlen: Optional[int] = None, max_batch_size: Optional[int] = None) -> None:
-        """Row-start state in place (captured graphs stay valid).  Mamba's call form ``reset(max_length, batch_size)``
+        """Row-start state in place (captured graphs stay valid).  The call form ``reset(max_length, batch_size)``
         is allowed when the length fits the ring capacity and the batch size equals the allocated one: the cache is
         never resized in place."""
         if (max_seqlen is not None and int(max_seqlen) > int(self.max_seqlen)) or \

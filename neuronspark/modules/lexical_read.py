@@ -1,4 +1,4 @@
-"""Lexical read-out of the memory layer: the first step of every memory layer, a gated read of the model-level
+"""Lexical read-out of the hippocampal layer: the first step of every hippocampal layer, a gated read of the model-level
 lexical n-gram vector m (:mod:`neuronspark.modules.lexical_memory`).
 
     hn    = h rsqrt(mean(h^2) + 1e-6)                                  fp32, no gain
@@ -40,7 +40,8 @@ LEX_EPS = 1e-6
 
 
 class LexicalReadMixin:
-    """Mixin of :class:`neuronspark.modules.memory_layer.MemoryLayer` (the lexical read, step 1 of the layer)."""
+    """Mixin of :class:`neuronspark.modules.hippocampal_layer.HippocampalLayer`: the lexical read, step 1 of the
+    layer."""
 
     def _build_lexical_read(self, config, layer_idx: int, device, dtype, init: str) -> None:
         D = int(config.D)
@@ -72,8 +73,8 @@ class LexicalReadMixin:
     def _check_lex(self, h: torch.Tensor, lex: torch.Tensor) -> None:
         if (not isinstance(lex, torch.Tensor) or tuple(lex.shape[:2]) != tuple(h.shape[:2])
                 or int(lex.shape[-1]) != self.lex_dim or lex.dtype != torch.float32):
-            raise RuntimeError("lexical read: the memory layer needs the model-level lexical vector of this call, fp32 "
-                               f"(T, B, {self.lex_dim}) for h {tuple(h.shape)}, got "
+            raise RuntimeError("lexical read: the hippocampal layer needs the model-level lexical vector of this call, "
+                               f"fp32 (T, B, {self.lex_dim}) for h {tuple(h.shape)}, got "
                                f"{None if not isinstance(lex, torch.Tensor) else (tuple(lex.shape), lex.dtype)}")
 
     def _lexical_gate(self, q_raw: torch.Tensor, k_raw: torch.Tensor) -> torch.Tensor:

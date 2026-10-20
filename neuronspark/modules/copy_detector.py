@@ -10,7 +10,7 @@ positions are s <= t - 2 (source s proposes the continuation after x_{s-1})::
     lse_t       = logsumexp_s(32 score[t, s])   (the logits padded with -inf to a multiple of 4)
     pi_t        = exp(32 maximum_t - logaddexp(32 tau, lse_t))           tau = the layer's pkm_copy_tau
 
-``pi`` is 0 at t < 2.  The operand is the same for the six memory layers, so the statistics ``(maximum, lse)`` are
+``pi`` is 0 at t < 2.  The operand is the same for the six hippocampal layers, so the statistics ``(maximum, lse)`` are
 computed once per call (:func:`copy_stats_whole_row` / :func:`copy_stats_session`) and every layer applies
 :func:`copy_pi` with its own calibrated ``tau``: the same operations on the same operands as a per-layer detector.
 
@@ -135,7 +135,7 @@ def copy_stats_session(lex_t: torch.Tensor, state: CopyState, ring_ptr: torch.Te
 
 @torch.no_grad()
 def copy_pi(stats: CopyStats, tau: Union[torch.Tensor, float]) -> torch.Tensor:
-    """Copy confidence ``exp(32 maximum - logaddexp(32 tau, lse))`` (T, B) fp32 of one memory layer."""
+    """Copy confidence ``exp(32 maximum - logaddexp(32 tau, lse))`` (T, B) fp32 of one hippocampal layer."""
     lse = stats.lse
     if not isinstance(tau, torch.Tensor):
         tau = torch.tensor(float(tau), dtype=torch.float32, device=lse.device)

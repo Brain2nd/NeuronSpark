@@ -1,38 +1,40 @@
 """The NeuronSpark language model: the backbone :class:`NeuronSparkModel` and the tied-readout LM head model
-:class:`NeuronSparkLMHeadModel` (the counterparts of mamba_ssm's ``MixerModel`` / ``MambaLMHeadModel``).
+:class:`NeuronSparkLMHeadModel`.
 
 Backbone (state-dict prefix ``backbone.``)::
 
     x    = embed_tokens(ids)                                  (T, B, D) fp32 residual stream
-    lex  = lexical_memory(ids)                                (T, B, 160) fp32, model level, read by every memory layer
-    ind  = induction match matrices (orders 2, 3, 4)          bool, model level
-    copy = copy-detector statistics (maximum, lse)            (T, B) fp32 each, model level
-    for i in 0 .. 23:   x = SpikingLayer_i(x)                      18 spiking layers (i not in 3, 7, 11, 15, 19, 23)
-                        x, carry = MemoryLayer_i(x, lex, ind, copy, carry)     6 memory layers (3:1 layout)
+    lex  = lexical_memory(ids)                                (T, B, 160) fp32, model level, read by every hippocampal
+    layer ind  = induction match matrices (orders 2, 3, 4)          bool, model level copy = copy-detector statistics
+    (maximum, lse)            (T, B) fp32 each, model level for i in 0 .. 23:   x = DendriticNeuronLayer_i(x)
+    18 dendritic neuron layers (i not in 3, 7, 11, 15, 19, 23)
+                        x, carry = HippocampalLayer_i(x, lex, ind, copy, carry)     6 hippocampal layers (3:1 layout)
     h    = norm(x)                                            RMSNorm, eps 1e-6
     returned as (B, T, D) fp32
 
 LM head: ``logits = bf16(h @ E^T)`` with the tied embedding ``E = backbone.embed_tokens.weight`` (151669 x 1536), then
 the readout balance tiled across the vocabulary (width 16, then width 32, one bf16 rounding per width).  Training loss
 (:meth:`NeuronSparkLMHeadModel.loss`): the mean token cross entropy of the balanced logits over the valid targets plus
-the copy-switch auxiliary loss of the six memory layers' novelty predictors (weight ``memory_copy_novelty_gate_aux``).
+the copy-switch auxiliary loss of the six hippocampal layers' novelty predictors (weight
+``hippocampal_copy_novelty_gate_aux``).
 
 Regimes (decided in :meth:`NeuronSparkModel.forward`, one code path each):
 
 * ``inference_params`` None -> whole row (training, and teacher-forced scoring), under ``regime("train")`` (bf16
-  autocast, TF32 on for fp32 matmuls).  T must be a multiple of ``spiking_chunk_size`` (256) on the kernel path; the
-  residual stream is the (T, B, D) view of the contiguous (B, T, D) embedding output; consecutive spiking layers join
-  one layer's residual addition with the next layer's pre-norm (``spiking_resid_norm``) unless activation checkpointing
-  is active. Works with or without autograd.
+  autocast, TF32 on for fp32 matmuls).  T must be a multiple of ``dendritic_chunk_size`` (256) on the kernel path; the
+  residual stream is the (T, B, D) view of the contiguous (B, T, D) embedding output; consecutive dendritic neuron
+  layers join one layer's residual addition with the next layer's pre-norm (``dendritic_resid_norm``) unless activation
+  checkpointing is active. Works with or without autograd.
 * ``inference_params`` given -> inference under ``regime("infer")`` (bf16 autocast, TF32 off, no reduced-precision bf16
   GEMM reductions) and ``torch.no_grad()``: T >= 2 is a prefill, T == 1 a decode step.  The stream is made contiguous
   T-major for T >= 2; the model-level session state (lexical window, induction keys ring, copy-operand ring) and every
   layer's carried state are read and updated in place; the final norm is ``rmsnorm_rows``; the device counters ``pos``
   / ``ring_ptr`` advance by T in place (CUDA-graph replay safe) and the host count ``seqlen_offset`` advances by T.
 
-Activation checkpointing (``gradient_checkpointing = True``, whole row with autograd): every spiking layer is recomputed
-in backward (``use_reentrant=False, preserve_rng_state=False``), the memory layers stay resident, and the spiking-layer
--> spiking-layer join is not used (each checkpointed spiking layer forms its own pre-norm).
+Activation checkpointing (``gradient_checkpointing = True``, whole row with autograd): every dendritic neuron layer is
+recomputed in backward (``use_reentrant=False, preserve_rng_state=False``), the hippocampal layers stay resident, and
+the dendritic-layer -> dendritic-layer join is not used (each checkpointed dendritic neuron layer forms its own
+pre-norm).
 
 Inference weights: :meth:`NeuronSparkLMHeadModel.prepare_inference` attaches a bf16 copy to every projection weight
 (the tied embedding included); inference GEMMs read it (``neuronspark.ops.linear``).  A weight modified after the copy
@@ -62,17 +64,17 @@ from neuronspark.models.config_neuronspark import NeuronSparkConfig
 from neuronspark.modules.copy_detector import allocate_copy_state, copy_stats_session, copy_stats_whole_row
 from neuronspark.modules.induction import allocate_induction_state, induction_match_matrices, induction_session_match
 from neuronspark.modules.lexical_memory import LexicalMemory
-from neuronspark.modules.memory_layer import MemoryLayer
+from neuronspark.modules.hippocampal_layer import HippocampalLayer
 from neuronspark.modules.norms import RMSNorm
 from neuronspark.modules.readout_balance import ReadoutBalance
-from neuronspark.modules.spiking_mixer import SpikingLayer
+from neuronspark.modules.dendritic_neuron_layer import DendriticNeuronLayer
 from neuronspark.ops.linear import cache_bf16_, drop_bf16_
 from neuronspark.utils.cache import (
     DEFAULT_MAX_SEQLEN,
     MAX_DECODE_BATCH,
     RING_MULTIPLE,
     InferenceParams,
-    resolve_spiking_state_dtype,
+    resolve_dendritic_state_dtype,
 )
 from neuronspark.utils.generation import GenerationMixin
 from neuronspark.utils.precision import check_fp32_parameters, regime
@@ -135,8 +137,8 @@ class NeuronSparkModel(nn.Module):
     """``NeuronSparkModel(config, device=None, dtype=torch.float32, impl="kernel", init="launch")``.
 
     Attributes (state-dict keys relative to the backbone): ``embed_tokens`` (``nn.Embedding(V, D)``, the tied readout
-    weight as well), ``layers`` (24 :class:`SpikingLayer` / :class:`MemoryLayer`), ``norm`` (``RMSNorm(D, 1e-6)``),
-    ``balance_stack`` (:class:`ReadoutBalance`, widths (16, 32)), ``lexical_memory`` (:class:`LexicalMemory`).
+    weight as well), ``layers`` (24 :class:`DendriticNeuronLayer` / :class:`HippocampalLayer`), ``norm`` (``RMSNorm(D,
+    1e-6)``), ``balance_stack`` (:class:`ReadoutBalance`, widths (16, 32)), ``lexical_memory`` (:class:`LexicalMemory`).
 
     ``impl``: ``"kernel"`` (the fused operators) or ``"ref"`` (the pure-torch references, same signatures).
     ``dtype``: the parameters are fp32 masters; any other value raises.
@@ -167,10 +169,10 @@ class NeuronSparkModel(nn.Module):
             self.embed_tokens = nn.Embedding(V, D, _weight=torch.empty((V, D), **f32))
         layers: List[nn.Module] = []
         for i in range(int(config.num_layers)):
-            if config.is_memory_layer(i):
-                layers.append(MemoryLayer(config, i, device=device, dtype=torch.float32, impl=impl, init=init))
+            if config.is_hippocampal_layer(i):
+                layers.append(HippocampalLayer(config, i, device=device, dtype=torch.float32, impl=impl, init=init))
             else:
-                layers.append(SpikingLayer(config, i, device=device, dtype=torch.float32, impl=impl, init=init))
+                layers.append(DendriticNeuronLayer(config, i, device=device, dtype=torch.float32, impl=impl, init=init))
         self.layers = nn.ModuleList(layers)
         self.norm = RMSNorm(D, eps=float(config.rms_norm_eps), device=device, dtype=torch.float32,
                             init="default" if launch else "empty")
@@ -186,14 +188,14 @@ class NeuronSparkModel(nn.Module):
 
     # ------------------------------------------------------------------------------------------------ structure
     @property
-    def memory_layers(self) -> List[MemoryLayer]:
-        """The six memory layers in depth order."""
-        return [m for m in self.layers if isinstance(m, MemoryLayer)]
+    def hippocampal_layers(self) -> List[HippocampalLayer]:
+        """The six hippocampal layers in depth order."""
+        return [m for m in self.layers if isinstance(m, HippocampalLayer)]
 
     @property
-    def spiking_layers(self) -> List[SpikingLayer]:
-        """The 18 spiking layers in depth order."""
-        return [m for m in self.layers if isinstance(m, SpikingLayer)]
+    def dendritic_layers(self) -> List[DendriticNeuronLayer]:
+        """The 18 dendritic neuron layers in depth order."""
+        return [m for m in self.layers if isinstance(m, DendriticNeuronLayer)]
 
     def parameter_versions(self) -> Dict[str, int]:
         """``{name: version counter}`` of every parameter (an in-place write bumps the counter)."""
@@ -201,8 +203,8 @@ class NeuronSparkModel(nn.Module):
 
     def extra_repr(self) -> str:
         c = self.config
-        return (f"vocab_size={c.vocab_size}, D={c.D}, layers={c.num_layers} (spiking {c.n_spiking_layers}, "
-                f"memory {c.n_memory_layers} at {c.memory_layer_ids}), impl={self.impl!r}")
+        return (f"vocab_size={c.vocab_size}, D={c.D}, layers={c.num_layers} (dendritic {c.n_dendritic_layers}, memory "
+                f"{c.n_hippocampal_layers} at {c.hippocampal_layer_ids}), impl={self.impl!r}")
 
     # ------------------------------------------------------------------------------------------------ forward
     def forward(self, input_ids: torch.Tensor, inference_params: Optional[InferenceParams] = None,
@@ -227,38 +229,38 @@ class NeuronSparkModel(nn.Module):
     def _forward_whole_row(self, ids: torch.Tensor, aux_out: Optional[List[tuple]], calib) -> torch.Tensor:
         cfg = self.config
         B, T = (int(s) for s in ids.shape)
-        if self.impl == "kernel" and T % int(cfg.spiking_chunk_size) != 0:
+        if self.impl == "kernel" and T % int(cfg.dendritic_chunk_size) != 0:
             raise RuntimeError(f"NeuronSparkModel: the whole-row regime runs full scan chunks: T = {T} is not a "
-                               f"multiple of spiking_chunk_size {cfg.spiking_chunk_size} (pad the rows, or use an "
+                               f"multiple of dendritic_chunk_size {cfg.dendritic_chunk_size} (pad the rows, or use an "
                                "inference cache)")
         if aux_out is not None and not isinstance(aux_out, list):
             raise TypeError("NeuronSparkModel: aux_out must be a list")
         with regime("train"):
             x = self.embed_tokens(ids).transpose(0, 1)                       # (T, B, D) fp32, B-major storage
             lex = self.lexical_memory(ids)                                   # (T, B, 160) fp32
-            ind = induction_match_matrices(ids, cfg.memory_induction_bias_orders, pad=int(cfg.vocab_size))
+            ind = induction_match_matrices(ids, cfg.hippocampal_induction_bias_orders, pad=int(cfg.vocab_size))
             copy = copy_stats_whole_row(lex, tuple(cfg.lexical_order1_slice))
             ckpt = bool(self.gradient_checkpointing) and torch.is_grad_enabled()
             carry: Optional[torch.Tensor] = None
             hn: Optional[torch.Tensor] = None
             n_layers = len(self.layers)
             for i, layer in enumerate(self.layers):
-                if isinstance(layer, MemoryLayer):
+                if isinstance(layer, HippocampalLayer):
                     if hn is not None:
-                        raise RuntimeError(f"NeuronSparkModel: layer {i} is a memory layer, but the previous spiking "
-                                           "layer prepared a spiking-layer pre-norm for it")
-                    # memory layers stay resident (never checkpointed)
+                        raise RuntimeError(f"NeuronSparkModel: layer {i} is a hippocampal layer, but the previous "
+                                           "dendritic layer prepared a dendritic-layer pre-norm for it")
+                    # hippocampal layers stay resident (never checkpointed)
                     x, carry = layer(x, lex=lex, ind=ind, copy=copy, carry=carry, aux_out=aux_out, calib=calib)
                     continue
                 if ckpt:
                     x, _ = checkpoint(layer, x, None, use_reentrant=False, preserve_rng_state=False)
                     continue
                 nxt = self.layers[i + 1] if i + 1 < n_layers else None
-                gain = nxt.mixer_a.pre_norm_gain if isinstance(nxt, SpikingLayer) else None
+                gain = nxt.mixer_a.pre_norm_gain if isinstance(nxt, DendriticNeuronLayer) else None
                 x, hn = layer(x, hn=hn, next_norm_gain=gain)
             if hn is not None:
-                raise RuntimeError("NeuronSparkModel: the last spiking layer prepared a pre-norm that no layer "
-                                   "consumed")
+                raise RuntimeError("NeuronSparkModel: the last dendritic neuron layer prepared a pre-norm that no "
+                                   "layer consumed")
             x = self.norm(x)
         return x.transpose(0, 1)                                             # (B, T, D)
 
@@ -282,11 +284,11 @@ class NeuronSparkModel(nn.Module):
             if T > 1:
                 x = x.contiguous()                                           # T-major stream for the prefill
             lex = self.lexical_memory.session_vector(ids, ip.lexical)
-            ind = induction_session_match(ids, ip.induction, ip.ring_ptr, W, cfg.memory_induction_bias_orders)
+            ind = induction_session_match(ids, ip.induction, ip.ring_ptr, W, cfg.hippocampal_induction_bias_orders)
             copy = copy_stats_session(lex, ip.copy, ip.ring_ptr, ip.pos, W, tuple(cfg.lexical_order1_slice))
             carry: Optional[torch.Tensor] = None
             for layer in self.layers:
-                if isinstance(layer, MemoryLayer):
+                if isinstance(layer, HippocampalLayer):
                     x, carry = layer(x, lex=lex, ind=ind, copy=copy, carry=carry, inference_params=ip)
                 else:
                     x, _ = layer(x, ip)
@@ -299,10 +301,10 @@ class NeuronSparkModel(nn.Module):
 
     # ------------------------------------------------------------------------------------------------ cache
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int = DEFAULT_MAX_SEQLEN,
-                                 spiking_state_dtype: Optional[Union[str, torch.dtype]] = None,
+                                 dendritic_state_dtype: Optional[Union[str, torch.dtype]] = None,
                                  device: Optional[Union[str, torch.device]] = None) -> InferenceParams:
         """A zero (row-start) cache for ``batch_size`` rows with ring capacity ``max_seqlen`` (a multiple of 512, at
-        most ``rope_max_seq_len``).  ``spiking_state_dtype`` None takes ``config.inference_spiking_state_dtype``."""
+        most ``rope_max_seq_len``).  ``dendritic_state_dtype`` None takes ``config.inference_dendritic_state_dtype``."""
         cfg = self.config
         B, W = int(batch_size), int(max_seqlen)
         if not 1 <= B <= MAX_DECODE_BATCH:
@@ -310,15 +312,15 @@ class NeuronSparkModel(nn.Module):
         if W <= 0 or W % RING_MULTIPLE != 0 or W > int(cfg.rope_max_seq_len):
             raise ValueError(f"allocate_inference_cache: max_seqlen (ring capacity) must be a positive multiple of "
                              f"{RING_MULTIPLE} and at most rope_max_seq_len {cfg.rope_max_seq_len}, got {W}")
-        dt = resolve_spiking_state_dtype(cfg.inference_spiking_state_dtype if spiking_state_dtype is None
-                                         else spiking_state_dtype)
+        dt = resolve_dendritic_state_dtype(cfg.inference_dendritic_state_dtype if dendritic_state_dtype is None
+                                         else dendritic_state_dtype)
         dev = self.embed_tokens.weight.device if device is None else torch.device(device)
         layers = {}
         for i, layer in enumerate(self.layers):
-            if isinstance(layer, MemoryLayer):
+            if isinstance(layer, HippocampalLayer):
                 layers[i] = layer.allocate_inference_cache(B, W, device=dev)
             else:
-                layers[i] = layer.allocate_inference_cache(B, W, spiking_state_dtype=dt, device=dev)
+                layers[i] = layer.allocate_inference_cache(B, W, dendritic_state_dtype=dt, device=dev)
         s0, s1 = (int(v) for v in cfg.lexical_order1_slice)
         pos, ring_ptr = InferenceParams.allocate_counters(B, dev)
         return InferenceParams(
@@ -326,10 +328,10 @@ class NeuronSparkModel(nn.Module):
             max_batch_size=B,
             pos=pos,
             ring_ptr=ring_ptr,
-            spiking_state_dtype=dt,
+            dendritic_state_dtype=dt,
             layers=layers,
             lexical=self.lexical_memory.allocate_inference_cache(B, device=dev),
-            induction=allocate_induction_state(B, W, cfg.memory_induction_bias_orders, pad=int(cfg.vocab_size),
+            induction=allocate_induction_state(B, W, cfg.hippocampal_induction_bias_orders, pad=int(cfg.vocab_size),
                                                device=dev),
             copy=allocate_copy_state(B, W, dim=s1 - s0, device=dev),
             rope_max_seq_len=int(cfg.rope_max_seq_len),
@@ -338,7 +340,7 @@ class NeuronSparkModel(nn.Module):
     # ------------------------------------------------------------------------------------------------ bf16 weights
     def inference_linear_weights(self) -> List[Tuple[str, nn.Parameter]]:
         """``(name, parameter)`` of every projection weight (2-D, read by ``neuronspark.ops.linear``), the tied
-        embedding included; the gathered tables (lexical tables, PKM values) and the spiking-layer conv taps are not
+        embedding included; the gathered tables (lexical tables, PKM values) and the dendritic-layer conv taps are not
         included."""
         out = []
         for n, p in self.named_parameters():
@@ -355,8 +357,8 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
     """``NeuronSparkLMHeadModel(config, device=None, dtype=torch.float32, impl="kernel", init="launch")``: the
     backbone (``backbone``) and the tied readout with the readout balance.
 
-    * :meth:`forward` ``(input_ids, inference_params=None, num_last_tokens=0) -> CausalLMOutput(logits)`` (mamba's
-      signature): the balanced logits (B, R, V) bf16 of the last R positions;
+    * :meth:`forward` ``(input_ids, inference_params=None, num_last_tokens=0) -> CausalLMOutput(logits)``: the
+      balanced logits (B, R, V) bf16 of the last R positions;
     * :meth:`loss` ``(input_ids, targets) -> LossOutput`` (training, whole row);
     * :meth:`allocate_inference_cache`, :meth:`prepare_inference` / :meth:`release_inference`;
     * :meth:`generate` (from :class:`neuronspark.utils.generation.GenerationMixin`), CUDA-graph decode by default;
@@ -426,9 +428,9 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
           gradient reaches E together with the embedding lookup's), the per-token cross entropy of the balanced logits
           by the fused readout-balance + cross-entropy operator (the balanced logits are never stored);
         * ``ce = sum(per * valid) / max(sum(valid), 1)``;
-        * ``aux`` = the copy-switch auxiliary loss on the memory layers' detached operands of this call (weight
-          ``memory_copy_novelty_gate_aux``; gradient to each layer's ``copy_novelty_w / _v / _b`` only), computed inside
-          the training autocast region;
+        * ``aux`` = the copy-switch auxiliary loss on the hippocampal layers' detached operands of this call (weight
+          ``hippocampal_copy_novelty_gate_aux``; gradient to each layer's ``copy_novelty_w / _v / _b`` only), computed
+          inside the training autocast region;
         * ``loss = ce + aux``.
         """
         ids = _as_token_ids(input_ids)
@@ -436,7 +438,7 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
         if tuple(tg.shape) != tuple(ids.shape):
             raise ValueError(f"targets {tuple(tg.shape)} must have the shape of input_ids {tuple(ids.shape)}")
         o = self._o
-        lam = float(self.config.memory_copy_novelty_gate_aux)
+        lam = float(self.config.hippocampal_copy_novelty_gate_aux)
         with regime("train"):
             feats: List[tuple] = []
             hidden = self.backbone(ids, aux_out=feats)                           # (B, T, D) fp32
@@ -448,10 +450,10 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
             valid = (labels != IGNORE_INDEX).to(per.dtype)
             n_valid = valid.sum()
             ce = (per * valid).sum() / n_valid.clamp(min=1.0)
-            mem = self.backbone.memory_layers
+            mem = self.backbone.hippocampal_layers
             if len(feats) != len(mem):
-                raise RuntimeError(f"NeuronSparkLMHeadModel.loss: {len(feats)} memory layers handed the copy switch's "
-                                   f"operands, the model has {len(mem)}")
+                raise RuntimeError(f"NeuronSparkLMHeadModel.loss: {len(feats)} hippocampal layers handed the copy "
+                                   f"switch's operands, the model has {len(mem)}")
             if lam > 0.0:
                 weights = [(l.copy_novelty_w, l.copy_novelty_v, l.copy_novelty_b) for l in mem]
                 aux = o.copy_switch_aux(ids, tg.contiguous(), feats, weights, lam)
@@ -462,10 +464,11 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
 
     # ------------------------------------------------------------------------------------------------ inference
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int = DEFAULT_MAX_SEQLEN,
-                                 spiking_state_dtype: Optional[Union[str, torch.dtype]] = None,
+                                 dendritic_state_dtype: Optional[Union[str, torch.dtype]] = None,
                                  device: Optional[Union[str, torch.device]] = None) -> InferenceParams:
         """See :meth:`NeuronSparkModel.allocate_inference_cache`."""
-        return self.backbone.allocate_inference_cache(batch_size, max_seqlen, spiking_state_dtype=spiking_state_dtype,
+        return self.backbone.allocate_inference_cache(batch_size, max_seqlen,
+                                                      dendritic_state_dtype=dendritic_state_dtype,
                                                       device=device)
 
     @torch.no_grad()
@@ -485,14 +488,14 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
     # ------------------------------------------------------------------------------------------------ checkpoints
     @classmethod
     def from_pretrained(cls, path, device: Union[str, torch.device] = "cuda", allow_uncalibrated: bool = False,
-                        impl: str = "kernel", inference_spiking_state_dtype: Optional[str] = None
+                        impl: str = "kernel", inference_dendritic_state_dtype: Optional[str] = None
                         ) -> "NeuronSparkLMHeadModel":
         """Load a checkpoint directory (``config.json`` + ``model.safetensors``, the format of
         :mod:`neuronspark.utils.hf`); see :func:`neuronspark.utils.hf.load_pretrained`."""
         from neuronspark.utils.hf import load_pretrained
 
         return load_pretrained(path, device=device, allow_uncalibrated=allow_uncalibrated, impl=impl,
-                               inference_spiking_state_dtype=inference_spiking_state_dtype, model_cls=cls)
+                               inference_dendritic_state_dtype=inference_dendritic_state_dtype, model_cls=cls)
 
     def save_pretrained(self, path, tokenizer_dir=None) -> dict:
         """Write the checkpoint directory (``config.json`` and ``model.safetensors`` with ``backbone.*`` keys); copy

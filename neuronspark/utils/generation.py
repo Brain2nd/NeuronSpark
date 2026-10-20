@@ -4,7 +4,7 @@
 # also NOTICE).
 # Modified by NeuronSpark: the inference cache is neuronspark.utils.cache.InferenceParams (ring capacity a multiple of
 # 512; device counters advanced by the model, so the decode loop passes no positions); the graph warm-up saves and
-# restores the cache; the graph cache is re-captured when the batch size, the ring capacity, the spiking-layer state
+# restores the cache; the graph cache is re-captured when the batch size, the ring capacity, the dendritic-layer state
 # dtype or any
 # weight changes; only the single-token step is captured; min-p filtering is applied to probabilities; sampling runs
 # on fp32 logits; no transformers dependency (own output record, duck-typed streamer); torch.no_grad instead of
@@ -15,8 +15,8 @@ decoding or sampling.
 ``decode(input_ids, model, max_length, ...)``:
 
 1. the cache (``InferenceParams``) is reset to the row start: with ``cg=True`` the cached one of
-   :func:`update_graph_cache` (allocated once per batch size / ring capacity / spiking-layer state dtype, with the bf16
-   weight copies of ``model.prepare_inference()`` and one captured decode step), else a fresh one;
+   :func:`update_graph_cache` (allocated once per batch size / ring capacity / dendritic-layer state dtype, with the
+   bf16 weight copies of ``model.prepare_inference()`` and one captured decode step), else a fresh one;
 2. the prompt runs as one eager prefill call (``num_last_tokens=1``), the logits of its last position give the first
    token;
 3. every further token is one T = 1 step: ``graph.replay()`` on the static input with ``cg=True`` (the captured step
@@ -35,7 +35,7 @@ from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 
 import torch
 
-from neuronspark.utils.cache import InferenceParams, RING_MULTIPLE, resolve_spiking_state_dtype
+from neuronspark.utils.cache import InferenceParams, RING_MULTIPLE, resolve_dendritic_state_dtype
 
 __all__ = [
     "DecodeOutput",
@@ -156,7 +156,7 @@ class DecodingCGCache:
     max_batch_size: int = 0
     max_seqlen: int = 0
     device: Optional[torch.device] = None
-    spiking_state_dtype: Optional[torch.dtype] = None
+    dendritic_state_dtype: Optional[torch.dtype] = None
     callables: Dict[Tuple[int, int], Callable] = field(default_factory=dict)
     mempool: Any = None
     inference_params: Optional[InferenceParams] = None
@@ -183,15 +183,15 @@ def decode(
     enable_timing: bool = False,
     output_scores: bool = False,
     streamer=None,
-    spiking_state_dtype: Optional[Union[str, torch.dtype]] = None,
+    dendritic_state_dtype: Optional[Union[str, torch.dtype]] = None,
 ) -> DecodeOutput:
     """Greedy decoding or sampling (see the module docstring).
 
     ``input_ids`` (B, T) int64 prompts of equal length; ``max_length`` the total length; ``eos_token_id``: stop once
     every row produced it; ``teacher_outputs`` (B, >= max_length): take the tokens from it instead of sampling;
     ``cg``: replay the decode step from a CUDA graph; ``output_scores``: return the per-step logits;
-    ``streamer``: an object with ``put(tokens)`` / ``end()``; ``spiking_state_dtype``: the cache's spiking-layer state
-    storage (default ``config.inference_spiking_state_dtype``).
+    ``streamer``: an object with ``put(tokens)`` / ``end()``; ``dendritic_state_dtype``: the cache's dendritic-layer
+    state storage (default ``config.inference_dendritic_state_dtype``).
     """
     if input_ids.dim() != 2:
         raise ValueError(f"decode: input_ids must be (B, T), got {tuple(input_ids.shape)}")
@@ -207,11 +207,11 @@ def decode(
     teacher_output_len = int(teacher_outputs.shape[1]) if teacher_outputs is not None else 0
     if cg:
         model._decoding_cache = update_graph_cache(model, getattr(model, "_decoding_cache", None), batch_size,
-                                                   seqlen_og, max_length, spiking_state_dtype=spiking_state_dtype)
+                                                   seqlen_og, max_length, dendritic_state_dtype=dendritic_state_dtype)
         inference_params = model._decoding_cache.inference_params
         inference_params.reset()
     else:
-        inference_params = model.allocate_inference_cache(batch_size, W, spiking_state_dtype=spiking_state_dtype)
+        inference_params = model.allocate_inference_cache(batch_size, W, dendritic_state_dtype=dendritic_state_dtype)
 
     def get_logits(input_ids, inference_params):
         # the model call (or the replayed step) advances inference_params.seqlen_offset by the call's length
@@ -267,7 +267,7 @@ def decode(
 
 
 class GenerationMixin:
-    """``generate`` for a model with ``allocate_inference_cache`` and the mamba-style ``forward(input_ids,
+    """``generate`` for a model with ``allocate_inference_cache`` and the causal-LM ``forward(input_ids,
     inference_params, num_last_tokens)``; the model class provides ``allocate_inference_cache`` and ``config``."""
 
     def generate(
@@ -302,14 +302,14 @@ def update_graph_cache(
     seqlen_og: int,
     max_seqlen: int,
     decoding_seqlens: Sequence[int] = (1,),
-    spiking_state_dtype: Optional[Union[str, torch.dtype]] = None,
+    dendritic_state_dtype: Optional[Union[str, torch.dtype]] = None,
     n_warmups: int = 2,
 ) -> DecodingCGCache:
     """The graph cache for ``batch_size`` rows of total length ``max_seqlen`` (``seqlen_og``: the prompt length, kept
-    for mamba's signature).  The cache, its memory pool and the graphs are (re)built when the device, the spiking-layer
-    state dtype or the batch size changes, when the ring capacity must grow, or when any weight was replaced or written
-    since the capture; then ``model.prepare_inference()`` makes the bf16 weight copies and one decode step is captured
-    per
+    for the generate signature).  The cache, its memory pool and the graphs are (re)built when the device, the
+    dendritic-layer state dtype or the batch size changes, when the ring capacity must grow, or when any weight was
+    replaced or written since the capture; then ``model.prepare_inference()`` makes the bf16 weight copies and one
+    decode step is captured per
     decoding length (only the single-token step is supported)."""
     if tuple(int(s) for s in decoding_seqlens) != (1,):
         raise ValueError(f"update_graph_cache: only the single-token decode step is captured, got decoding_seqlens "
@@ -320,11 +320,11 @@ def update_graph_cache(
     device = param_example.device
     if device.type != "cuda":
         raise RuntimeError(f"update_graph_cache: CUDA-graph decoding needs the model on a CUDA device, got {device}")
-    dtype = resolve_spiking_state_dtype(model.config.inference_spiking_state_dtype if spiking_state_dtype is None
-                                        else spiking_state_dtype)
+    dtype = resolve_dendritic_state_dtype(model.config.inference_dendritic_state_dtype if dendritic_state_dtype is None
+                                        else dendritic_state_dtype)
     W = ring_capacity(max_seqlen, model.config.rope_max_seq_len)
     if (
-        (device, dtype) != (cache.device, cache.spiking_state_dtype)
+        (device, dtype) != (cache.device, cache.dendritic_state_dtype)
         or batch_size != cache.max_batch_size
         or W > cache.max_seqlen
         or _weight_signature(model) != cache.weight_signature
@@ -336,9 +336,9 @@ def update_graph_cache(
         cache.keepalive = []
         gc.collect()
         model.prepare_inference()
-        cache.device, cache.spiking_state_dtype = device, dtype
+        cache.device, cache.dendritic_state_dtype = device, dtype
         cache.max_batch_size, cache.max_seqlen = int(batch_size), W
-        cache.inference_params = model.allocate_inference_cache(batch_size, W, spiking_state_dtype=dtype)
+        cache.inference_params = model.allocate_inference_cache(batch_size, W, dendritic_state_dtype=dtype)
         cache.mempool = torch.cuda.graphs.graph_pool_handle()
         cache.weight_signature = _weight_signature(model)
         cache.keepalive = [w for w in (getattr(p, "_ns_bf16", None) for p in model.parameters()) if w is not None]

@@ -12,9 +12,9 @@ autocast                                       CUDA, bf16           CUDA, bf16
 =============================================  ===================  ====================================
 
 ``regime("train")`` is the whole-row regime (training, and teacher-forced scoring without an inference cache): the fp32
-matmuls of the memory layers (PKM half-query scores, copy-detector cosines) run in TF32.  ``regime("infer")`` is prefill
-and decode with an inference cache: those matmuls run in IEEE fp32 and bf16 GEMMs accumulate without reduced-precision
-reductions.
+matmuls of the hippocampal layers (PKM half-query scores, copy-detector cosines) run in TF32.  ``regime("infer")`` is
+prefill and decode with an inference cache: those matmuls run in IEEE fp32 and bf16 GEMMs accumulate without
+reduced-precision reductions.
 
 The contexts save the previous values on entry and restore them on exit (nesting restores the outer regime).  Every
 setting is host-side state, so entering a regime inside CUDA-graph capture or around a replayed graph is safe.

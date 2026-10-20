@@ -5,7 +5,7 @@ from __future__ import annotations
 from neuronspark.models.config_neuronspark import (
     ARCHITECTURES,
     MODEL_TYPE,
-    SPIKING_STATE_DTYPES,
+    DENDRITIC_STATE_DTYPES,
     NeuronSparkConfig,
 )
 
@@ -15,7 +15,7 @@ __all__ = [
     "NeuronSparkLMHeadModel",
     "MODEL_TYPE",
     "ARCHITECTURES",
-    "SPIKING_STATE_DTYPES",
+    "DENDRITIC_STATE_DTYPES",
 ]
 
 _LAZY = {

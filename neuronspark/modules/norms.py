@@ -6,7 +6,7 @@ the gain from 1, initialised at 0).  ``w_eff`` is formed in the weight's dtype (
 output dtype equals the input dtype.  State-dict key: ``weight``.
 
 ``frozen_rms_norm(x, eps)``: the same chain with the gain fixed at 1.0 and no parameter (the attention-input norm of
-the memory layer): ``(xf * rsqrt(mean(xf^2, -1) + eps)).to(x.dtype)``.
+the hippocampal layer): ``(xf * rsqrt(mean(xf^2, -1) + eps)).to(x.dtype)``.
 
 The op order is fixed (``x.pow(2).mean(-1, keepdim=True)``, ``torch.rsqrt(v + eps)``, the gain product last): it is
 the eager arithmetic that the fused norm kernels reproduce.

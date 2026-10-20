@@ -1,10 +1,10 @@
-"""Copy-switch auxiliary loss: the supervised training term of the memory layers' novelty predictor.
+"""Copy-switch auxiliary loss: the supervised training term of the hippocampal layers' novelty predictor.
 
 For token ids x (B, T) and pre-shifted next-token targets y (B, T) (``-100`` ignored), the copy label of position t is
 
     label[t] = any_{j < t} (x_j == x_t and y_j == y_t and y_j != -100) and y_t != -100,   valid[t] = y_t != -100
 
-(the next token is an induction copy of an earlier continuation).  For each memory layer l with the detached
+(the next token is an induction copy of an earlier continuation).  For each hippocampal layer l with the detached
 predictor inputs z (T, B, D) (the layer's normed input), r (T, B, D) (its attention residual) and pi (T, B) (the copy
 detector's confidence) and its parameters w, v (D,) and b (1,):
 
@@ -55,7 +55,7 @@ __all__ = [
 ]
 
 # ================================================================================================ fixed constants
-#: weight of the auxiliary term (the model's memory_copy_novelty_gate_aux)
+#: weight of the auxiliary term (the model's hippocampal_copy_novelty_gate_aux)
 LAM = 0.5
 #: eps of the residual's RMS
 EPS = 1e-6
@@ -104,7 +104,8 @@ def _labels(token_ids: torch.Tensor, target_ids: torch.Tensor) -> Tuple[torch.Te
 
 def _check_layers(T: int, Bsz: int, dev: torch.device, zs, rs, pis, ws, vs, bs) -> int:
     L = len(zs)
-    _need(L >= 1 and all(len(t) == L for t in (rs, pis, ws, vs, bs)), "one (z, r, pi, w, v, b) set per memory layer")
+    _need(L >= 1 and all(len(t) == L for t in (rs, pis, ws, vs, bs)),
+          "one (z, r, pi, w, v, b) set per hippocampal layer")
     D = int(zs[0].shape[-1])
     for li in range(L):
         z, r, pi, w, v, b = zs[li], rs[li], pis[li], ws[li], vs[li], bs[li]
@@ -249,7 +250,7 @@ class CopySwitchAuxFn(torch.autograd.Function):
 # ================================================================================================ public functions
 def _flat(feats: Sequence[Sequence[torch.Tensor]], weights: Sequence[Sequence[torch.Tensor]]) -> List[torch.Tensor]:
     _need(len(feats) == len(weights) and len(feats) >= 1,
-          f"one (z, r, pi) and one (w, v, b) per memory layer, got {len(feats)} / {len(weights)}")
+          f"one (z, r, pi) and one (w, v, b) per hippocampal layer, got {len(feats)} / {len(weights)}")
     flat: List[torch.Tensor] = []
     for li, (f, wt) in enumerate(zip(feats, weights)):
         _need(len(f) == 3 and len(wt) == 3, f"layer {li}: feats (z, r, pi) and weights (w, v, b) expected")
@@ -264,7 +265,8 @@ def copy_switch_aux(ids: torch.Tensor, targets: torch.Tensor, feats: Sequence[Se
     """The copy-switch auxiliary loss, a () fp32 tensor.
 
     ``ids`` / ``targets``: (B, T) int64 token ids and pre-shifted next-token targets (-100 ignored); ``feats``: per
-    memory layer (z (T, B, D), r (T, B, D), pi (T, B)) (detached here); ``weights``: per memory layer the predictor's
+    hippocampal layer (z (T, B, D), r (T, B, D), pi (T, B)) (detached here); ``weights``: per hippocampal layer the
+    predictor's
     (w (D,), v (D,), b (1,)) fp32 contiguous.  Differentiable in the weights."""
     return CopySwitchAuxFn.apply(float(lam), ids, targets, *_flat(feats, weights))
 
@@ -305,7 +307,7 @@ def copy_switch_aux_ref(ids: torch.Tensor, targets: torch.Tensor, feats: Sequenc
             den = wt.sum().clamp(min=1.0)
             bce = F.binary_cross_entropy_with_logits(logit, y, reduction="none")
             terms.append((wt * bce).sum() / den)
-    _need(len(terms) >= 1, "at least one memory layer")
+    _need(len(terms) >= 1, "at least one hippocampal layer")
     return lam * torch.stack(terms).mean()
 
 
@@ -342,7 +344,8 @@ def _cs_labels_kernel(X, Y, YO, VO, T, B, xs0, xs1, ys0, ys1, BT: tl.constexpr, 
 def _cs_fwd_kernel(Z, R, PI, W, V, BIAS, YO, VO, LOGIT, RSO, PART, NROWS, B, D,
                    zs0, zs1, zs2, rs0, rs1, rs2, ps0, ps1, inv_d, eps,
                    BR: tl.constexpr, BD: tl.constexpr):
-    """One memory layer, rows n = t * B + b: logit = (z . w + b) + rsqrt(mean(r^2) + eps) (r . v); per-program partial
+    """One hippocampal layer, rows n = t * B + b: logit = (z . w + b) + rsqrt(mean(r^2) + eps) (r . v); per-program
+    partial
     sums of wt * bce(logit, y) and wt (wt = pi * valid) into PART[pid, 0 / 1]; logit and rs per row for the backward."""
     pid = tl.program_id(0)
     n = pid.to(tl.int64) * BR + tl.arange(0, BR).to(tl.int64)

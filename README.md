@@ -9,24 +9,28 @@
 
 ## About
 
-NeuronSpark is a spiking language model.  Its recurrent layers are neurons: each layer keeps the membrane potentials
-of its dendritic compartments as a selective state space (input-dependent leak and write, as in Mamba), and reads them
-out through a spiking soma.  Every fourth layer is a memory layer that adds attention-style retrieval, a spiking
-feed-forward block of leaky integrate-and-fire neurons and a product-key memory.
+NeuronSpark is a spiking language model built from neuron models.  Its dendritic neuron layers are populations of
+neurons with dendritic compartments: every soma owns a set of compartments whose membrane potentials leak with an
+input-dependent time constant and integrate each token's synaptic input, and the soma reads its dendrites out through a
+bipolar soft threshold.  The membrane dynamics have the selective state-space form, which lets them run in parallel over
+a sequence in training and one token at a time in decoding.  Every fourth layer is a hippocampal layer: an episodic
+memory of past tokens, written through PLIF write-gate neurons and recalled by content, a copy pathway for verbatim
+recall, a spiking feed-forward circuit of PLIF (parametric leaky integrate-and-fire) neurons and a product-key
+associative memory.
 
 This repository contains the NeuronSpark model (1.27B parameters) together with its GPU operators.  The Triton and Gluon
-kernels cover training, prefill and single-token decoding.  The repository also has a mamba-style inference cache with
-CUDA-graph decoding, plus tests and benchmarks.
+kernels cover training, prefill and single-token decoding.  The repository also has an inference cache with CUDA-graph
+decoding, plus tests and benchmarks.
 
 ## Architecture
 
-NeuronSpark stacks two kinds of layers in a fixed 3:1 pattern: three spiking layers, then one memory layer.  The readout
-is tied to the embedding.
+NeuronSpark stacks two kinds of layers in a fixed 3:1 pattern: three dendritic neuron layers, then one hippocampal
+layer.  The readout is tied to the embedding.
 
-| block | what it computes |
+| block | neural mechanism |
 |---|---|
-| **Spiking layer** | pre-norm → input projection → causal conv + SiLU → a selective state space holding the membrane potentials of each soma's dendritic compartments (chunked scan) → gated RMSNorm → bipolar soft-threshold soma `max(n − θ, 0) − max(−n − θ, 0)` → output projection |
-| **Memory layer** (every fourth layer) | lexical read-out; pool attention (RoPE, PLIF write gate, gated decay, induction bias, value residual); copy gate; spiking FFN of PLIF neurons; product-key memory with top-k retrieval |
+| **Dendritic neuron layer** | *synaptic input*: the normalised residual stream is projected onto the dendrites through a short causal synaptic filter (conv + SiLU); *dendritic integration*: each soma's compartments hold membrane potentials `V` that leak with an input-dependent time constant and integrate the input, `V_t = exp(Δt_t A) V_{t−1} + Δt_t x_t B_tᵀ`, and the soma reads `V_t C_t` (selective state-space dynamics, a chunked scan in training); *somatic release*: the somatic potential is normalised under a multiplicative gate and released through the bipolar soft threshold `max(n − θ, 0) − max(−n − θ, 0)` with a learned threshold θ; the release projects back onto the residual stream |
+| **Hippocampal layer** (every fourth layer) | *episodic memory*: each token is written into memory slots through PLIF write-gate neurons, older traces decay under a gate, and the slots are recalled by content with position (RoPE) and induction biases, plus a value residual across hippocampal layers; *lexical read-out* of the token's hashed context; *copy pathway*: a copy gate for verbatim recall; *spiking feed-forward circuit* of PLIF neurons; *associative memory*: a product-key memory with top-k recall |
 | **Model level** | hashed n-gram lexical memory, induction match matrices, copy-detector statistics, final RMSNorm, readout balance (low-rank logit corrections) |
 
 The training loss is the token cross entropy plus a weighted copy-switch auxiliary loss.
@@ -62,7 +66,7 @@ from neuronspark import NeuronSparkLMHeadModel
 
 model = NeuronSparkLMHeadModel.from_pretrained("path/to/checkpoint", device="cuda")
 
-ids = torch.randint(0, model.config.vocab_size, (8, 1024), device="cuda")  # (B, T), T a multiple of spiking_chunk_size
+ids = torch.randint(0, model.config.vocab_size, (8, 1024), device="cuda")  # (B, T); T % dendritic_chunk_size == 0
 logits = model(ids).logits                                        # (B, T, V)
 
 targets = torch.roll(ids, -1, dims=1)
@@ -72,7 +76,7 @@ loss.backward()
 ```
 
 A checkpoint directory holds `config.json` and `model.safetensors`.  `model.save_pretrained(path)` writes one.  To
-recompute the spiking layers in the backward pass, set `model.gradient_checkpointing = True`.
+recompute the dendritic neuron layers in the backward pass, set `model.gradient_checkpointing = True`.
 
 To train from scratch, build `NeuronSparkLMHeadModel(config)` and calibrate it once on the first training rows with
 `neuronspark.utils.calibration.calibrate_fresh_model(model, batches)`.  This sets the neuron thresholds and the
@@ -89,7 +93,7 @@ out = model.generate(prompt, max_length=768, top_k=50, top_p=0.9, temperature=0.
 `generate` decodes with CUDA graphs.  `max_length` counts the prompt and the new tokens together.  A batch holds 1 to 32
 prompts of equal length.
 
-As in Mamba, you can also drive the inference cache yourself:
+The inference cache can also be driven step by step:
 
 ```python
 with torch.no_grad():
@@ -99,13 +103,13 @@ with torch.no_grad():
     logits = model(token, inference_params=cache).logits                       # one decode step
 ```
 
-The spiking-layer state in the cache is stored in bf16 by default.  To store it in fp32, pass
-`spiking_state_dtype="float32"` to `allocate_inference_cache` or `generate`, or
-`inference_spiking_state_dtype="float32"` to `from_pretrained`.  fp32 storage uses twice the memory.
+The dendritic-layer state in the cache is stored in bf16 by default.  To store it in fp32, pass
+`dendritic_state_dtype="float32"` to `allocate_inference_cache` or `generate`, or
+`inference_dendritic_state_dtype="float32"` to `from_pretrained`.  fp32 storage uses twice the memory.
 
 ## Operators
 
-`neuronspark/ops` follows the layout of `mamba_ssm/ops`: one file per operator family.  Each family provides a public
+`neuronspark/ops` has one file per operator family.  Each family provides a public
 function and a pure-PyTorch reference `*_ref` with the same signature.  Kernels are registered as `torch.library`
 custom ops.  `neuronspark/ops/registry.py` lists every operator with its signature and the code paths that use it.
 `NeuronSparkLMHeadModel(config, impl="ref")` builds the whole model on the references.
@@ -113,13 +117,13 @@ custom ops.  `neuronspark/ops/registry.py` lists every operator with its signatu
 | family | file | used in |
 |---|---|---|
 | linear with fp32 weight gradient | `ops/linear.py` | train, prefill, decode |
-| Spiking-layer chunk scan + soma | `ops/spiking_combined.py`, `ops/triton/spiking_{states,scan,glue,soma}.py`, `ops/gluon/spiking_{chunk_states,dstates,dda,chunk_scan_fwd,chunk_scan_dx}.py` | train |
-| Spiking-layer prefill scan | `ops/spiking_prefill.py`, `ops/gluon/spiking_chunk_states.py` | prefill |
-| Spiking-layer conv, norms, residual | `ops/triton/spiking_{conv,prenorm,gated_norm,residual}.py` | train, prefill |
-| Spiking-layer decode step | `ops/triton/spiking_step.py` | decode |
+| dendritic integration (chunked scan) + somatic release | `ops/dendritic_combined.py`, `ops/triton/dendritic_{states,scan,glue,soma}.py`, `ops/gluon/dendritic_{chunk_states,dstates,dda,chunk_scan_fwd,chunk_scan_dx}.py` | train |
+| dendritic integration, prefill | `ops/dendritic_prefill.py`, `ops/gluon/dendritic_chunk_states.py` | prefill |
+| synaptic filter (conv), norms, residual | `ops/triton/dendritic_{conv,prenorm,gated_norm,residual}.py` | train, prefill |
+| dendritic neuron step | `ops/triton/dendritic_step.py` | decode |
 | PLIF neurons | `ops/triton/plif.py`, `ops/gluon/plif_k1_bwd.py` | train, prefill |
-| pool attention | `ops/triton/pool_{attn,bias}.py`, `ops/triton/mem_{heads,rope,norms,residual}.py` | train |
-| inference rings, extra queries | `ops/triton/pool_ring.py`, `ops/triton/xq_query.py` | prefill, decode |
+| hippocampal recall (pool attention) | `ops/triton/pool_{attn,bias}.py`, `ops/triton/hippo_{heads,rope,norms,residual}.py` | train |
+| hippocampal slot rings, extra queries | `ops/triton/pool_ring.py`, `ops/triton/xq_query.py` | prefill, decode |
 | short conv | `ops/triton/short_conv.py` | train, prefill, decode |
 | cumulative sums | `ops/triton/cumsum.py` | train, prefill |
 | product-key memory | `ops/triton/pkm_{topk,read}.py` | train, prefill, decode |
@@ -128,7 +132,7 @@ custom ops.  `neuronspark/ops/registry.py` lists every operator with its signatu
 | readout balance | `ops/triton/balance_add.py` | scoring, prefill, decode |
 | readout balance + cross entropy | `ops/triton/lm_tail.py` | train |
 
-The SSD chunk kernels in `ops/triton/mamba/` are vendored from `mamba_ssm` (see `NOTICE`).
+The chunked-scan kernels in `ops/triton/mamba/` are vendored from `mamba_ssm` (see `NOTICE`).
 
 ## Tests
 

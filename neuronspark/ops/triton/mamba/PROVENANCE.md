@@ -26,8 +26,8 @@ is `LICENSE` in this directory (the upstream `LICENSE`, sha256
    configuration lists).
 5. Each file has a header with the upstream copyright line, the Apache-2.0 notice and these modifications.
 
-`_chunk_cumsum_bwd_kernel` keeps no launcher here: the spiking-layer backward
-(`neuronspark.ops.triton.spiking_glue.chunk_cumsum_bwd`) launches it directly with `CHUNK_CUMSUM_BWD_TRAIN`.
+`_chunk_cumsum_bwd_kernel` keeps no launcher here: the dendritic-layer backward
+(`neuronspark.ops.triton.dendritic_glue.chunk_cumsum_bwd`) launches it directly with `CHUNK_CUMSUM_BWD_TRAIN`.
 
 ## Launch configurations (`neuronspark/ops/triton/mamba/__init__.py`)
 
@@ -37,7 +37,7 @@ The configurations start from mamba_ssm's deterministic mode (`MAMBA_DETERMINIST
 configuration of minimal cost, cost = product of the `BLOCK_SIZE_*` values x `num_stages` (`_estimate_config_cost`,
 lines 35-41; `triton.Config` defaults num_warps 4, num_stages 3), unless `TRITON_AUTOTUNE_BLOCK_SIZE_*` or
 `TRITON_CACHE_AUTOTUNING=1` are set. Some of those single configurations are replaced by configurations measured for
-the spiking layer's shapes (nheads 144). The values used here:
+the dendritic neuron layer's shapes (nheads 144). The values used here:
 
 | constant | kernel | (kwargs, num_warps, num_stages) | derivation |
 |---|---|---|---|
@@ -50,7 +50,7 @@ the spiking layer's shapes (nheads 144). The values used here:
 | `STATE_PASSING_FWD_PREFILL` | `_state_passing_fwd_kernel` | `({BLOCK_SIZE: 1024}, 4, 3)` | prefill: a measured configuration (stages 3, warps 4) |
 
 Neither the training forward nor the inference prefill runs `_chunk_state_fwd_kernel` or `_state_passing_fwd_kernel`
-(both are replaced by the Gluon chunk-states kernel of `neuronspark.ops.gluon.spiking_chunk_states`; the two configurations
+(both are replaced by the Gluon chunk-states kernel of `neuronspark.ops.gluon.dendritic_chunk_states`; the two configurations
 above are those of the vendored pair the tests compare it with); the training backward does not run any other mamba_ssm
 kernel.
 
@@ -61,7 +61,7 @@ The autotune configurations of the source carry `pre_hook=init_to_zero([...])` o
 | kernel | pre-hook in the source | here |
 |---|---|---|
 | `_chunk_cumsum_fwd_kernel` | none | -- |
-| `_chunk_cumsum_bwd_kernel` | `init_to_zero(["dA_ptr", "ddt_bias_ptr"])` on every configuration | not replicated. The only launch (`spiking_glue.chunk_cumsum_bwd`) passes `DETERMINISTIC_REDUCTION=True` and per-(batch, chunk, head) workspaces of shape (batch, nchunks, nheads) for `dA_ptr` / `ddt_bias_ptr`; the grid (batch, nchunks, cdiv(nheads, BLOCK_SIZE_H)) stores every slot (`tl.store`, masked only by `offs_h < nheads`), so no slot is read unwritten |
+| `_chunk_cumsum_bwd_kernel` | `init_to_zero(["dA_ptr", "ddt_bias_ptr"])` on every configuration | not replicated. The only launch (`dendritic_glue.chunk_cumsum_bwd`) passes `DETERMINISTIC_REDUCTION=True` and per-(batch, chunk, head) workspaces of shape (batch, nchunks, nheads) for `dA_ptr` / `ddt_bias_ptr`; the grid (batch, nchunks, cdiv(nheads, BLOCK_SIZE_H)) stores every slot (`tl.store`, masked only by `offs_h < nheads`), so no slot is read unwritten |
 | `_chunk_state_fwd_kernel` | none | -- |
 | `_bmm_chunk_fwd_kernel`, `_bmm_chunk_bwd_kernel` | none | -- |
 | `_state_passing_fwd_kernel` | none | -- |

@@ -1,16 +1,16 @@
 """Operators of the NeuronSpark model.
 
-Layout (as in mamba_ssm): ``ops/linear.py`` (fp32-weight-gradient linear), ``ops/spiking_combined.py`` (training
-spiking-layer chunk scan + soma Function), ``ops/spiking_prefill.py`` (prefill spiking-layer scan), ``ops/triton/``
-(Triton kernels, the vendored mamba SSD kernels under ``ops/triton/mamba/``) and ``ops/gluon/`` (Gluon kernels for
-Blackwell). Each family exposes private launchers, an autograd Function where it has a backward, a plain public function
-and a pure-torch ``*_ref``.
+Layout (as in mamba_ssm): ``ops/linear.py`` (fp32-weight-gradient linear), ``ops/dendritic_combined.py`` (training
+dendritic-layer chunk scan + soma Function), ``ops/dendritic_prefill.py`` (prefill dendritic-layer scan),
+``ops/triton/`` (Triton kernels, the vendored mamba SSD kernels under ``ops/triton/mamba/``) and ``ops/gluon/`` (Gluon
+kernels for Blackwell). Each family exposes private launchers, an autograd Function where it has a backward, a plain
+public function and a pure-torch ``*_ref``.
 
 Modules call operators through a namespace chosen once::
 
     from neuronspark import ops
     o = ops.namespace("kernel")        # or "ref": the pure-torch references, same signatures
-    hn = o.spiking_norm(h, gain, 1e-5)
+    hn = o.dendritic_norm(h, gain, 1e-5)
 
 ``KERNELS`` / ``REFS`` resolve an op name to its callable through :mod:`neuronspark.ops.registry` on first use (the
 resolved callables are cached in the namespace: a documented first-call cache).  ``REFS.<name>`` and

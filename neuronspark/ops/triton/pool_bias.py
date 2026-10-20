@@ -1,4 +1,4 @@
-"""The additive mask of the memory layers' pool attention (training).
+"""The additive mask of the hippocampal layers' pool attention (training).
 
 Operators (registry names):
 

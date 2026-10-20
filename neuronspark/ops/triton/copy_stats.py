@@ -25,7 +25,7 @@ in another order and ``tl.exp`` is the approximate exponential.
 Operator: :func:`copy_stats_prefill` (custom op ``neuronspark::copy_stats_prefill``), pure-torch reference
 :func:`copy_stats_prefill_ref` (same signature).  The ring pointer ``p0`` and the row counts are read on the device
 (CUDA-graph capture safe).  Tests: the per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the
-torch chain, on the finite statistics and on the confidence ``pi`` the memory layers form from them.
+torch chain, on the finite statistics and on the confidence ``pi`` the hippocampal layers form from them.
 """
 from __future__ import annotations
 

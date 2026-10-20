@@ -1,6 +1,6 @@
-"""PLIF population operators: the projected-gate, bipolar soft-reset PLIF neuron of the memory layers.
+"""PLIF population operators: the projected-gate, bipolar soft-reset PLIF neuron of the hippocampal layers.
 
-Every PLIF population (per memory layer: ``gate_neuron`` and ``input_neuron2`` with C = 1536, the latter with a
+Every PLIF population (per hippocampal layer: ``gate_neuron`` and ``input_neuron2`` with C = 1536, the latter with a
 centred projection input; ``snn_ffn.gate_neuron`` and ``snn_ffn.up_neuron`` with C = 768) computes, per row b and
 channel c, with ``xw = fp32(x)`` and every fp32 operation rounded once (round to nearest even, no FMA contraction):
 

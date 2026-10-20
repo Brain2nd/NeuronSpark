@@ -1,6 +1,6 @@
 """Lexical read of a prefill call after its projections, in one kernel.
 
-The first step of every memory layer reads the model-level lexical vector m through a scalar gate per token
+The first step of every hippocampal layer reads the model-level lexical vector m through a scalar gate per token
 (:mod:`neuronspark.modules.lexical_read`).  After the three bf16 projections ``q_raw = bf16(hn @ lex_q^T)``
 (T, B, K), ``k_raw = bf16(m @ lex_k^T)`` (T, B, K) and ``o = bf16(m @ lex_o^T)`` (T, B, D) the read is, per row::
 
@@ -128,7 +128,7 @@ def lex_read_prefill(h: torch.Tensor, q_raw: torch.Tensor, k_raw: torch.Tensor, 
 # ================================================================================================ reference
 def lex_read_prefill_ref(h: torch.Tensor, q_raw: torch.Tensor, k_raw: torch.Tensor, o: torch.Tensor,
                          q_gain: torch.Tensor, k_gain: torch.Tensor, beta: torch.Tensor, eps: float) -> torch.Tensor:
-    """The memory layer's torch chain of the read after its projections (same arguments and output as
+    """The hippocampal layer's torch chain of the read after its projections (same arguments and output as
     :func:`lex_read_prefill`): the zero-centred-gain RMS norms of q / k in fp32, the scaled dot plus the bias through
     a sigmoid, and the fp32 residual ``h + (alpha * f32(o))``."""
     K = int(q_raw.shape[-1])

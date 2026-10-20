@@ -1,6 +1,6 @@
 """ops.triton.vr_mix: the value-residual mix and GLU tail of a prefill call.
 
-``vr_mix_prefill`` (one kernel) against its torch chain ``vr_mix_prefill_ref`` for memory layer 0 (``v (1 + lam)``)
+``vr_mix_prefill`` (one kernel) against its torch chain ``vr_mix_prefill_ref`` for hippocampal layer 0 (``v (1 + lam)``)
 and a later layer (``v + lam carry``): v / carry (T, B, 1536) bf16 contiguous and as views of a (B, 3 x 1536, T)
 buffer (token axis contiguous), gl (T, B, 6) bf16, lam0 (1536,) fp32, glu_add (T, B, 256) fp32; three value scales.
 

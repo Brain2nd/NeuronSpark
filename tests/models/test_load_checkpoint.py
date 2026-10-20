@@ -108,7 +108,7 @@ def test_state_layout():
     for i in range(CFG.num_layers):
         p = [k for k in params if k.startswith(f"backbone.layers.{i}.")]
         b = [k for k in buffers if k.startswith(f"backbone.layers.{i}.")]
-        if CFG.is_memory_layer(i):
+        if CFG.is_hippocampal_layer(i):
             assert (len(p), len(b)) == (70, 11), (i, len(p), len(b))
         else:
             assert (len(p), len(b)) == (10, 0), (i, len(p), len(b))
@@ -161,19 +161,20 @@ def test_post_load_checks(loaded):
     bb = loaded.backbone
     bb.lexical_memory.check_hash_buffers()
     assert [int(v) for v in bb.lexical_memory.hash_wrap.tolist()] == [128000, 128000, 170027, 170027]
-    mem = bb.memory_layers
-    assert [l.layer_idx for l in mem] == list(CFG.memory_layer_ids)
+    mem = bb.hippocampal_layers
+    assert [l.layer_idx for l in mem] == list(CFG.hippocampal_layer_ids)
     for l in mem:
         assert l.pkm_ready, l.layer_idx
         assert float(l.pkm_calibrated) == 1.0
-        rank = CFG.memory_index(l.layer_idx)
+        rank = CFG.hippocampal_index(l.layer_idx)
         want = (torch.zeros(CFG.D_value) if rank == 0 else
-                value_residual_anchor(CFG.memory_pool_value_residual_anchor[rank - 1], CFG.D_value, CFG.memory_heads))
+                value_residual_anchor(CFG.hippocampal_pool_value_residual_anchor[rank - 1], CFG.D_value,
+                                      CFG.hippocampal_heads))
         assert_match(l.pool_value_residual_anchor, want.to(l.pool_value_residual_anchor.device),
                      f"layers.{l.layer_idx}.pool_value_residual_anchor")
     frozen = [n for n, p in loaded.named_parameters() if not p.requires_grad]
     assert len(frozen) == 24 and all(n.endswith(".w") for n in frozen)
-    assert loaded.config.inference_spiking_state_dtype == "bfloat16"
+    assert loaded.config.inference_dendritic_state_dtype == "bfloat16"
 
 
 @pytest.mark.cuda
@@ -212,7 +213,7 @@ def test_verification_refuses_altered_checkpoints(ckpt_dir):
     config = load_config(ckpt_dir)
     sd = load_state_dict(ckpt_dir, device="cpu")
     summary = verify_state_dict(config, sd)
-    assert summary["state_tensors"] == 678 and summary["uncalibrated_memory_layers"] == []
+    assert summary["state_tensors"] == 678 and summary["uncalibrated_hippocampal_layers"] == []
 
     def refused(mutate, **kw):
         bad = dict(sd)
@@ -231,7 +232,7 @@ def test_verification_refuses_altered_checkpoints(ckpt_dir):
     refused(lambda d: d.__setitem__(key, torch.zeros_like(d[key])))
     unc = dict(sd)
     unc[key] = torch.zeros_like(sd[key])
-    assert verify_state_dict(config, unc, allow_uncalibrated=True)["uncalibrated_memory_layers"] == [11]
+    assert verify_state_dict(config, unc, allow_uncalibrated=True)["uncalibrated_hippocampal_layers"] == [11]
 
 
 @pytest.mark.cuda
@@ -249,7 +250,7 @@ def test_save_round_trip(loaded, ckpt_dir, tmp_path):
     assert all(k.startswith(PREFIX) for k in _file_keys(saved))
     assert _compare_with_file(loaded.state_dict(), saved, dev) == 678
     model2 = NeuronSparkLMHeadModel.from_pretrained(saved, device="cuda")
-    assert all(l.pkm_ready for l in model2.backbone.memory_layers)
+    assert all(l.pkm_ready for l in model2.backbone.hippocampal_layers)
     assert _compare_with_file(model2.state_dict(), saved, dev) == 678
     del model2
     shutil.rmtree(saved)

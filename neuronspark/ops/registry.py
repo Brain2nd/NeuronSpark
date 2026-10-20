@@ -310,9 +310,10 @@ _MEMORY_PREFILL_SPECS: List[OpSpec] = [
         "(T, B, 1536) fp32 contiguous h + alpha * o", "prefill",
         doc="h (T, B, 1536) fp32, q_raw / k_raw (T, B, 64) bf16, o (T, B, 1536) bf16, q_gain / k_gain (64,) fp32, "
             "beta (1,) fp32, eps = 1e-6"),
-    _op("vr_lambda_prefill", _T + "vr_lambda", "gl lam",
-        "(T, B, 1536) fp32 contiguous value-residual mix lam + tanh(gl) per head's channels", "prefill",
-        doc="gl (T, B, 6) bf16 gate projection, lam (1536,) fp32 contiguous static mix"),
+    _op("vr_mix_prefill", _T + "vr_mix", "v carry gl lam0 glu_add",
+        "(T, B, 1536) bf16 contiguous value stream after the value-residual mix and the GLU tail", "prefill",
+        doc="v (T, B, 1536) bf16, carry (T, B, 1536) bf16 or None (memory layer 0), gl (T, B, 6) bf16 gate projection, "
+            "lam0 (1536,) fp32 contiguous static mix, glu_add (T, B, 256) fp32 GLU addend of the last head"),
 ]
 for _mem_spec in _MEMORY_PREFILL_SPECS:
     if _mem_spec.name in OPS:

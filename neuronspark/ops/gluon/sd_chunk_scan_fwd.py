@@ -43,6 +43,7 @@ from triton.experimental.gluon.language.nvidia.blackwell import (
     fence_async_shared)
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
+from neuronspark.ops.gluon._ptx import _ex2ftz, _tc_fence
 from neuronspark.ops.triton import num_sms, require_cuda, require_sm100
 
 __all__ = ["BM", "BK", "NH", "R", "NB", "NWC", "W0", "REGS_W", "REGS_C", "DD", "RP", "SR", "CW",
@@ -65,27 +66,6 @@ CW = 4           # compute layout columns per thread group
 
 # (batch, nchunks, MT, HG, G, device index) -> int32 (G + 1,) item ranges per CTA: a documented first-call cache
 _WORK_SPLIT: Dict[Tuple[int, int, int, int, int, int], torch.Tensor] = {}
-
-
-# ------------------------------------------------------------------------------------------------ helpers
-@gluon.jit
-def _ex2ftz(t):
-    return gl.inline_asm_elementwise("ex2.approx.ftz.f32 $0, $1;", "=f,f", [t], dtype=gl.float32, is_pure=True, pack=1)
-
-
-@gluon.jit
-def _tc_fence(AFTER: gl.constexpr, NWF: gl.constexpr):
-    """tcgen05.fence::before_thread_sync (AFTER 0) / ::after_thread_sync (AFTER 1), once per thread of the calling partition: the
-    PTX ordering of tcgen05 operations across a thread synchronisation (a TMEM store by the compute warps, then the MMA warp's
-    tcgen05.mma reading that accumulator; an MMA's commit, then the compute warps' TMEM loads).  Gluon 3.5.1 emits neither."""
-    LF: gl.constexpr = gl.BlockedLayout([1], [32], [NWF], [0])
-    z = gl.full([32 * NWF], 0, gl.int32, layout=LF)
-    if AFTER:
-        gl.inline_asm_elementwise("tcgen05.fence::after_thread_sync; mov.b32 $0, $1;", "=r,r", [z], dtype=gl.int32,
-                                  is_pure=False, pack=1)
-    else:
-        gl.inline_asm_elementwise("tcgen05.fence::before_thread_sync; mov.b32 $0, $1;", "=r,r", [z], dtype=gl.int32,
-                                  is_pure=False, pack=1)
 
 
 # ------------------------------------------------------------------------------------------------ partitions

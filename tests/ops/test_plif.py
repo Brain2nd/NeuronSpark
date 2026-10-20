@@ -6,7 +6,8 @@
   sigmoid surrogate, sequential over t);
 * training ``plif_centred_input`` (output and input gradient) against the reference;
 * prefill ``plif_gate_prefill`` and ``plif_scan_prefill`` (S and the carried membrane) at b in {1, 8} and the prefill
-  lengths, against the references; a split prefill against one call;
+  lengths, against the references; a split prefill against one call; ``plif_gate_prefill`` reading the bf16 eta
+  projection (widened on load) against the same kernel and the reference on the projection widened beforehand;
 * the refusals outside the contract.
 
 Every comparison is the per-operator rule of ``neuronspark.utils.testing`` (matched ratio 1.0).
@@ -28,6 +29,7 @@ from neuronspark.ops.triton.plif import (
     plif_scan_train,
     plif_scan_train_ref,
 )
+from neuronspark.utils.precision import regime
 from neuronspark.utils.testing import assert_all_match, rand_tensor
 
 pytestmark = pytest.mark.cuda
@@ -217,3 +219,23 @@ def test_plif_prefill_refusals(device):
             plif_scan_prefill(inp["a"], inp["drive"], inp["v_th"], inp["v0"][:1].clone())
         with pytest.raises(RuntimeError):                 # projection of another shape
             plif_gate_prefill(inp["x"], inp["w_eta"], inp["b_eta"], inp["zp"][:1])
+
+
+GATE_BF16_SHAPES = ((2, 1), (16, 8), (128, 8), (1024, 1), (1024, 8), (2048, 8), (896, 8))
+
+
+@pytest.mark.parametrize("x_dtype", [torch.float32, torch.bfloat16], ids=["x_fp32", "x_bf16"])
+@pytest.mark.parametrize("T,B", GATE_BF16_SHAPES, ids=[f"t{t}_b{b}" for t, b in GATE_BF16_SHAPES])
+def test_plif_gate_prefill_bf16_projection(device, T, B, x_dtype):
+    C = 1536
+    g = torch.Generator(device="cpu").manual_seed(T + B)
+    x = (torch.randn((T, B, C), generator=g) * 2.0).to(x_dtype).to(device)
+    w = (torch.randn(C, generator=g) * 0.3).to(device)
+    b = (torch.randn(C, generator=g) * 0.5 - 1.0).to(device)
+    z = (torch.randn((T, B, C), generator=g) * 1.5).to(torch.bfloat16).to(device)
+    with torch.no_grad(), regime("infer"):
+        new = plif_gate_prefill(x, w, b, z)
+        widened = plif_gate_prefill(x, w, b, z.to(torch.float32))
+        ref = plif_gate_prefill_ref(x, w, b, z.to(torch.float32))
+    assert_all_match({"a": new[0], "drive": new[1]}, {"a": widened[0], "drive": widened[1]}, prefix="gate_vs_widened")
+    assert_all_match({"a": new[0], "drive": new[1]}, {"a": ref[0], "drive": ref[1]}, prefix="gate_vs_reference")

@@ -119,7 +119,7 @@ custom ops.  `neuronspark/ops/registry.py` lists every operator with its signatu
 | short conv | `ops/triton/short_conv.py` | train, prefill, decode |
 | cumulative sums | `ops/triton/cumsum.py` | train, prefill |
 | product-key memory | `ops/triton/pkm_{topk,read}.py` | train, prefill, decode |
-| lexical read, copy statistics, value residual | `ops/triton/{lex_read,copy_stats,vr_lambda}.py` | prefill |
+| lexical read, copy statistics, value residual | `ops/triton/{lex_read,copy_stats,vr_mix}.py` | prefill |
 | copy-switch loss | `ops/triton/copy_switch.py` | train |
 | readout balance | `ops/triton/balance_add.py` | scoring, prefill, decode |
 | readout balance + cross entropy | `ops/triton/lm_tail.py` | train |

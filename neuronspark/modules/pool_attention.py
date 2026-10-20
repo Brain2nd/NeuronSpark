@@ -43,8 +43,8 @@ Regime differences kept explicitly in the code paths (each regime has its own nu
 * short conv: ``ops.short_conv_train`` / ``ops.short_conv_silu_prefill`` (T >= 3, the SiLU in the store; a 2-token call takes the depthwise
   ``F.conv1d`` over the carried history) / ``ops.short_conv_step``;
 * prefill only: the value-residual gate's centred input is written in bf16 (the operand dtype of its projection),
-  ``lam`` is formed by ``ops.vr_lambda_prefill`` (tanh of the gate repeated over each head's channels plus the
-  static mix, one kernel), and the extra queries after their projections by ``ops.xq_queries_prefill`` (SiLU, RoPE,
+  ``lam``, the value residual and the GLU tail are one kernel, ``ops.vr_mix_prefill`` (``lam`` is not materialised),
+  and the extra queries after their projections by ``ops.xq_queries_prefill`` (SiLU, RoPE,
   normalisation and gain of all M queries in one kernel, stored in bf16, the rounding the ring read applies); the
   whole row and decode keep the torch forms.
 
@@ -369,11 +369,15 @@ class PoolAttentionMixin:
                                f"call as the carry ({tuple(v.shape)} {v.dtype}), got "
                                f"{None if carry is None else (tuple(carry.shape), carry.dtype)}")
 
-    def _glu_tail_torch(self, v: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """v with the GLU addend added to the last head's value channels (inference, torch)."""
+    def _glu_addend(self, z: torch.Tensor) -> torch.Tensor:
+        """(T, B, dv) fp32 GLU addend of the last head's value channels (inference)."""
         lin = self._ops.linear
         gp = F.silu(lin(z, self.pool_glu_a).float()) * lin(z, self.pool_glu_b).float()
-        gv = lin(gp.to(z.dtype), self.pool_glu_u).float()
+        return lin(gp.to(z.dtype), self.pool_glu_u).float()
+
+    def _glu_tail_torch(self, v: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+        """v with the GLU addend added to the last head's value channels (inference, torch)."""
+        gv = self._glu_addend(z)
         dvh = self.memory_value_head_dim
         return torch.cat([v[..., :self.D_value - dvh], (v[..., self.D_value - dvh:].float() + gv).to(v.dtype)], dim=-1)
 
@@ -547,12 +551,15 @@ class PoolAttentionMixin:
         else:
             qkv = F.silu(self._short_conv_two(qkv, st.conv_hist))
         q, k, v = qkv.split([self.D_key, self.D_key, self.D_value], dim=-1)
-        # value-residual mix: the centred input in bf16 (its only consumer is the bf16 gate projection, whose input
-        # cast is the same rounding), the tanh gate repeated over each head's channels in one kernel
+        # value-residual mix and GLU tail in one kernel: the centred input in bf16 (its only consumer is the bf16 gate
+        # projection, whose input cast is the same rounding); layer 0's unmixed values are the later layers' carry
         zc = o.centred_running(z, st.vr_sum, pos0, torch.bfloat16)
-        lam = o.vr_lambda_prefill(lin(zc, self.pool_vr_gate), self.value_residual_lambda0())
-        v, carry_out = self._value_residual_torch(v, lam, carry)
-        v = self._glu_tail_torch(v, z)
+        if self.value_residual_first:
+            carry_in, carry_out = None, v
+        else:
+            self._check_carry(carry, v)
+            carry_in = carry_out = carry
+        v = o.vr_mix_prefill(v, carry_in, lin(zc, self.pool_vr_gate), self.value_residual_lambda0(), self._glu_addend(z))
         positions = pos0.view(1, B) + torch.arange(T, device=h.device, dtype=torch.int64).view(T, 1)
         cos = self.rope_cos[positions].to(q.dtype)
         sin = self.rope_sin[positions].to(q.dtype)

@@ -62,9 +62,9 @@ def _clocks(B, n, device, gen):
     return torch.cumsum(la, dim=-1)
 
 
-def _rings(B, device, gen):
-    pool_k = F.normalize(rand_tensor((B, H, W, DK), torch.float32, device, gen), dim=-1).to(torch.bfloat16)
-    pool_gv = (rand_tensor((B, H, W, DV), torch.float32, device, gen) * 0.5).to(torch.bfloat16)
+def _rings(B, device, gen, w=W):
+    pool_k = F.normalize(rand_tensor((B, H, w, DK), torch.float32, device, gen), dim=-1).to(torch.bfloat16)
+    pool_gv = (rand_tensor((B, H, w, DV), torch.float32, device, gen) * 0.5).to(torch.bfloat16)
     return pool_k.contiguous(), pool_gv.contiguous()
 
 
@@ -263,15 +263,15 @@ def test_ring_write_prefill_variants(device, variant, scale, strided):
 
 
 # ------------------------------------------------------------------------------------------------ prefill recall
-def _recall_inputs(T, B, pos0, shift, device, seed, xq):
+def _recall_inputs(T, B, pos0, shift, device, seed, xq, w=W):
     g = _gen(device, seed)
     N = pos0 + T
     p0 = pos0 + shift                                                       # the ring pointer at the call's start
     clocks = _clocks(B, N, device, g)
-    pool_cum = torch.full((B, H, W), float("inf"), dtype=torch.float32, device=device)
-    j = torch.arange(max(0, N - W), N, device=device)
-    pool_cum[:, :, (p0 + (j - pos0)) % W] = clocks[:, :, j]
-    pool_k, pool_gv = _rings(B, device, g)
+    pool_cum = torch.full((B, H, w), float("inf"), dtype=torch.float32, device=device)
+    j = torch.arange(max(0, N - w), N, device=device)
+    pool_cum[:, :, (p0 + (j - pos0)) % w] = clocks[:, :, j]
+    pool_k, pool_gv = _rings(B, device, g, w)
     cum_tbh = clocks[:, :, pos0:N].permute(2, 0, 1).contiguous()             # (T, B, H) query clocks
     gain = _head_gain(device, g)
     if xq:
@@ -282,17 +282,17 @@ def _recall_inputs(T, B, pos0, shift, device, seed, xq):
     else:
         q_base = F.normalize(rand_tensor((T, B, H, DK), torch.float32, device, g), dim=-1) * gain.view(1, 1, H, 1)
         q4, ct3, G = q_base.permute(1, 2, 0, 3), cum_tbh.permute(1, 2, 0), H
-    matches = [torch.rand((B, T, W), device=device, generator=g) < MATCH_DENSITY for _ in range(N_ORD)]
+    matches = [torch.rand((B, T, w), device=device, generator=g) < MATCH_DENSITY for _ in range(N_ORD)]
     beta = rand_tensor((N_ORD, H), torch.float32, device, g)
     return {"q_base": q_base, "q4": q4, "ct3": ct3, "cum_tbh": cum_tbh, "pool_k": pool_k, "pool_gv": pool_gv,
             "pool_cum": pool_cum, "p0": torch.tensor([p0], dtype=torch.int64, device=device), "matches": matches,
-            "beta": beta, "T": T, "B": B, "G": G, "xq": xq}
+            "beta": beta, "T": T, "B": B, "G": G, "xq": xq, "W": w}
 
 
 def _recall(fn, a, out_dtype=torch.bfloat16):
     with torch.no_grad(), regime("infer"):
         return fn(a["q4"], a["pool_k"], a["pool_gv"], a["pool_cum"], a["ct3"], a["p0"], (a["matches"], a["beta"]),
-                  GAIN, a["T"], a["B"], a["G"], W, DK, DV, out_dtype, a["xq"], H - 1 if a["xq"] else 0)
+                  GAIN, a["T"], a["B"], a["G"], a["W"], DK, DV, out_dtype, a["xq"], H - 1 if a["xq"] else 0)
 
 
 @pytest.mark.parametrize("xq", (False, True), ids=("heads", "extra_queries"))
@@ -303,6 +303,13 @@ def test_ring_recall_prefill_vs_reference(device, pos0, shift, T, B, xq):
     a = _recall_inputs(T, B, pos0, shift, device, seed=5100 + T + B + pos0, xq=xq)
     assert_match(_recall(ring_recall_prefill, a), _recall(ring_recall_prefill_ref, a),
                  f"ring_recall_prefill[T{T},b{B},pos{pos0},xq={xq}]")
+
+
+@pytest.mark.parametrize("w", (384, 768), ids=("split1", "split2"))
+def test_ring_recall_prefill_ring_sizes(device, w):
+    """rings whose W / 128 has fewer factors of two than RECALL_STATS_SPLIT: the statistics pass over fewer slot ranges"""
+    a = _recall_inputs(256, 2, 300, 9, device, seed=5300 + w, xq=False, w=w)
+    assert_match(_recall(ring_recall_prefill, a), _recall(ring_recall_prefill_ref, a), f"ring_recall_prefill[W{w}]")
 
 
 @pytest.mark.parametrize("T", (17, 256))

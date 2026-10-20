@@ -41,7 +41,8 @@ Operators (each: private launcher, ``torch.library`` custom op with a fake, publ
     events at their clocks, this call's events causal), for the six heads (``xq=False``: group g reads ring head g) or
     the extra queries (``xq=True``: every group reads ring head ``hr``, the query clocks are those of this call's
     slots).  T >= 64: two launches -- a statistics pass (the scores of every valid (64 x 128) tile into an fp32
-    scratch, the online row max / sum, a per-tile validity flag) and a value pass (``p = bf16(exp(x - m) * (1 / l))``
+    scratch, the online row max / sum, a per-tile validity flag; the W slots split over RECALL_STATS_SPLIT programs per
+    query block -- fewer when W / 128 has fewer factors of two -- their statistics combined by the value pass) and a value pass (``p = bf16(exp(x - m) * (1 / l))``
     times the values on bf16 tensor cores, fp32 accumulation); T < 64: one kernel with 16-row tiles recomputing the
     scores in the value pass.  Both use ``tl.exp`` (ex2.approx after the log2 e multiply) and one reciprocal per row.
 
@@ -55,6 +56,7 @@ the start of this call (token t of the call is at slot ``(ptr + t) % W``).  ``ri
 *before* the step (the live length is ``pos + 1``); the extra-query and induction operands are explicit arguments.
 The launch configurations are the fixed constants below.
 """
+import math
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -71,7 +73,7 @@ from neuronspark.ops.triton._ptx import (  # noqa: F401  (Triton resolves the he
 __all__ = [
     "RING_READ_KERNEL_BATCHES", "RING2_QUERY_ROWS", "RING2_CONFIGS", "XQ_FORM_WARPS", "RING_WRITE_HEAD_DIM",
     "RING_WRITE_ROWS", "RING_WRITE_WARPS", "RECALL_BT", "RECALL_BT_SHORT", "RECALL_BW", "RECALL_WARPS",
-    "RECALL_STAGES", "RECALL_STATS_WARPS", "RECALL_STATS_STAGES", "RECALL_VALUE_WARPS", "RECALL_VALUE_STAGES",
+    "RECALL_STAGES", "RECALL_STATS_SPLIT", "RECALL_STATS_WARPS", "RECALL_STATS_STAGES", "RECALL_VALUE_WARPS", "RECALL_VALUE_STAGES",
     "RECALL_VALUE_BDV",
     "ring_read_t1_takes", "ring_read_t1", "ring_read_t1_ref",
     "xq_form_t1", "xq_form_t1_ref", "xq_weight_stack", "xq_head_gain",
@@ -103,7 +105,9 @@ RECALL_BT_SHORT = 16
 RECALL_BW = 128
 RECALL_WARPS = 8
 RECALL_STAGES = 1
-# prefill recall, two-launch form (T >= 64): statistics pass, value pass, value columns per value program
+# prefill recall, two-launch form (T >= 64): statistics pass (its W slots split over gcd(RECALL_STATS_SPLIT, W / RECALL_BW)
+# programs), value pass, value columns per value program
+RECALL_STATS_SPLIT = 4
 RECALL_STATS_WARPS = 4
 RECALL_STATS_STAGES = 1
 RECALL_VALUE_WARPS = 8
@@ -921,10 +925,11 @@ def _ring_stats_kernel(Q, sq_b, sq_g, sq_t, sq_d, KR, sk_b, sk_h, sk_w, sk_d,
                        scale, T, W, G, HR,
                        M0, M1, M2, M3, sm_b, sm_t, sm_w, BETA, sbe_n, sbe_h, SCR, MST, LST, VFL,
                        XQ: tl.constexpr, DK: tl.constexpr,
-                       BT: tl.constexpr, BW: tl.constexpr, N_IND: tl.constexpr):
-    """Two-launch recall, launch 1: the scores x of every valid (BT, BW) tile into SCR, the row max / sum into
-    MST / LST, a per-(program, tile) validity flag into VFL.  A tile is valid for the block when one of its slots has
-    a finite clock and is not causal for the block's last valid row."""
+                       BT: tl.constexpr, BW: tl.constexpr, N_IND: tl.constexpr, NSPLIT: tl.constexpr):
+    """Two-launch recall, launch 1: program (t block, b g, split) -- the scores x of every valid (BT, BW) tile of its
+    W / NSPLIT slots into SCR, the split's row max / sum (raw: -inf / 0 without a valid slot) into MST / LST, a
+    per-(program, tile) validity flag into VFL.  A tile is valid for the block when one of its slots has a finite clock
+    and is not causal for the block's last valid row."""
     pt = tl.program_id(0)
     pbg = tl.program_id(1)
     b = pbg // G
@@ -945,11 +950,13 @@ def _ring_stats_kernel(Q, sq_b, sq_g, sq_t, sq_d, KR, sk_b, sk_h, sk_w, sk_d,
         ct = tl.load(CA + b * sca_b + g * sca_g + t * sca_t, mask=tm, other=0.0)
     nT = tl.cdiv(T, BT)
     prog = pbg * nT + pt
+    ps = tl.program_id(2)
     scr = SCR + (prog * BT + tl.arange(0, BT))[:, None].to(tl.int64) * W
     t_max = tl.minimum(pt * BT + BT, T) - 1
     m_i = tl.full([BT], float("-inf"), tl.float32)
     l_i = tl.zeros([BT], dtype=tl.float32)
-    for w0 in range(0, W, BW):
+    WS = W // NSPLIT
+    for w0 in range(ps * WS, ps * WS + WS, BW):
         w = w0 + tl.arange(0, BW)
         cw, causal, valid = _rf_valid(CW, scw_b, scw_h, scw_w, b, hr, w, t, tm, p0, T, W)
         jw = (w.to(tl.int64) - p0) % W
@@ -968,18 +975,17 @@ def _ring_stats_kernel(Q, sq_b, sq_g, sq_t, sq_d, KR, sk_b, sk_h, sk_w, sk_d,
             tl.store(VFL + prog * (W // BW) + w0 // BW, 1)
         else:
             tl.store(VFL + prog * (W // BW) + w0 // BW, 0)
-    m_safe = tl.where(m_i == float("-inf"), 0.0, m_i)
-    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
-    tl.store(MST + prog * BT + tl.arange(0, BT), m_safe)
-    tl.store(LST + prog * BT + tl.arange(0, BT), l_safe)
+    tl.store(MST + (prog * NSPLIT + ps) * BT + tl.arange(0, BT), m_i)
+    tl.store(LST + (prog * NSPLIT + ps) * BT + tl.arange(0, BT), l_i)
 
 
 @triton.jit
 def _ring_value_kernel(GV, sg_b, sg_h, sg_w, sg_d, OUT, so_t, so_b, so_c, T, W, G, HR, SCR, MST, LST, VFL,
                        XQ: tl.constexpr, DV: tl.constexpr, BT: tl.constexpr, BW: tl.constexpr,
-                       OUT_DTYPE: tl.constexpr, BDV: tl.constexpr):
-    """Two-launch recall, launch 2: p = exp(x - m) * (1 / l) from the stored scores, rounded to bf16, times the ring
-    values on the valid tiles (VFL) into a (BT, BDV) fp32 accumulator."""
+                       OUT_DTYPE: tl.constexpr, BDV: tl.constexpr, NSPLIT: tl.constexpr):
+    """Two-launch recall, launch 2: the row max m / sum l combined from the NSPLIT splits' statistics, p = exp(x - m) *
+    (1 / l) from the stored scores, rounded to bf16, times the ring values on the valid tiles (VFL) into a (BT, BDV) fp32
+    accumulator."""
     pt = tl.program_id(0)
     pbg = tl.program_id(1)
     pd = tl.program_id(2)
@@ -994,8 +1000,16 @@ def _ring_value_kernel(GV, sg_b, sg_h, sg_w, sg_d, OUT, so_t, so_b, so_c, T, W, 
     nT = tl.cdiv(T, BT)
     prog = pbg * nT + pt
     scr = SCR + (prog * BT + tl.arange(0, BT))[:, None].to(tl.int64) * W
-    m_safe = tl.load(MST + prog * BT + tl.arange(0, BT))
-    l_safe = tl.load(LST + prog * BT + tl.arange(0, BT))
+    m_r = tl.full([BT], float("-inf"), tl.float32)
+    for ps in tl.static_range(NSPLIT):
+        m_r = tl.maximum(m_r, tl.load(MST + (prog * NSPLIT + ps) * BT + tl.arange(0, BT)))
+    m_safe = tl.where(m_r == float("-inf"), 0.0, m_r)
+    l_r = tl.zeros([BT], dtype=tl.float32)
+    for ps in tl.static_range(NSPLIT):
+        m_s = tl.load(MST + (prog * NSPLIT + ps) * BT + tl.arange(0, BT))
+        l_s = tl.load(LST + (prog * NSPLIT + ps) * BT + tl.arange(0, BT))
+        l_r = l_r + tl.where(l_s > 0.0, l_s * tl.exp(m_s - m_safe), 0.0)
+    l_safe = tl.where(l_r > 0.0, l_r, 1.0)
     inv_l = 1.0 / l_safe
     dvv = pd * BDV + tl.arange(0, BDV)
     acc = tl.zeros([BT, BDV], dtype=tl.float32)
@@ -1093,18 +1107,19 @@ def _ring_recall_prefill_fwd(q4: torch.Tensor, k_ring: torch.Tensor, gv_ring: to
         # two launches: statistics (no accumulator) and values
         BT = RECALL_BT
         nT = triton.cdiv(T, BT)
+        nsp = math.gcd(RECALL_STATS_SPLIT, W // BW)           # the slot ranges: whole BW tiles each
         scr = torch.empty((B * G * nT * BT, W), dtype=torch.float32, device=dev)
-        mst = torch.empty((B * G * nT * BT,), dtype=torch.float32, device=dev)
-        lst = torch.empty((B * G * nT * BT,), dtype=torch.float32, device=dev)
+        mst = torch.empty((B * G * nT * nsp * BT,), dtype=torch.float32, device=dev)
+        lst = torch.empty((B * G * nT * nsp * BT,), dtype=torch.float32, device=dev)
         vfl = torch.empty((B * G * nT, W // BW), dtype=torch.int32, device=dev)
-        _ring_stats_kernel[(nT, B * G)](
+        _ring_stats_kernel[(nT, B * G, nsp)](
             *qs, *ks, *cs, p0, float(scale), T, W, G, int(hr), *inds, scr, mst, lst, vfl,
-            XQ=bool(xq), DK=dk, BT=BT, BW=BW, N_IND=n_ind,
+            XQ=bool(xq), DK=dk, BT=BT, BW=BW, N_IND=n_ind, NSPLIT=nsp,
             num_warps=RECALL_STATS_WARPS, num_stages=RECALL_STATS_STAGES)
         _ring_value_kernel[(nT, B * G, dv // RECALL_VALUE_BDV)](
             *gs, out, out.stride(0), out.stride(1), out.stride(2), T, W, G, int(hr), scr, mst, lst, vfl,
             XQ=bool(xq), DV=dv, BT=BT, BW=BW, OUT_DTYPE=_OUT_TL[out_dtype], BDV=RECALL_VALUE_BDV,
-            num_warps=RECALL_VALUE_WARPS, num_stages=RECALL_VALUE_STAGES)
+            NSPLIT=nsp, num_warps=RECALL_VALUE_WARPS, num_stages=RECALL_VALUE_STAGES)
     else:
         BT = RECALL_BT_SHORT
         _ring_fast_kernel[(triton.cdiv(T, BT), B * G, 1)](

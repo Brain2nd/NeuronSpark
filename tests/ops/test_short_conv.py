@@ -2,16 +2,20 @@
 
 * ``short_conv_train`` at T 1024, B 8, C 4608: output, input gradient and the fp32 weight gradient, against the fp32
   tap-chain reference; two uses of the weight in one graph;
-* ``short_conv_prefill`` at b in {1, 8}, T in {3, 63, 64, 256, 1024, 2048}, chained over two calls (the carried taps);
+* ``short_conv_silu_prefill`` (the conv and its SiLU) at b in {1, 8}, T in {3, 63, 64, 256, 1024, 2048}, chained over
+  two calls (the carried taps);
 * ``short_conv_step`` at b in {1, 2, 4, 8, 16, 32}, several consecutive steps;
 
-the inference forms against the torch chains (outputs and the rolled history), and the steps against one prefill.
+the inference forms against the torch chains (outputs and the rolled history), and the steps (with the SiLU applied to
+their outputs) against one prefill.
 Every comparison is the per-operator rule of ``neuronspark.utils.testing`` (matched ratio 1.0).
 """
 import pytest
 import torch
 
-from neuronspark.ops.triton.short_conv import (short_conv_prefill, short_conv_prefill_ref, short_conv_step,
+import torch.nn.functional as F
+
+from neuronspark.ops.triton.short_conv import (short_conv_silu_prefill, short_conv_silu_prefill_ref, short_conv_step,
                                                short_conv_step_ref, short_conv_train, short_conv_train_ref)
 from neuronspark.utils.precision import regime
 from neuronspark.utils.testing import assert_all_match, rand_tensor
@@ -80,17 +84,17 @@ def _prefill_run(fn, x1, x2, hist, w):
 
 
 @pytest.mark.parametrize("b,t", PREFILL, ids=[f"b{b}_t{t}" for b, t in PREFILL])
-def test_short_conv_prefill_vs_reference(device, b, t):
+def test_short_conv_silu_prefill_vs_reference(device, b, t):
     x1 = rand_tensor((t, b, C), torch.bfloat16, device)
     x2 = rand_tensor((t, b, C), torch.bfloat16, device)
     hist, w = _hist(device, b), _weight(device)
-    assert_all_match(_prefill_run(short_conv_prefill, x1, x2, hist, w),
-                     _prefill_run(short_conv_prefill_ref, x1, x2, hist, w), prefix="short_conv_prefill")
+    assert_all_match(_prefill_run(short_conv_silu_prefill, x1, x2, hist, w),
+                     _prefill_run(short_conv_silu_prefill_ref, x1, x2, hist, w), prefix="short_conv_silu_prefill")
 
 
-def test_short_conv_prefill_rejects_short_call(device):
+def test_short_conv_silu_prefill_rejects_short_call(device):
     with pytest.raises(RuntimeError):
-        short_conv_prefill(rand_tensor((2, 1, C), torch.bfloat16, device), _hist(device, 1), _weight(device))
+        short_conv_silu_prefill(rand_tensor((2, 1, C), torch.bfloat16, device), _hist(device, 1), _weight(device))
 
 
 # ------------------------------------------------------------------------------------------------ decode step
@@ -117,12 +121,13 @@ def test_short_conv_step_vs_reference(device, b):
 
 
 def test_short_conv_step_matches_prefill(device):
-    """Consecutive steps from a carried history match one prefill call over the same tokens under the rule."""
+    """Consecutive steps from a carried history (their outputs through SiLU) match one prefill call over the same tokens
+    under the rule."""
     b, t = 8, 16
     x = rand_tensor((t, b, C), torch.bfloat16, device)
     hist, w = _hist(device, b), _weight(device)
     h_pre, h_step = hist.clone(), hist.clone()
     with torch.no_grad():
-        y_pre = short_conv_prefill(x, h_pre, w)
-        y_step = torch.stack([short_conv_step(x[i], h_step, w) for i in range(t)], dim=0)
+        y_pre = short_conv_silu_prefill(x, h_pre, w)
+        y_step = F.silu(torch.stack([short_conv_step(x[i], h_step, w) for i in range(t)], dim=0))
     assert_all_match({"y": y_step, "hist": h_step}, {"y": y_pre, "hist": h_pre}, prefix="step_vs_prefill")

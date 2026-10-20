@@ -40,7 +40,7 @@ Regime differences kept explicitly in the code paths (each regime has its own nu
 * the pool clock: ``ops.cumsum0`` (whole row), ``ops.exact_cumsum0`` over the carried clock (prefill), one add
   (decode); the value-residual running mean: ``ops.cumsum0`` + ``ops.zc_center`` (whole row),
   ``ops.centred_running`` (prefill), torch over the carried sum (decode);
-* short conv: ``ops.short_conv_train`` / ``ops.short_conv_prefill`` (T >= 3; a 2-token call takes the depthwise
+* short conv: ``ops.short_conv_train`` / ``ops.short_conv_silu_prefill`` (T >= 3, the SiLU in the store; a 2-token call takes the depthwise
   ``F.conv1d`` over the carried history) / ``ops.short_conv_step``;
 * prefill only: the value-residual gate's centred input is written in bf16 (the operand dtype of its projection),
   ``lam`` is formed by ``ops.vr_lambda_prefill`` (tanh of the gate repeated over each head's channels plus the
@@ -543,11 +543,10 @@ class PoolAttentionMixin:
             raise RuntimeError(f"memory layer: a call of {T} tokens exceeds the ring capacity {W}")
         qkv = lin(z, self.qkv_proj.weight)
         if T >= 3:
-            qkv = o.short_conv_prefill(qkv, st.conv_hist, self.qkv_conv.weight)
+            qkv = o.short_conv_silu_prefill(qkv, st.conv_hist, self.qkv_conv.weight)      # the conv and its SiLU
         else:
-            qkv = self._short_conv_two(qkv, st.conv_hist)
+            qkv = F.silu(self._short_conv_two(qkv, st.conv_hist))
         q, k, v = qkv.split([self.D_key, self.D_key, self.D_value], dim=-1)
-        q, k, v = F.silu(q), F.silu(k), F.silu(v)
         # value-residual mix: the centred input in bf16 (its only consumer is the bf16 gate projection, whose input
         # cast is the same rounding), the tanh gate repeated over each head's channels in one kernel
         zc = o.centred_running(z, st.vr_sum, pos0, torch.bfloat16)

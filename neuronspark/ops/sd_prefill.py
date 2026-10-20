@@ -18,7 +18,8 @@ Op (registry name ``sd_chunk_scan_prefill``; inference prefill, no autograd)::
 * ``dt``  (B, T, H)    bf16 -- the raw step sizes, any strides (the strided slice of the in-projection);
 * ``A``   (H,) fp32 = ``-exp(A_log)``; ``D`` (H,) fp32; ``dt_bias`` (H,) fp32;
 * ``Bm`` / ``Cm`` (B, T, 1, N) bf16 -- the shared input / output projections, unit last stride;
-* ``initial_state`` (B, H, P, N) fp32 -- the carried compartments (a bf16 cache state is upcast by the caller);
+* ``initial_state`` (B, H, P, N) fp32 or bf16 -- the carried compartments in the cache's storage dtype (the state-passing
+  kernel widens a bf16 state to fp32 on load: the same values as an upcast copy);
 * returns ``y`` (B, T, H, P) bf16 contiguous and ``final_state`` (B, H, P, N) fp32 (the caller stores it back in
   the cache's state dtype: one rounding per call for a bf16 state).
 
@@ -63,7 +64,7 @@ Contract (anything else raises): CUDA tensors on one device of a Blackwell GPU (
 descriptors, tcgen05 / TMEM); the dtypes and shapes above with ngroups 1, N in {64, 128}, P in {16, 32, 64, 128}
 (P <= 64 and H even when T is a multiple of 256: the Gluon kernel's two heads per item in tensor memory),
 ``chunk_size`` 256, T <= 64 chunks (16384 tokens) per call; ``x`` with a contiguous (H, P) part (or a non-unit last
-stride, which is copied as mamba_ssm does); ``initial_state`` fp32.  For whole-chunk calls an ``x`` / ``Cm`` whose
+stride, which is copied as mamba_ssm does); ``initial_state`` fp32 or bf16.  For whole-chunk calls an ``x`` / ``Cm`` whose
 batch stride is not T times its row stride (a time slice of a longer buffer) is copied to the standard layout first
 (a layout change only).  The Gluon kernel builds its work split on the first call per (B, nchunks, device): that
 call must not be inside a CUDA-graph capture (it raises).
@@ -231,8 +232,9 @@ def _check_operands(x, dt, A, Bm, Cm, D, dt_bias, initial_state, chunk_size) -> 
     for name, t in (("A", A), ("D", D), ("dt_bias", dt_bias)):
         if t.dtype != torch.float32 or tuple(t.shape) != (nheads,):
             _fail(f"{name} must be fp32 ({nheads},), got {t.dtype} {tuple(t.shape)}")
-    if initial_state.dtype != torch.float32 or tuple(initial_state.shape) != (batch, nheads, headdim, dstate):
-        _fail(f"initial_state must be fp32 ({batch}, {nheads}, {headdim}, {dstate}), got {initial_state.dtype} "
+    if (initial_state.dtype not in (torch.float32, torch.bfloat16)
+            or tuple(initial_state.shape) != (batch, nheads, headdim, dstate)):
+        _fail(f"initial_state must be fp32 or bf16 ({batch}, {nheads}, {headdim}, {dstate}), got {initial_state.dtype} "
               f"{tuple(initial_state.shape)}")
     if x.stride(3) == 1 and x.stride(2) != headdim:
         # (a non-unit last stride is copied to the contiguous layout by the launcher's layout rules)

@@ -197,6 +197,15 @@ def test_prefill_split_at_chunk_multiples(device, b, splits):
     assert_all_match({"y": torch.cat(ys, dim=1), "final_state": state}, whole, prefix=f"prefill_split_b{b}")
 
 
+@pytest.mark.parametrize("b,T", [(1, 1024), (8, 1024), (2, 300)], ids=["b1_t1024", "b8_t1024", "b2_t300"])
+def test_prefill_scan_bf16_initial_state(device, b, T):
+    """A bf16 carried state handed to the scan as is (the state-passing kernel widens it on load) gives the outputs of its
+    fp32 upcast."""
+    o = operands(b, T, device)
+    o16 = dict(o, init=o["init"].to(torch.bfloat16))
+    assert_all_match(_op(o16), _op(o), prefix="bf16_initial_state")
+
+
 def test_inputs_unchanged(device):
     for T in (300, 512):
         o = operands(2, T, device, "fp32")
@@ -214,7 +223,7 @@ def test_refusals(device):
         with pytest.raises(RuntimeError):
             sd_chunk_scan_prefill(x, dt, A, Bm, Cm, D, dtb, init, chunk_size=128)              # chunk size
         with pytest.raises(RuntimeError):
-            sd_chunk_scan_prefill(x, dt, A, Bm, Cm, D, dtb, init.to(torch.bfloat16), chunk_size=CHUNK)   # bf16 state
+            sd_chunk_scan_prefill(x, dt, A, Bm, Cm, D, dtb, init.to(torch.float16), chunk_size=CHUNK)    # fp16 state
         with pytest.raises(RuntimeError):
             sd_chunk_scan_prefill(x.float(), dt, A, Bm, Cm, D, dtb, init, chunk_size=CHUNK)    # fp32 x
         with pytest.raises(RuntimeError):

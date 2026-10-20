@@ -353,7 +353,7 @@ class SDMixer(nn.Module):
         Cm = xbc[..., di + N:].view(B, T, 1, N)
         # the scan starts from the state in fp32; the final state is stored back in the cache's dtype (one rounding
         # per call for a bf16 state)
-        y, final_state = o.sd_chunk_scan_prefill(x, dt, self.A(), Bm, Cm, self.D, self.dt_bias, state.ssm.float(),
+        y, final_state = o.sd_chunk_scan_prefill(x, dt, self.A(), Bm, Cm, self.D, self.dt_bias, state.ssm,
                                                  chunk_size=self.chunk_size)
         state.ssm.copy_(final_state)
         xo = o.sd_gated_norm_soma(y.reshape(B * T, di), z.reshape(B * T, di), self.theta(), self.gamma, self.norm_eps)

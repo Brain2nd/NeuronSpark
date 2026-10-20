@@ -51,7 +51,7 @@ class Linear(nn.Linear):
 class ShortConvWeight(nn.Module):
     """Holder of the depthwise causal short-convolution weight ``weight`` of shape ``(channels, 1, width)`` (fp32 by
     default); tap ``width - 1`` multiplies the current position (lag 0).  The convolution itself is an op
-    (``short_conv_train`` / ``short_conv_prefill`` / ``short_conv_step``).
+    (``short_conv_train`` / ``short_conv_silu_prefill`` / ``short_conv_step``).
 
     ``init``: ``"identity"`` (zeros, last tap 1: the conv starts as a pass-through), or ``"empty"`` (no init).
     """

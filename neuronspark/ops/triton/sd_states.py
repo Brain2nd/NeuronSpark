@@ -10,7 +10,7 @@ Internal pieces (not registry ops); ``csp_fused``, ``spd_fused``, ``db_tma`` and
   ``states_pre`` (b, nc, h, P, N) fp32 = each chunk's own state, ``states`` (b, nc, h, P, N) in out_dtype = the state
   entering chunk c (states[0] = 0; the final state is not stored).
 * ``csp_prefill(B, x, dt, dA_cumsum, initial_state, out_dtype) -> (states, final_state)``: the same pair from a
-  carried ``initial_state`` (b, h, P, N) fp32, ``_state_passing_fwd(.., initial_states=initial_state, out_dtype)``:
+  carried ``initial_state`` (b, h, P, N) fp32 or bf16 (widened on load), ``_state_passing_fwd(.., initial_states=initial_state, out_dtype)``:
   ``states`` (b, nc, h, P, N) in out_dtype = the state entering chunk c (states[0] = the initial state),
   ``final_state`` (b, h, P, N) fp32.  Each chunk's own fp32 state is consumed in registers by the passing step and
   never stored (the value the stock pair stores in fp32 and reads back: the same).
@@ -399,7 +399,7 @@ def csp_prefill(B, x, dt, dA_cumsum, initial_state, out_dtype):
     states_in_fp32=True) flattened, dA_cumsum[:, :, :, -1], initial_states=initial_state flattened, seq_idx=None,
     out_dtype=out_dtype)`` in one kernel (see _csp_prefill_kernel).  B (b, l, 1, N), x (b, l, h, P) with unit last
     strides and a contiguous (h, P) part (any row / batch strides); dt / dA_cumsum (b, h, nc, chunk) with unit last
-    stride; initial_state (b, h, P, N) fp32 (any strides).  Partial last chunks are supported (rows past seqlen are the
+    stride; initial_state (b, h, P, N) fp32 or bf16 (any strides; widened to fp32 on load).  Partial last chunks are supported (rows past seqlen are the
     descriptor's zero fill and masked loads)."""
     require_cuda(x, "csp_prefill")
     batch, seqlen, nheads, headdim = x.shape
@@ -413,9 +413,10 @@ def csp_prefill(B, x, dt, dA_cumsum, initial_state, out_dtype):
         raise RuntimeError(f"neuronspark.csp_prefill: shapes B {tuple(B.shape)} dt {tuple(dt.shape)} x {tuple(x.shape)}")
     if dA_cumsum.shape != dt.shape:
         raise RuntimeError("neuronspark.csp_prefill: dA_cumsum must have dt's shape")
-    if tuple(initial_state.shape) != (batch, nheads, headdim, dstate) or initial_state.dtype != torch.float32:
-        raise RuntimeError(f"neuronspark.csp_prefill: initial_state must be fp32 {(batch, nheads, headdim, dstate)}, got "
-                           f"{initial_state.dtype} {tuple(initial_state.shape)}")
+    if (tuple(initial_state.shape) != (batch, nheads, headdim, dstate)
+            or initial_state.dtype not in (torch.float32, torch.bfloat16)):
+        raise RuntimeError(f"neuronspark.csp_prefill: initial_state must be fp32 or bf16 {(batch, nheads, headdim, dstate)} "
+                           f"(widened to fp32 on load), got {initial_state.dtype} {tuple(initial_state.shape)}")
     if B.stride(-1) != 1 or x.stride(-1) != 1 or dt.stride(-1) != 1 or dA_cumsum.stride(-1) != 1:
         raise RuntimeError("neuronspark.csp_prefill: unit last strides of B / x / dt / dA_cumsum expected")
     if nchunks < 1 or nchunks > CSP_MAX_CHUNKS or not (nchunks - 1) * chunk_size < seqlen <= nchunks * chunk_size:

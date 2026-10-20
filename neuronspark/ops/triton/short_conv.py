@@ -7,7 +7,7 @@ Operators (registry names):
   with channel stride 1, ``weight`` fp32 (C, 1, 4); returns (T, B, C) bf16 contiguous (T-major).  Backward: the input
   gradient by the same fma chain in the reference tap order, and the fp32 weight gradient ``dW[c, 0, k] =
   sum_{b, t} x[t - 3 + k] dy[t]`` returned as ``weight.grad``.
-* ``short_conv_prefill(x, hist, weight)`` (prefill, T >= 3, no autograd): the same chain with the carried three taps
+* ``short_conv_silu_prefill(x, hist, weight)`` (prefill, T >= 3, no autograd): the same chain with the carried three taps
   ``hist`` (B, C, 3) (oldest first) standing for ``x[t < 0]``; ``hist`` is rolled in place to the call's last three
   inputs.  Returns (T, B, C) bf16 contiguous.
 * ``short_conv_step(x, hist, weight)`` (decode, T == 1, no autograd): ``y = w0 h0 + w1 h1 + w2 h2 + w3 x`` as the fma
@@ -41,7 +41,7 @@ from neuronspark.ops.triton._ptx import (  # noqa: F401  (jit helpers resolved t
     _sr_f32_to_bf16 as _scn,
 )
 
-__all__ = ["ShortConvFn", "short_conv_train", "short_conv_train_ref", "short_conv_prefill", "short_conv_prefill_ref",
+__all__ = ["ShortConvFn", "short_conv_train", "short_conv_train_ref", "short_conv_silu_prefill", "short_conv_silu_prefill_ref",
            "short_conv_step", "short_conv_step_ref"]
 
 K = 4
@@ -193,8 +193,9 @@ def _conv_step_kernel(X, HIST, WT, OUT, s_x_b, s_h_b, s_h_c, s_out_b, C, BLOCK: 
 def _conv_prefill_kernel(X, HIST, WT, OUT, s_x_t, s_x_b, s_h_b, s_h_c, s_o_t, s_o_b, T, C,
                          BT: tl.constexpr, BC: tl.constexpr):
     """one (b, t-tile, c-tile): y[t, c] = w3 x[t] + w2 x[t-1] + w1 x[t-2] + w0 x[t-3] as the fp32 FMA chain of
-    PyTorch's depthwise conv (tap 0 oldest) on bf16 operands, x[t < 0] = the carried history (bf16-valued); the last
-    three rows of the call roll into the history (written by the tile that holds t = T - 1)"""
+    PyTorch's depthwise conv (tap 0 oldest) on bf16 operands, x[t < 0] = the carried history (bf16-valued), rounded to
+    bf16, then its SiLU (fp32 with Triton's exponential and division, one rounding to bf16); the last three rows of the
+    call roll into the history (written by the tile that holds t = T - 1)"""
     b = tl.program_id(0)
     pt = tl.program_id(1)
     pc = tl.program_id(2)
@@ -227,7 +228,8 @@ def _conv_prefill_kernel(X, HIST, WT, OUT, s_x_t, s_x_b, s_h_b, s_h_c, s_o_t, s_
     acc = tl.math.fma(w1[None, :], x2, acc)
     acc = tl.math.fma(w2[None, :], x1, acc)
     acc = tl.math.fma(w3[None, :], x0, acc)
-    o16 = acc.to(tl.bfloat16)
+    of = acc.to(tl.bfloat16).to(tl.float32)
+    o16 = (of / (1.0 + tl.exp(-of))).to(tl.bfloat16)                    # SiLU of the bf16 conv output (fp32, one rounding)
     tl.store(OUT + t[:, None] * s_o_t + b * s_o_b + c[None, :], o16, mask=m)
     # the history roll: x[T-3], x[T-2], x[T-1] (the tile holding t = T - 1)
     last = (T - 1) // BT
@@ -370,7 +372,7 @@ def _check_hist(hist: torch.Tensor, B: int, C: int, what: str) -> None:
                            f"{tuple(getattr(hist, 'stride', lambda: ())())} (need (B, C, 3) with contiguous taps)")
 
 
-@torch.library.custom_op("neuronspark::short_conv_prefill", mutates_args=("hist",),
+@torch.library.custom_op("neuronspark::short_conv_silu_prefill", mutates_args=("hist",),
                          schema="(Tensor x, Tensor(a!) hist, Tensor weight) -> Tensor")
 def _sc_prefill(x, hist, weight):
     T, B, C = (int(v) for v in x.shape)
@@ -386,29 +388,29 @@ def _sc_prefill_fake(x, hist, weight):
     return torch.empty(tuple(x.shape), dtype=torch.bfloat16, device=x.device)
 
 
-def short_conv_prefill(x: torch.Tensor, hist: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """The causal conv of a prefill call: ``x`` (T, B, C) bf16 with unit inner stride and T >= 3, ``hist`` (B, C, 3)
-    the carried taps (rolled in place to the call's last three inputs), ``weight`` fp32 (C, 1, 4) -> (T, B, C) bf16
-    contiguous.  No autograd."""
-    require_cuda(x, "short_conv_prefill")
+def short_conv_silu_prefill(x: torch.Tensor, hist: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """The causal conv of a prefill call followed by the SiLU of q / k / v: ``x`` (T, B, C) bf16 with unit inner stride
+    and T >= 3, ``hist`` (B, C, 3) the carried taps (rolled in place to the call's last three inputs), ``weight`` fp32
+    (C, 1, 4) -> (T, B, C) bf16 contiguous ``silu(conv(x))``.  No autograd."""
+    require_cuda(x, "short_conv_silu_prefill")
     if x.dim() != 3 or x.dtype != torch.bfloat16 or x.stride(2) != 1 or int(x.shape[0]) < 3:
-        raise RuntimeError(f"neuronspark.short_conv_prefill: x {tuple(x.shape)} {x.dtype} strides {tuple(x.stride())} "
-                           "(bf16, unit inner stride, T >= 3)")
+        raise RuntimeError(f"neuronspark.short_conv_silu_prefill: x {tuple(x.shape)} {x.dtype} strides "
+                           f"{tuple(x.stride())} (bf16, unit inner stride, T >= 3)")
     T, B, C = (int(v) for v in x.shape)
-    _check_hist(hist, B, C, "short_conv_prefill")
-    _check_weight(weight, C, "short_conv_prefill")
+    _check_hist(hist, B, C, "short_conv_silu_prefill")
+    _check_weight(weight, C, "short_conv_silu_prefill")
     return _sc_prefill(x, hist, weight)
 
 
-def short_conv_prefill_ref(x: torch.Tensor, hist: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+def short_conv_silu_prefill_ref(x: torch.Tensor, hist: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """The torch path at T > 1: (T, B, C) -> (B, C, T), cat with the bf16 history, F.conv1d on bf16 operands, the
-    roll (hist <- the last 3 taps of the staged input, in place)."""
+    roll (hist <- the last 3 taps of the staged input, in place), F.silu of the bf16 output."""
     T, B, C = x.shape
     xb = x.permute(1, 2, 0)
     full = torch.cat([hist.to(torch.bfloat16), xb], dim=2)
     out = F.conv1d(full, weight.to(torch.bfloat16), groups=C)                                   # (B, C, T)
     hist.copy_(full[:, :, full.shape[2] - 3:].to(hist.dtype))
-    return out.permute(2, 0, 1)
+    return F.silu(out.permute(2, 0, 1))
 
 
 @torch.library.custom_op("neuronspark::short_conv_step", mutates_args=("hist",),

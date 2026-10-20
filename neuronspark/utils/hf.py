@@ -18,7 +18,7 @@ Checkpoint directory format (written by :func:`save_pretrained`, read by :func:`
       backbone.lexical_memory.tables.{k}            (rows, dim) fp32 lexical n-gram tables
       backbone.lexical_memory.hash_{mult,add,wrap}  int64 lexical hash constants
 
-  Non-persistent buffers (RoPE tables, unit norm weights) are not stored.  For the 1MIX configuration the file holds
+  Non-persistent buffers (RoPE tables, unit norm weights) are not stored.  For the 1.27B configuration the file holds
   678 tensors: 609 fp32 parameters (1,270,342,292 elements) and 69 persistent buffers (10,908 elements);
 * optionally the tokenizer files :data:`TOKENIZER_FILES`, copied unchanged.
 
@@ -148,7 +148,7 @@ def _expected_anchor(config: NeuronSparkConfig, mem_index: int) -> torch.Tensor:
 
 def verify_state_dict(config: NeuronSparkConfig, state_dict: Mapping[str, torch.Tensor],
                       allow_uncalibrated: bool = False) -> Dict[str, Any]:
-    """Raise unless ``state_dict`` (``backbone.*`` keys) is a complete 1MIX checkpoint for ``config`` (see the module
+    """Raise unless ``state_dict`` (``backbone.*`` keys) is a complete checkpoint for ``config`` (see the module
     docstring).  Returns a summary (tensor and element counts, the uncalibrated memory layers)."""
     params, buffers, hashes = _layout(config)
     want = set(params) | set(buffers)

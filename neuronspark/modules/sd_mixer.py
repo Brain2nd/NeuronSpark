@@ -2,7 +2,7 @@
 
 The mixer reads the residual stream through a Mamba-2 selective state space whose state ``S[h, p, :]`` holds the
 membrane potentials of the ``N`` dendritic compartments of soma ``(h, p)``, and emits through bipolar soft-threshold
-somata.  Per token ``t`` (1MIX: d_model 1536, d_inner 9216 = 6 * 1536, H = 144 heads of P = 64 somata, N = 128
+somata.  Per token ``t`` (1.27B: d_model 1536, d_inner 9216 = 6 * 1536, H = 144 heads of P = 64 somata, N = 128
 compartments, conv width 4)::
 
     hn_t            = RMSNorm(h_t) * pre_norm_gain                       eps 1e-5
@@ -392,7 +392,7 @@ class SDMixer(nn.Module):
 
 
 class SDLayer(nn.Module):
-    """An SD layer of the 1MIX stack (18 instances, ``layers.{i}`` for i not in (3, 7, ..., 23)): ``mixer_a`` and the
+    """An SD layer of the stack (18 instances, ``layers.{i}`` for i not in (3, 7, ..., 23)): ``mixer_a`` and the
     fp32 residual addition.
 
     ``forward(h, inference_params=None, *, hn=None, next_norm_gain=None) -> (h, hn_next | None)``:

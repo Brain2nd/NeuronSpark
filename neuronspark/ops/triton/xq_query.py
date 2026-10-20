@@ -1,6 +1,6 @@
 """Extra-query formation of a prefill call in one kernel.
 
-The last memory head reads its ring with M extra queries (1MIX: M = 4, dk = 256).  Query m of row (t, b) is formed
+The last memory head reads its ring with M extra queries (1.27B: M = 4, dk = 256).  Query m of row (t, b) is formed
 from its bf16 projection ``q_m`` (T, B, dk) (``bf16(u[..., r m : r m + r] @ pool_xq_b[m]^T)``, a cuBLAS GEMM outside
 this op) by the expressions of the memory layer under the bf16 autocast of the inference regime::
 

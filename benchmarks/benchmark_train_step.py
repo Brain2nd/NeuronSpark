@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Training-step throughput of the 1MIX model (eager PyTorch: no CUDA graph, no torch.compile).
+"""Training-step throughput of the NeuronSpark model (eager PyTorch: no CUDA graph, no torch.compile).
 
 One step = ``model.loss(input_ids, targets)`` (whole-row regime: bf16 autocast, TF32 on) + ``backward()`` + global
 gradient-norm clipping (1.0) + one fused ``torch.optim.AdamW`` step over the four parameter groups of
@@ -13,7 +13,7 @@ device time of the step's kernels (CUPTI, L2 flushed before each step).  The wei
 loaded checkpoint is not written back.
 
 The model is loaded from ``--ckpt`` (a checkpoint directory: ``config.json`` + ``model.safetensors``); without it a
-fresh model is launched from ``configs/onemix_1p3b.json`` and calibrated on the first benchmark batches (the launch
+fresh model is launched from ``configs/neuronspark_1p3b.json`` and calibrated on the first benchmark batches (the launch
 calibration of a new training run).
 
 Example::
@@ -157,7 +157,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         from neuronspark.utils.calibration import CALIBRATION_ROWS, calibrate_fresh_model
 
-        config = NeuronSparkConfig.from_json(_HERE.parent / "configs" / "onemix_1p3b.json")
+        config = NeuronSparkConfig.from_json(_HERE.parent / "configs" / "neuronspark_1p3b.json")
         torch.manual_seed(a.seed)
         model = NeuronSparkLMHeadModel(config, device=dev, init="launch")
         vocab = int(config.vocab_size)

@@ -2,7 +2,7 @@
 
 Command-line options:
 
-* ``--ckpt DIR``: a 1MIX checkpoint directory (``config.json`` and ``model.safetensors`` as written by
+* ``--ckpt DIR``: a NeuronSpark checkpoint directory (``config.json`` and ``model.safetensors`` as written by
   ``save_pretrained``).
 
 Markers: ``cuda`` (skipped without a GPU), ``sm100`` (skipped below compute capability 10.0), ``ckpt`` (skipped
@@ -21,14 +21,14 @@ SEED = 0
 
 def pytest_addoption(parser):
     g = parser.getgroup("neuronspark")
-    g.addoption("--ckpt", default=None, help="1MIX checkpoint directory")
+    g.addoption("--ckpt", default=None, help="NeuronSpark checkpoint directory")
 
 
 def pytest_configure(config):
     for line in (
         "cuda: needs a CUDA GPU",
         "sm100: needs a Blackwell GPU (compute capability >= 10.0)",
-        "ckpt: needs the 1MIX checkpoint (--ckpt)",
+        "ckpt: needs the NeuronSpark checkpoint (--ckpt)",
     ):
         config.addinivalue_line("markers", line)
 

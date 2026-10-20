@@ -1,4 +1,4 @@
-"""utils.generation and the model's inference regimes, on the 1MIX checkpoint (``--ckpt``, GPU).
+"""utils.generation and the model's inference regimes, on the NeuronSpark checkpoint (``--ckpt``, GPU).
 
 * CUDA-graph decode against eager decode: the same tokens fed to both (teacher forcing with the eager run's tokens),
   the per-step logits by the per-operator rule (decode batch sizes 1, 2, 8, 32: the ring-kernel and torch-chain routes

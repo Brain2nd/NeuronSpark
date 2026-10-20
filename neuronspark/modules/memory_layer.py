@@ -1,4 +1,4 @@
-"""Memory layer of 1MIX (6 instances, layers 3, 7, 11, 15, 19, 23; state-dict prefix ``layers.{i}.``).
+"""Memory layer (6 instances, layers 3, 7, 11, 15, 19, 23; state-dict prefix ``layers.{i}.``).
 
 One call, residual stream h (T, B, D) fp32:
 

@@ -1,6 +1,6 @@
 """models: checkpoint layout, loading, verification and saving.
 
-* layout (no GPU, meta-device build): the 678 state tensors of the 1MIX model (609 parameters / 1,270,342,292
+* layout (no GPU, meta-device build): the 678 state tensors of the NeuronSpark model (609 parameters / 1,270,342,292
   elements, 69 persistent buffers / 10,908 elements), key prefixes, shapes and dtypes; the configuration file round
   trip and the model-type check;
 * checkpoint (``--ckpt``, GPU): a strict load of the 678 tensors; every loaded tensor against the file's tensor (dtype

@@ -17,7 +17,7 @@ Regimes:
 * training (:meth:`ReadoutBalance.ce_per_token`): the balanced logits are never materialised; the contributions and
   the labels go to the fused balance + cross-entropy operator ``balance_ce_per_token`` (forward and backward).
 
-The 1MIX configuration uses the widths (16, 32).
+The 1.27B configuration uses the widths (16, 32).
 """
 from __future__ import annotations
 

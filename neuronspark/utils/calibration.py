@@ -1,4 +1,4 @@
-"""Launch-time calibrations of a freshly launched 1MIX model.
+"""Launch-time calibrations of a freshly launched NeuronSpark model.
 
 A model built with ``init="launch"`` is calibrated once, before training, on the first 64 training rows (e.g. 8
 batches of (8, 1024) token ids), in the whole-row regime under ``torch.no_grad()`` and ``regime("train")``

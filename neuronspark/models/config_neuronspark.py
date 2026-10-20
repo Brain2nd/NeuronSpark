@@ -1,9 +1,9 @@
-"""Configuration of the NeuronSpark 1MIX language model and its on-disk form (``config.json``).
+"""Configuration of the NeuronSpark language model and its on-disk form (``config.json``).
 
 ``NeuronSparkConfig`` holds only the fields that change the computed function: a parameter shape, a numeric constant
 of the forward math, of the initialisation or of the launch-time calibration.  The architecture itself (layer forms,
-neuron model, mechanisms) is fixed in the code and is therefore not configurable.  The defaults are the 1MIX 1.27 B
-model; ``configs/onemix_1p3b.json`` is the same configuration on disk.
+neuron model, mechanisms) is fixed in the code and is therefore not configurable.  The defaults are the 1.27 B
+model; ``configs/neuronspark_1p3b.json`` is the same configuration on disk.
 
 Layout (24 layers, ratio 3:1): layer ``i`` is a memory layer iff ``(i + 1) % memory_layer_interval == 0`` (layers 3, 7,
 11, 15, 19, 23), every other layer is a selective-dendrite (SD) layer.
@@ -53,7 +53,7 @@ _PathLike = Union[str, "os.PathLike[str]"]
 
 @dataclass(frozen=True)
 class NeuronSparkConfig:
-    """Hyper-parameters of the 1MIX architecture (defaults = the 1.27 B model).
+    """Hyper-parameters of the NeuronSpark architecture (defaults = the 1.27 B model).
 
     Groups (consumer in parentheses):
 

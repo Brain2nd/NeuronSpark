@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "neuronspark"
 version = "1.0.0"
-description = "NeuronSpark 1MIX: a spiking language model (selective-dendrite and memory layers) with its Triton and Gluon operators"
+description = "NeuronSpark: a spiking language model (selective-dendrite and memory layers) with its Triton and Gluon operators"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
@@ -36,5 +36,5 @@ addopts = "--import-mode=importlib"
 markers = [
     "cuda: needs a CUDA GPU",
     "sm100: needs a Blackwell GPU (compute capability >= 10.0)",
-    "ckpt: needs the 1MIX checkpoint (--ckpt)",
+    "ckpt: needs the NeuronSpark checkpoint (--ckpt)",
 ]

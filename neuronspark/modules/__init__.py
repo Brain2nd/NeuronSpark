@@ -1,4 +1,4 @@
-"""Layer modules of the 1MIX model.
+"""Layer modules of the NeuronSpark model.
 
 Building blocks (this package): ``Linear`` / ``ShortConvWeight`` (``linear``), ``RMSNorm`` / ``frozen_rms_norm``
 (``norms``), the RoPE tables and reference (``rope``).  Layers (imported on first access): ``SDLayer`` / ``SDMixer``

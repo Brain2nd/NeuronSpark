@@ -2,7 +2,7 @@
 
 ``lex_read_prefill`` (one kernel per call: the 64-wide q / k RMS norms with zero-centred gains, the gate
 sigmoid(q . k / sqrt(64) + beta), the fp32 residual h + alpha o) against its torch chain ``lex_read_prefill_ref`` at
-the 1MIX shapes: h (T, B, 1536) fp32, q_raw / k_raw (T, B, 64) bf16, o (T, B, 1536) bf16, fp32 gains, beta in
+the 1.27B shapes: h (T, B, 1536) fp32, q_raw / k_raw (T, B, 64) bf16, o (T, B, 1536) bf16, fp32 gains, beta in
 {-2.0 (the configured gate bias), 0.0, 3.0}; T x B in {2 x 1, 16 x 8, 128 x 8, 1024 x 1, 1024 x 8, 2048 x 8, 896 x 8}.
 A B-major residual stream (the (T, B, D) view of a (B, T, D) tensor) is checked too.
 

@@ -30,7 +30,7 @@ the embedding.
 | **Model level** | – | hashed n-gram lexical memory (orders 1–3), induction match matrices (orders 2–4), copy-detector statistics, final RMSNorm, readout balance (low-rank logit corrections of widths 16 and 32) |
 
 The training loss is the token cross entropy plus a copy-switch auxiliary loss with weight 0.5.  The configuration is
-in `configs/onemix_1p3b.json`.
+in `configs/neuronspark_1p3b.json`.
 
 ## Installation
 

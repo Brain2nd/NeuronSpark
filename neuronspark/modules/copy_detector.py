@@ -47,7 +47,7 @@ __all__ = [
 
 COPY_LOGIT_SCALE = 32.0          # logit scale of the source scores and of the sink 32 tau
 COPY_LAG = 2                     # sources s <= t - 2
-COPY_ORDER1_SLICE = (0, 96)      # the order-1 channels of the 1MIX lexical vector
+COPY_ORDER1_SLICE = (0, 96)      # the order-1 channels of the 1.27B lexical vector
 
 
 class CopyStats(NamedTuple):

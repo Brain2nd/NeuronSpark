@@ -1,6 +1,6 @@
 """PKM value read: the softmax-weighted sum of the selected value rows, ``o[r] = sum_m w[r, m] * V[u[r, m]]``.
 
-Shapes (1MIX): per token r = (t, b) M = 4 heads x 16 slots = 64 (slot, weight) pairs into one shared value table V
+Shapes (1.27B): per token r = (t, b) M = 4 heads x 16 slots = 64 (slot, weight) pairs into one shared value table V
 (S = 128^2 = 16384 rows x D = 768, fp32).  No (T, B, M, D) gathered tensor is formed.
 
 Operators (regime: public function -> what runs):

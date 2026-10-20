@@ -4,7 +4,7 @@ backward) and inference prefill.
 Ops:
 
 * training (whole row): ``sd_conv_silu(xBC, conv_w, conv_b) -> out`` with ``SDConvSiluFn``.  ``xBC`` (B, L, C) bf16 with
-  unit channel stride (the strided x|B|C slice of the projection, row stride 18832 for 1MIX), ``conv_w`` (C, 4) fp32
+  unit channel stride (the strided x|B|C slice of the projection, row stride 18832 for 1.27B), ``conv_w`` (C, 4) fp32
   contiguous (column 3 = lag 0), ``conv_b`` (C,) fp32; ``out`` (B, L, C) bf16 contiguous.  Backward: ``dxBC`` (B, L, C)
   bf16, ``dconv_w`` (C, 4) fp32, ``dconv_b`` (C,) fp32.  The combined SD Function
   (:mod:`neuronspark.ops.sd_combined`) calls the launchers ``_conv_fwd`` / ``_conv_bwd`` directly (its backward writes

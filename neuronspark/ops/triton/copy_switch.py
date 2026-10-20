@@ -10,7 +10,7 @@ detector's confidence) and its parameters w, v (D,) and b (1,):
 
     logit = (z . w + b) + rsqrt(mean(r^2) + 1e-6) (r . v)
     term_l = sum_t,b wt bce(logit, label) / max(sum wt, 1),   wt = pi * valid
-    aux    = lam * mean_l term_l                              (lam = 0.5 for 1MIX)
+    aux    = lam * mean_l term_l                              (lam = 0.5 for 1.27B)
 
 with bce(x, y) = (1 - y) x - log_sigmoid(x).  The gradient reaches w, v and b of every layer only.
 

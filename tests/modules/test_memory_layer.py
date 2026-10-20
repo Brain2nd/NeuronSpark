@@ -1,9 +1,9 @@
 """modules.memory_layer: the memory layer in its three regimes.
 
-* layout: the 70 parameters and 11 persistent buffers of the 1MIX checkpoint (keys, shapes, element counts), the
+* layout: the 70 parameters and 11 persistent buffers of the NeuronSpark checkpoint (keys, shapes, element counts), the
   non-persistent RoPE tables, the launch values (spectra, anchors, zero-launched parameters, PLIF b_eta, identity
   short conv), an empty build drawing nothing, the uncalibrated-PKM refusal;
-* checkpoint: every memory layer of the 1MIX checkpoint loads strictly (prefix ``backbone.layers.<i>.`` stripped),
+* checkpoint: every memory layer of the checkpoint loads strictly (prefix ``backbone.layers.<i>.`` stripped),
   marks its PKM ready and holds the config-derived value-residual anchor;
 * the sub-blocks on the kernel operators against the same sub-blocks on the reference operators (attention sub-block,
   FFN + PKM read on a shared input), forward and backward; the whole layer is reported;

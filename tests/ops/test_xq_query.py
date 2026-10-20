@@ -2,7 +2,7 @@
 
 ``xq_queries_prefill`` (one kernel for all M queries: SiLU, interleaved RoPE, normalisation, gain, one rounding to
 bf16) against its torch chain ``xq_queries_prefill_ref`` (the memory layer's formation under the bf16 autocast of the
-inference regime, fp32 queries) at the 1MIX shapes: M = 4 queries of dk = 256, bf16 projections, psi (T, B, 4) fp32
+inference regime, fp32 queries) at the 1.27B shapes: M = 4 queries of dk = 256, bf16 projections, psi (T, B, 4) fp32
 clamped to [-3, 3], a one-element bf16 head gain; T x B in {2 x 1, 16 x 8, 128 x 8, 1024 x 1, 1024 x 8, 2048 x 8,
 896 x 8}.  Two table layouts: (T, 1, 128) fp32 tables of real positions shared by the rows, and the module's layout
 (the last head's band of the (T, B, 768) bf16 tables gathered at per-row positions).

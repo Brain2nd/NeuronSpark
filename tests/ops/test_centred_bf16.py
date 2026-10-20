@@ -3,7 +3,7 @@
 In a prefill call the memory layer forms the strictly-past centred input of the value-residual gate and of the
 centred PLIF neuron's eta projection with ``centred_running(..., out_dtype=torch.bfloat16)``: their only consumer is a
 bf16 linear, whose input cast rounds the fp32 value to bf16 exactly as the kernel's store does.  Checked under the
-inference regime at the 1MIX shapes (x (T, B, 1536) fp32, the carried sum (B, 1536) fp32, the counts (B,) int64 of
+inference regime at the 1.27B shapes (x (T, B, 1536) fp32, the carried sum (B, 1536) fp32, the counts (B,) int64 of
 rows at their start and inside a row; the projections (16, 1536) = eta_V and (6, 1536) = pool_vr_gate): the bf16 path
 (kernel) against the fp32 path of the torch chain ``centred_running_ref`` followed by the same linear -- the linear's
 output and the advanced carried sum -- by the per-operator rule of ``neuronspark.utils.testing`` (matched ratio 1.0).

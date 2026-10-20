@@ -1,6 +1,6 @@
 """Model-level lexical n-gram memory: hashed n-gram tables read once per call and shared by the six memory layers.
 
-``forward(ids (B, T)) -> m (T, B, M)`` fp32 with ``M = sum_n heads_n * dim_n`` (1MIX: 96 + 2 * 16 + 2 * 16 = 160)::
+``forward(ids (B, T)) -> m (T, B, M)`` fp32 with ``M = sum_n heads_n * dim_n`` (1.27B: 96 + 2 * 16 + 2 * 16 = 160)::
 
     m_t = s * concat over tables k of T_k[bucket_k(x_{t-n_k+1} .. x_t)]                s = 1 / init_std = 50.0
 
@@ -10,7 +10,7 @@
   the row start read the pad id ``V``, outside the vocabulary); each head of the order hashes the key with its own odd
   64-bit multiplier: ``h = key * mult + add (mod 2^64); h ^= h >> 29; bucket = h mod rows`` (unsigned arithmetic,
   emulated on int64: two's-complement wrap of the product, a masked logical shift, and the unsigned residue fixed
-  with ``2^64 mod rows`` for negative values).  1MIX: order 2 (262139, 16) x 2 heads, order 3 (344951, 16) x 2.
+  with ``2^64 mod rows`` for negative values).  1.27B: order 2 (262139, 16) x 2 heads, order 3 (344951, 16) x 2.
 
 The hash constants come from ``random.Random(lexical_memory_hash_seed)`` (per hashed table, in table order:
 ``mult = getrandbits(62) * 2 + 1`` then ``add = getrandbits(62)``) and are int64 buffers ``hash_mult``, ``hash_add``,

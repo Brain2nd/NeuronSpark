@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inference latency of the 1MIX model: prefill and CUDA-graph decode (``neuronspark.utils.generation``).
+"""Inference latency of the NeuronSpark model: prefill and CUDA-graph decode (``neuronspark.utils.generation``).
 
 * **prefill**: one call ``model(ids (b, L), inference_params=cache, num_last_tokens=1)`` on a cache reset to the row
   start (the reset is not timed), CUDA events around the call, at every b of ``--prefill-batches``;

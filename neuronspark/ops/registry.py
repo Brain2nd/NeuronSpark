@@ -2,9 +2,9 @@
 
 Every operator the model calls is listed here once, with the module that implements it, its kernel entry point
 ``<name>`` and its pure-torch reference ``<name>_ref``.  Both have the same parameter list (``params`` below); shapes are
-given for 1MIX.  Modules do not import kernels directly: they pick a namespace once, ``ops = neuronspark.ops.namespace(
-impl)`` with ``impl = "kernel"`` (``KERNELS``) or ``"ref"`` (``REFS``), and call ``ops.<name>(...)``.  The namespace
-imports the implementing module lazily on first use.
+given for the 1.27B configuration.  Modules do not import kernels directly: they pick a namespace once,
+``ops = neuronspark.ops.namespace(impl)`` with ``impl = "kernel"`` (``KERNELS``) or ``"ref"`` (``REFS``), and call
+``ops.<name>(...)``.  The namespace imports the implementing module lazily on first use.
 
 Regimes: ``train`` = whole-row forward (+ backward), ``prefill`` = inference call with T >= 2, ``decode`` = inference
 call with T == 1.  ``mutates`` names the arguments an op writes in place (declared to ``torch.library`` by the
@@ -35,10 +35,10 @@ class OpSpec:
     name: str
     module: str                      # implementing module (``neuronspark.ops....``)
     params: Tuple[str, ...]          # parameter names in order; "*" marks the start of keyword-only parameters
-    returns: str                     # outputs (shapes / dtypes, 1MIX)
+    returns: str                     # outputs (shapes / dtypes, 1.27B)
     regimes: Tuple[str, ...]         # subset of ("train", "prefill", "decode")
     mutates: Tuple[str, ...] = ()    # arguments written in place
-    doc: str = ""                    # inputs (shapes / dtypes, 1MIX)
+    doc: str = ""                    # inputs (shapes / dtypes, 1.27B)
 
     @property
     def kernel(self) -> str:

@@ -1,0 +1,40 @@
+[build-system]
+# The package is pure Python (every kernel is Triton / Gluon, compiled at run time): no build-time dependency on torch.
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neuronspark"
+version = "1.0.0"
+description = "NeuronSpark 1MIX: a spiking language model (selective-dendrite and memory layers) with its Triton and Gluon operators"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+keywords = ["spiking neural network", "language model", "state space model", "triton", "pytorch"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+dependencies = [
+    "torch==2.9.1",
+    "triton==3.5.1",
+    "safetensors>=0.4",
+    "packaging",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.urls]
+Repository = "https://github.com/Brain2nd/NeuronSpark"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# test files with the same basename live in different directories (tests/ops, tests/modules)
+addopts = "--import-mode=importlib"
+markers = [
+    "cuda: needs a CUDA GPU",
+    "sm100: needs a Blackwell GPU (compute capability >= 10.0)",
+    "ckpt: needs the 1MIX checkpoint (--ckpt)",
+]

@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# model weights and tensors
+*.safetensors
+*.pt
+*.pth
+*.bin
+
+# compiler caches
+.triton/
+triton_cache/
+torchinductor_*/
+.cache/
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store

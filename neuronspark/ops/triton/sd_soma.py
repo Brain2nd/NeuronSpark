@@ -25,7 +25,7 @@ lanes instead of one 16384-lane row); the soma forward is the torch chain's arit
 backward is fp32-rounding class (approximate exp2 / division, reordered parameter sums).  Checked with the
 per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the references below.
 
-Launch constants: forward R 1 row / program, 16 warps, CH 1024 (NCH 9), n stored for the backward; soma backward ROWS 128, BM 2, BC 1024, 4 warps, STAGES 4, sum BR 32 BC 64 4 warps; gated norm backward
+Launch constants: forward R 1 row / program, 16 warps, CH 1024 (NCH 9), n stored for the backward; soma backward ROWS 128, BM 4, BC 1024, 4 warps, STAGES 4 (no masks on whole tiles), sum BR 32 BC 64 4 warps; gated norm backward
 R 1, 8 warps, CH 1024 (two passes).  The PTX helpers ``_sr_*`` are :mod:`neuronspark.ops.triton._ptx`'s.
 """
 from __future__ import annotations
@@ -47,7 +47,7 @@ __all__ = [
 # ------------------------------------------------------------------------------------------------ launch constants
 SOMA_FWD_CFG = (1, 16, 1024)            # rows / program, num_warps, CH (chunk lanes; N = 9 CH)
 SOMA_FWD_NCH = 9                        # the forward kernel handles rows of 9 chunks
-SOMA_BWD_CFG = (128, 2, 1024, 4, 4)     # ROWS / program, BM rows / iteration, BC columns, num_warps, STAGES
+SOMA_BWD_CFG = (128, 4, 1024, 4, 4)     # ROWS / program, BM rows / iteration, BC columns, num_warps, STAGES
 SOMA_SUM_CFG = (32, 64, 4)              # BR, BC, num_warps of the partial-sum reduction
 NORM_BWD_CFG = (1, 8, 1024)             # rows / program, num_warps, CH
 
@@ -188,34 +188,49 @@ def _gated_norm_soma_fwd_k9(X, XO, Y, W, Z, TH, GA, Rstd, sx, sxo, sy, sz, M, N,
 # ------------------------------------------------------------------------------------------------ kernels
 @triton.jit
 def _soma_fast_bwd_p(DX, N, TH, GA, GN, QTH, QGA, M, C, alpha,
-                     ROWS: tl.constexpr, BM: tl.constexpr, BC: tl.constexpr, STAGES: tl.constexpr):
+                     ROWS: tl.constexpr, BM: tl.constexpr, BC: tl.constexpr, STAGES: tl.constexpr, EVEN: tl.constexpr):
     """Soma backward over ROWS rows x BC columns: grad_n = bf16(g gamma (gp + gn)), the theta / gamma partial sums of
     the program's rows in fp32; the row loop as tl.range(.., num_stages=STAGES) (loads of later row pairs issued ahead
-    by the software pipeliner)."""
+    by the software pipeliner), the tile pointers advanced by BM rows per iteration.  EVEN (M % ROWS == 0 and
+    C % BC == 0, the training step's shape): no masks."""
     r = tl.program_id(0)
     cols = tl.program_id(1) * BC + tl.arange(0, BC)
     cm = cols < C
-    th = tl.load(TH + cols, mask=cm, other=0.0)[None, :]
-    ga = tl.load(GA + cols, mask=cm, other=0.0)[None, :]
+    if EVEN:
+        th = tl.load(TH + cols)[None, :]
+        ga = tl.load(GA + cols)[None, :]
+    else:
+        th = tl.load(TH + cols, mask=cm, other=0.0)[None, :]
+        ga = tl.load(GA + cols, mask=cm, other=0.0)[None, :]
     at = tl.zeros((BM, BC), tl.float32)
     ag = tl.zeros((BM, BC), tl.float32)
+    rows = r * ROWS + tl.arange(0, BM)
+    off = rows.to(tl.int64)[:, None] * C + cols[None, :]
     for i in tl.range(0, ROWS, BM, num_stages=STAGES):
-        rows = r * ROWS + i + tl.arange(0, BM)
-        mask = (rows < M)[:, None] & cm[None, :]
-        off = rows.to(tl.int64)[:, None] * C + cols[None, :]
-        g = tl.load(DX + off, mask=mask, other=0.0).to(tl.float32)
-        v = tl.load(N + off, mask=mask, other=0.0).to(tl.float32)
+        if EVEN:
+            g = tl.load(DX + off).to(tl.float32)
+            v = tl.load(N + off).to(tl.float32)
+        else:
+            mask = ((rows + i) < M)[:, None] & cm[None, :]
+            g = tl.load(DX + off, mask=mask, other=0.0).to(tl.float32)
+            v = tl.load(N + off, mask=mask, other=0.0).to(tl.float32)
         a, b = v - th, -v - th
         s = tl.maximum(a, 0.0) - tl.maximum(b, 0.0)
         gs = g * ga
         gp = 1.0 / (1.0 + tl.exp2(-(a * alpha) * 1.4426950408889634))
         gm = 1.0 / (1.0 + tl.exp2(-(b * alpha) * 1.4426950408889634))
-        tl.store(GN + off, (gs * (gp + gm)).to(tl.bfloat16), mask=mask)
-        at += tl.where(mask, -gs * (gp - gm), 0.0)
-        ag += tl.where(mask, g * s, 0.0)
-    off = r.to(tl.int64) * C + cols
-    tl.store(QTH + off, tl.sum(at, axis=0), mask=cm)
-    tl.store(QGA + off, tl.sum(ag, axis=0), mask=cm)
+        if EVEN:
+            tl.store(GN + off, (gs * (gp + gm)).to(tl.bfloat16))
+            at += -gs * (gp - gm)
+            ag += g * s
+        else:
+            tl.store(GN + off, (gs * (gp + gm)).to(tl.bfloat16), mask=mask)
+            at += tl.where(mask, -gs * (gp - gm), 0.0)
+            ag += tl.where(mask, g * s, 0.0)
+        off += BM * C
+    qoff = r.to(tl.int64) * C + cols
+    tl.store(QTH + qoff, tl.sum(at, axis=0), mask=cm)
+    tl.store(QGA + qoff, tl.sum(ag, axis=0), mask=cm)
 
 
 @triton.jit
@@ -317,7 +332,8 @@ def _soma_bwd(dx, n, theta, gamma, alpha, gn, gtheta, ggamma):
     parts = torch.empty((2, r, c), device=n.device, dtype=torch.float32)
     _soma_fast_bwd_p[(r, triton.cdiv(c, bc))](
         dx, n, theta, gamma, gn, parts[0], parts[1], m, c, float(alpha),
-        ROWS=rows, BM=bm, BC=bc, STAGES=stages, num_warps=warps, enable_fp_fusion=True)
+        ROWS=rows, BM=bm, BC=bc, STAGES=stages, EVEN=(m % rows == 0 and c % bc == 0), num_warps=warps,
+        enable_fp_fusion=True)
     _soma_fast_sum[(triton.cdiv(c, sbc),)](
         parts[0], parts[1], gtheta, ggamma, r, c,
         BR=br, BC=sbc, num_warps=swarps, enable_fp_fusion=True)

@@ -109,7 +109,7 @@ custom ops.  `neuronspark/ops/registry.py` lists every operator with its signatu
 | family | file | used in |
 |---|---|---|
 | linear with fp32 weight gradient | `ops/linear.py` | train, prefill, decode |
-| SD chunk scan + soma | `ops/sd_combined.py`, `ops/triton/sd_{states,scan,glue,soma}.py`, `ops/gluon/sd_chunk_scan_fwd.py` | train |
+| SD chunk scan + soma | `ops/sd_combined.py`, `ops/triton/sd_{states,scan,glue,soma}.py`, `ops/gluon/sd_chunk_scan_{fwd,dx}.py` | train |
 | SD prefill scan | `ops/sd_prefill.py`, `ops/triton/sd_states.py` | prefill |
 | SD conv, norms, residual | `ops/triton/sd_{conv,prenorm,gated_norm,residual}.py` | train, prefill |
 | SD decode step | `ops/triton/sd_step.py` | decode |

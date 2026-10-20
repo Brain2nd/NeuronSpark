@@ -2,8 +2,10 @@
 ``splits_sum`` / ``ddA_combine`` / ``chunk_cumsum_bwd``.
 
 * against ``bwd_store_glue_ref`` (the same backward sequence in pure torch on the same kept tensors, the kernels' bf16
-  operand rounding points reproduced) at B 1 x L 512 and a partial-chunk length: dx, ddt (written into the
-  projection-gradient view), dA, dB, dC (written into the conv-input-gradient views), dD, ddt_bias;
+  operand rounding points reproduced) at B 1 x L 512 and B 2 x L 512: dx, ddt (written into the projection-gradient
+  view), dA, dB, dC (written into the conv-input-gradient views), dD, ddt_bias;
+* the whole-chunk contract of the training regime (a partial chunk raises: the chunk-scan kernels are whole-chunk
+  Gluon kernels);
 * ``splits_sum`` against torch sums.
 
 Every comparison is the per-operator rule of ``neuronspark.utils.testing``.
@@ -24,7 +26,7 @@ H, P, N, CS = 144, 64, 128, 256
 DI = H * P
 C_CONV = DI + 2 * N
 WIDTH = 2 * DI + 2 * N + H
-REF_SHAPES = [(1, 512), (1, 300)]
+REF_SHAPES = [(1, 512), (2, 512)]
 
 
 def operands(B, L, device):
@@ -78,6 +80,12 @@ def test_glue_vs_reference(device, B, L):
                              None, None, None, None, o["dA"], o["dt"], o["CB"], o["states_pre"])
     names = ("dx", "ddt", "dA", "dB", "dC", "dD", "ddt_bias")
     assert_all_match({k: new[k].contiguous() for k in names}, dict(zip(names, ref)), prefix="glue_ref")
+
+
+def test_glue_whole_chunks_only(device):
+    o = operands(1, 300, device)
+    with pytest.raises(RuntimeError, match="full chunks only"):
+        _run(o)
 
 
 def test_splits_sum(device):

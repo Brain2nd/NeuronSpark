@@ -66,8 +66,7 @@ The autotune configurations of the source carry `pre_hook=init_to_zero([...])` o
 
 ## Workspace geometry constants
 
-`CHUNK_SCAN_CHUNK_STATE_BWD_DX_MIN_BLOCK_N`, `CHUNK_STATE_BWD_DB_MIN_BLOCK_N` and `CHUNK_SCAN_BWD_DC_MIN_BLOCK_N` are
-mamba_ssm's `_*_MIN_BLOCK_N` module constants (`ssd_combined.py` line 257, `ssd_chunk_state.py` line 500,
-`ssd_chunk_scan.py` line 621), computed at import as the smallest `BLOCK_SIZE_N` of the kernel's configuration list.
-In deterministic mode that list holds one configuration (`{M 64, N 32, K 32}`, `{M 32, N 32}`, `{M 32, N 32}`), so
-each value is 32. The kernels that replace those three mamba_ssm kernels keep the workspace shapes derived from them.
+`CHUNK_STATE_BWD_DB_MIN_BLOCK_N` and `CHUNK_SCAN_BWD_DC_MIN_BLOCK_N` are mamba_ssm's `_*_MIN_BLOCK_N` module constants
+(`ssd_chunk_state.py` line 500, `ssd_chunk_scan.py` line 621), computed at import as the smallest `BLOCK_SIZE_N` of the
+kernel's configuration list.  In deterministic mode that list holds one configuration (`{M 32, N 32}` each), so each
+value is 32. The kernels that replace those two mamba_ssm kernels keep the workspace shapes derived from them.

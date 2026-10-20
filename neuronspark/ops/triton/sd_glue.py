@@ -8,11 +8,12 @@ kept (dA_cumsum, softplus'd dt, CB, the fp32 chunk states) instead of recomputin
 (b, l, h) bf16 view of the projection, A / D / dt_bias (h,) fp32, dx / ddt / dB / dC the output buffers (views of the
 projection and conv-input gradients, written in place), dA_cumsum / dt_sp (b, h, nc, chunk) fp32, CB (b, nc, 1,
 chunk, chunk) fp32, states_pre (b, nc, h, P, N) fp32.  Returns dx, ddt, dB, dC (the given buffers), dA, dD, ddt_bias
-(h,) fp32.
+(h,) fp32.  Whole chunks only (l % chunk == 0, the training regime; the chunk-scan input backward is a whole-chunk
+Gluon kernel): otherwise it raises.
 
 The sequence (each step's order and operands are fixed):
   1. ``sd_states.spd_fused``: dstates (bf16), the state-passing ddA workspace, the passed states (bf16);
-  2. ``sd_scan.dx_tma``: dx, ddt (fp32 per position), dD;
+  2. ``gluon.sd_chunk_scan_dx.chunk_scan_dx_gluon``: dx, ddt (fp32 per position), dD;
   3. ``sd_states.db_tma`` / ``dc_tma``: dB / dC head-split partials and the ddA_next / ddA_prev workspaces;
   4. ``sd_scan.dda_tma``: dCB head-split partials and the V grid of the intra-chunk ddA;
   5. ``splits_sum``: dB, dC, dCB = sums over the head-split axis (one launch);
@@ -49,7 +50,8 @@ from neuronspark.ops.triton.mamba import (
     _bmm_chunk_bwd,
     _chunk_cumsum_bwd_kernel,
 )
-from neuronspark.ops.triton.sd_scan import dda_asm, dda_ref, dda_tma, dx_tma, dx_tma_ref, softplus_ref
+from neuronspark.ops.gluon.sd_chunk_scan_dx import chunk_scan_dx_gluon
+from neuronspark.ops.triton.sd_scan import chunk_scan_dx_ref, dda_asm, dda_ref, dda_tma, softplus_ref
 from neuronspark.ops.triton.sd_states import _chunked, db_tma, db_tma_ref, dc_tma, dc_tma_ref, spd_fused, spd_fused_ref
 
 __all__ = ["bwd_store_glue", "bwd_store_glue_ref", "splits_sum", "ddA_combine", "chunk_cumsum_bwd"]
@@ -235,7 +237,7 @@ def bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB
                                               x.dtype)
     states = states.unflatten(-1, (headdim, dstate))
     dstates = dstates.unflatten(-1, (headdim, dstate))
-    dx, ddt, dD = dx_tma(x, dt, dA_cumsum, B, CB, dout, dstates, D, dx)
+    dx, ddt, dD = chunk_scan_dx_gluon(x, dt, dA_cumsum, B, CB, dout, dstates, D, dx)
     dB_p, ws_db, nt_db = db_tma(x, dt, dA_cumsum, dstates, B, ngroups)
     dC_p, ws_dc, nt_dc = dc_tma(states.to(x.dtype), dA_cumsum, dout, C, ngroups)
     dcb_p, ddA_v = dda_tma(x, dt, dA_cumsum, dout, CB)
@@ -258,7 +260,7 @@ def bwd_store_glue_ref(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt
 
       1. ``spd_fused_ref``: dstates (bf16, from bf16(dout exp(dA)) C sums), the state-passing ddA block sums, the
          passed states recomputed from states_pre (bf16);
-      2. ``dx_tma_ref``: dx, ddt_out, dD (the dot operand bf16(CB[k, m] decay) of the dx kernel);
+      2. ``chunk_scan_dx_ref``: dx, ddt_out, dD (the dot operand bf16(CB[k, m] decay) of the dx kernel);
       3. ``db_tma_ref`` / ``dc_tma_ref``: dB / dC summed over heads, ddA_next / ddA_prev;
       4. ``dda_ref``: dCB and the intra-chunk ddA;
       5. ``_bmm_chunk_bwd`` (ssd_bmm.py ``_bmm_chunk_bwd_kernel``): dB += sum_l bf16(dCB[l, s]) C_l, dC += sum_s
@@ -280,7 +282,7 @@ def bwd_store_glue_ref(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt
     dstates = dstates.unflatten(-1, (headdim, dstate))
     states = states.unflatten(-1, (headdim, dstate))
     # 2. dx / ddt_out / dD
-    dx_r, ddt_out, dD = dx_tma_ref(x, dt_sp, dA_cumsum, B, CB, dout, dstates, D, None)
+    dx_r, ddt_out, dD = chunk_scan_dx_ref(x, dt_sp, dA_cumsum, B, CB, dout, dstates, D, None)
     # 3. dB / dC head sums and the ddA_next / ddA_prev workspaces
     dB_h, ddA_next = db_tma_ref(x, dt_sp, dA_cumsum, dstates, B, 1)
     dC_h, ddA_prev = dc_tma_ref(states, dA_cumsum, dout, C, 1)

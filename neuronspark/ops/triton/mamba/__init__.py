@@ -15,13 +15,11 @@ Launch configurations (the derivations are in PROVENANCE.md):
 * ``BMM_CHUNK_BWD_TRAIN``     -- the two ``_bmm_chunk_bwd`` calls of the training backward.
 * ``CHUNK_STATE_FWD_PREFILL`` / ``STATE_PASSING_FWD_PREFILL`` -- the prefill chunk states and state passing.
 
-Workspace geometry constants: mamba_ssm sizes the deterministic tile workspaces of three backward kernels that the SD
-layer replaces by its own kernels (``neuronspark.ops.triton.sd_states.db_tma`` / ``dc_tma``,
-``neuronspark.ops.triton.sd_scan.dx_tma``) from the smallest ``BLOCK_SIZE_N`` of the kernel's configuration list as
-mamba_ssm's deterministic mode leaves it (one configuration).  The replacement kernels keep that workspace geometry,
-so the values are fixed here: 32 for each of the three (``_chunk_scan_chunk_state_bwd_dx_kernel``:
-BLOCK_SIZE_N 32 of {M 64, N 32, K 32}; ``_chunk_state_bwd_db_kernel``: {M 32, N 32}; ``_chunk_scan_bwd_dc_kernel``:
-{M 32, N 32}).
+Workspace geometry constants: mamba_ssm sizes the deterministic tile workspaces of two backward kernels that the SD
+layer replaces by its own kernels (``neuronspark.ops.triton.sd_states.db_tma`` / ``dc_tma``) from the smallest
+``BLOCK_SIZE_N`` of the kernel's configuration list as mamba_ssm's deterministic mode leaves it (one configuration).
+The replacement kernels keep that workspace geometry, so the values are fixed here: 32 for both
+(``_chunk_state_bwd_db_kernel``: {M 32, N 32}; ``_chunk_scan_bwd_dc_kernel``: {M 32, N 32}).
 """
 from __future__ import annotations
 
@@ -44,7 +42,7 @@ __all__ = [
     "_state_passing_fwd", "_state_passing_fwd_kernel",
     "CHUNK_CUMSUM_FWD_TRAIN", "CHUNK_CUMSUM_FWD_PREFILL", "CHUNK_CUMSUM_BWD_TRAIN",
     "BMM_CHUNK_FWD", "BMM_CHUNK_BWD_TRAIN", "CHUNK_STATE_FWD_PREFILL", "STATE_PASSING_FWD_PREFILL",
-    "CHUNK_SCAN_CHUNK_STATE_BWD_DX_MIN_BLOCK_N", "CHUNK_STATE_BWD_DB_MIN_BLOCK_N", "CHUNK_SCAN_BWD_DC_MIN_BLOCK_N",
+    "CHUNK_STATE_BWD_DB_MIN_BLOCK_N", "CHUNK_SCAN_BWD_DC_MIN_BLOCK_N",
 ]
 
 # (kwargs, num_warps, num_stages); see PROVENANCE.md for where each value comes from.
@@ -57,6 +55,5 @@ CHUNK_STATE_FWD_PREFILL = ({"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE
 STATE_PASSING_FWD_PREFILL = ({"BLOCK_SIZE": 1024}, 4, 3)
 
 # deterministic tile-workspace geometry of the replaced mamba_ssm backward kernels (see the module docstring)
-CHUNK_SCAN_CHUNK_STATE_BWD_DX_MIN_BLOCK_N = 32
 CHUNK_STATE_BWD_DB_MIN_BLOCK_N = 32
 CHUNK_SCAN_BWD_DC_MIN_BLOCK_N = 32

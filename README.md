@@ -1,6 +1,6 @@
 # NeuronSpark
 
-![NeuronSpark](https://img.shields.io/badge/model-1MIX%201.27B-blue)
+![NeuronSpark](https://img.shields.io/badge/parameters-1.27B-blue)
 [![arXiv](https://img.shields.io/badge/arXiv-2603.16148-b31b1b.svg)](https://arxiv.org/abs/2603.16148)
 
 > **NeuronSpark: A Spiking Neural Network Language Model with Selective State Space Dynamics**\
@@ -14,13 +14,13 @@ of its dendritic compartments as a selective state space (input-dependent leak a
 out through a spiking soma.  Every fourth layer is a memory layer that adds attention-style retrieval, a spiking
 feed-forward block of leaky integrate-and-fire neurons and a product-key memory.
 
-This repository contains the 1MIX model (1.27B parameters) together with its GPU operators.  The Triton and Gluon
+This repository contains the NeuronSpark model (1.27B parameters) together with its GPU operators.  The Triton and Gluon
 kernels cover training, prefill and single-token decoding.  The repository also has a mamba-style inference cache with
 CUDA-graph decoding, plus tests and benchmarks.
 
 ## Architecture
 
-1MIX has 24 layers in a fixed 3:1 pattern, width 1536, and a vocabulary of 151,669 tokens.  The readout is tied to
+The model has 24 layers in a fixed 3:1 pattern, width 1536, and a vocabulary of 151,669 tokens.  The readout is tied to
 the embedding.
 
 | block | layers | what it computes |

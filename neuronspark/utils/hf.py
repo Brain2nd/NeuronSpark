@@ -10,7 +10,8 @@ Checkpoint directory format (written by :func:`save_pretrained`, read by :func:`
   with its own key names, every key under the prefix ``backbone.`` (:data:`PREFIX`)::
 
       backbone.embed_tokens.weight                  (vocab_size, D) fp32, also the tied readout weight (stored once)
-      backbone.layers.{i}.mixer_a.<name>            SD layer i: pre_norm_gain, in_proj.weight, conv_weight, conv_bias,
+      backbone.layers.{i}.mixer_a.<name>            spiking layer i: pre_norm_gain, in_proj.weight, conv_weight,
+      conv_bias,
                                                     dt_bias, A_log, D, gamma, W_out, rho (fp32)
       backbone.layers.{i}.<name>                    memory layer i: 70 fp32 parameters and 11 fp32 persistent buffers
       backbone.norm.weight                          (D,) fp32 final RMSNorm gain
@@ -205,12 +206,12 @@ def verify_state_dict(config: NeuronSparkConfig, state_dict: Mapping[str, torch.
 
 # ------------------------------------------------------------------------------------------------ models
 def load_pretrained(path: _PathLike, device: Union[str, torch.device] = "cuda", allow_uncalibrated: bool = False,
-                    impl: str = "kernel", inference_sd_state_dtype: Optional[str] = None,
+                    impl: str = "kernel", inference_spiking_state_dtype: Optional[str] = None,
                     model_cls: Optional[Type] = None):
     """Build and load a :class:`NeuronSparkLMHeadModel` (or ``model_cls``) from a checkpoint directory.
 
-    1. :func:`load_config`; ``inference_sd_state_dtype`` (``"bfloat16"`` / ``"float32"``) replaces the
-       configuration's SD state storage option when given;
+    1. :func:`load_config`; ``inference_spiking_state_dtype`` (``"bfloat16"`` / ``"float32"``) replaces the
+       configuration's spiking-layer state storage option when given;
     2. the tensors onto ``device``, :func:`verify_state_dict`;
     3. the model built with ``init="empty"`` on ``device`` (fp32, no random draw), ``load_state_dict(strict=True)``;
     4. post-load checks: the lexical hash buffers, the product-key memories marked ready, fp32 parameters.
@@ -220,8 +221,8 @@ def load_pretrained(path: _PathLike, device: Union[str, torch.device] = "cuda", 
     if model_cls is None:
         from neuronspark.models.neuronspark_lm import NeuronSparkLMHeadModel as model_cls
     config = load_config(path)
-    if inference_sd_state_dtype is not None:
-        config = dataclasses.replace(config, inference_sd_state_dtype=str(inference_sd_state_dtype))
+    if inference_spiking_state_dtype is not None:
+        config = dataclasses.replace(config, inference_spiking_state_dtype=str(inference_spiking_state_dtype))
     sd = load_state_dict(path, device=device)
     verify_state_dict(config, sd, allow_uncalibrated=allow_uncalibrated)
     model = model_cls(config, device=device, dtype=torch.float32, impl=impl, init="empty")

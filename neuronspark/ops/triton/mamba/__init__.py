@@ -10,7 +10,7 @@ Launch configurations (the derivations are in PROVENANCE.md):
 
 * ``CHUNK_CUMSUM_FWD_TRAIN``  -- training forward of the SD layer (nheads 144).
 * ``CHUNK_CUMSUM_FWD_PREFILL`` -- inference prefill (the single configuration mamba_ssm's deterministic mode keeps).
-* ``CHUNK_CUMSUM_BWD_TRAIN``  -- training backward (launched by :func:`neuronspark.ops.triton.sd_glue.chunk_cumsum_bwd`).
+* ``CHUNK_CUMSUM_BWD_TRAIN``  -- training backward (launched by :func:`neuronspark.ops.triton.spiking_glue.chunk_cumsum_bwd`).
 * ``BMM_CHUNK_FWD``           -- CB = C B^T of the training forward and of the prefill (deterministic-mode configuration).
 * ``BMM_CHUNK_BWD_TRAIN``     -- the two ``_bmm_chunk_bwd`` calls of the training backward.
 * ``CHUNK_STATE_FWD_PREFILL`` / ``STATE_PASSING_FWD_PREFILL`` -- the prefill chunk states and state passing.

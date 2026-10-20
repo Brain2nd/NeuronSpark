@@ -167,7 +167,8 @@ def _whole_row(layer, ids, lex_table, h, carry, g_out=None, g_carry=None, aux_ou
 def _cache(layer, B, device, W=W_RING):
     st = layer.allocate_inference_cache(B, W)
     pos, ring_ptr = InferenceParams.allocate_counters(B, device)
-    return InferenceParams(max_seqlen=W, max_batch_size=B, pos=pos, ring_ptr=ring_ptr, sd_state_dtype=torch.bfloat16,
+    return InferenceParams(max_seqlen=W, max_batch_size=B, pos=pos, ring_ptr=ring_ptr,
+                           spiking_state_dtype=torch.bfloat16,
                            layers={layer.layer_idx: st},
                            lexical=LexicalState.allocate(B, 2, V, device),
                            induction=InductionState.allocate(B, W, max(CFG.memory_induction_bias_orders), V, device),

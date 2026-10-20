@@ -49,8 +49,8 @@ EPS = 1e-8
 WEIGHT_DECAY = 0.1
 LEXICAL_LR_MULT = 8.0
 GRAD_CLIP = 1.0
-# SD mixer vectors decayed with the matrices (their own group)
-SD_DECAYED_VECTORS = ("A_log", "dt_bias", "D", "gamma", "conv_bias", "pre_norm_gain")
+# spiking mixer vectors decayed with the matrices (their own group)
+SPIKING_DECAYED_VECTORS = ("A_log", "dt_bias", "D", "gamma", "conv_bias", "pre_norm_gain")
 
 
 def schedule_lr(update: int, total: int = TOTAL_UPDATES, peak: float = PEAK_LR, warmup: int = WARMUP_UPDATES,
@@ -69,26 +69,27 @@ def build_param_groups(model, lr: float = PEAK_LR, weight_decay: float = WEIGHT_
     """Four AdamW groups (trainable parameters only; the PLIF ``w`` are frozen), in this order, each in
     ``model.parameters()`` order:
 
-    0. matrices (``ndim >= 2``: projections, SD ``in_proj`` / ``conv_weight`` / ``W_out``, the tied embedding), weight
+    0. matrices (``ndim >= 2``: projections, spiking-layer ``in_proj`` / ``conv_weight`` / ``W_out``, the tied
+    embedding), weight
        decay ``weight_decay``;
-    1. vectors and scalars (``ndim < 2``: norm gains, thresholds, gate biases, SD ``rho``, ...), no weight decay;
-    2. the lexical n-gram tables, no weight decay, learning rate x ``lexical_lr_mult``;
-    3. the SD mixer vectors ``A_log``, ``dt_bias``, ``D``, ``gamma``, ``conv_bias``, ``pre_norm_gain``, weight decay
+    1. vectors and scalars (``ndim < 2``: norm gains, thresholds, gate biases, spiking-layer ``rho``, ...), no weight
+    decay; 2. the lexical n-gram tables, no weight decay, learning rate x ``lexical_lr_mult``; 3. the spiking mixer
+    vectors ``A_log``, ``dt_bias``, ``D``, ``gamma``, ``conv_bias``, ``pre_norm_gain``, weight decay
        ``weight_decay``.
 
     Each group carries ``lr_mult``; its ``lr`` is ``lr * lr_mult``."""
     named = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
     lexical = {id(p) for p in model.backbone.lexical_memory.tables}
-    sd_vectors = {id(p) for n, p in named if ".mixer_a." in n and n.rsplit(".", 1)[-1] in SD_DECAYED_VECTORS}
+    spiking_vectors = {id(p) for n, p in named if ".mixer_a." in n and n.rsplit(".", 1)[-1] in SPIKING_DECAYED_VECTORS}
     groups = [
-        {"params": [p for n, p in named if p.ndim >= 2 and id(p) not in lexical and id(p) not in sd_vectors],
+        {"params": [p for n, p in named if p.ndim >= 2 and id(p) not in lexical and id(p) not in spiking_vectors],
          "weight_decay": weight_decay, "lr_mult": 1.0, "name": "matrices"},
-        {"params": [p for n, p in named if p.ndim < 2 and id(p) not in lexical and id(p) not in sd_vectors],
+        {"params": [p for n, p in named if p.ndim < 2 and id(p) not in lexical and id(p) not in spiking_vectors],
          "weight_decay": 0.0, "lr_mult": 1.0, "name": "vectors"},
         {"params": [p for n, p in named if id(p) in lexical], "weight_decay": 0.0, "lr_mult": float(lexical_lr_mult),
          "name": "lexical_tables"},
-        {"params": [p for n, p in named if id(p) in sd_vectors], "weight_decay": weight_decay, "lr_mult": 1.0,
-         "name": "sd_vectors"},
+        {"params": [p for n, p in named if id(p) in spiking_vectors], "weight_decay": weight_decay, "lr_mult": 1.0,
+         "name": "spiking_vectors"},
     ]
     if sum(len(g["params"]) for g in groups) != len(named):
         raise RuntimeError("build_param_groups: the groups do not cover every trainable parameter exactly once")

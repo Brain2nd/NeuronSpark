@@ -1,6 +1,6 @@
 """NeuronSpark: a spiking language model (1.27 B parameters) and its operators.
 
-24 layers in a 3:1 ratio: 18 selective-dendrite (SD) layers (a membrane-potential selective state space with a bipolar
+24 layers in a 3:1 ratio: 18 spiking layers (a membrane-potential selective state space with a bipolar
 soma read-out) and 6 memory layers (pool attention with a lexical read-out, a spiking FFN of PLIF neurons and a
 product-key memory), plus model-level lexical n-gram memory and induction match matrices.
 

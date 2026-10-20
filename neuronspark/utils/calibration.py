@@ -184,7 +184,7 @@ def _check_batches(backbone, batches: Sequence[torch.Tensor], rows: Optional[int
     if not isinstance(batches, (list, tuple)) or not batches:
         raise ValueError("launch calibration: batches must be a non-empty list of (B, T) token-id tensors")
     dev = backbone.embed_tokens.weight.device
-    chunk = int(backbone.config.sd_chunk_size)
+    chunk = int(backbone.config.spiking_chunk_size)
     out = []
     for b in batches:
         if not isinstance(b, torch.Tensor) or b.dim() != 2 or b.dtype not in (torch.int64, torch.int32):
@@ -192,7 +192,8 @@ def _check_batches(backbone, batches: Sequence[torch.Tensor], rows: Optional[int
         if b.device != dev:
             raise ValueError(f"launch calibration: a batch on {b.device}, the model on {dev}")
         if backbone.impl == "kernel" and int(b.shape[1]) % chunk != 0:
-            raise ValueError(f"launch calibration: T = {int(b.shape[1])} is not a multiple of sd_chunk_size {chunk}")
+            raise ValueError(f"launch calibration: T = {int(b.shape[1])} is not a multiple of spiking_chunk_size "
+                             f"{chunk}")
         out.append(b.to(torch.int64))
     total = sum(int(b.shape[0]) for b in out)
     if rows is not None and total != int(rows):

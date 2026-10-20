@@ -6,11 +6,11 @@ neuron model, mechanisms) is fixed in the code and is therefore not configurable
 model; ``configs/neuronspark_1p3b.json`` is the same configuration on disk.
 
 Layout (24 layers, ratio 3:1): layer ``i`` is a memory layer iff ``(i + 1) % memory_layer_interval == 0`` (layers 3, 7,
-11, 15, 19, 23), every other layer is a selective-dendrite (SD) layer.
+11, 15, 19, 23), every other layer is a spiking layer.
 
-The single numerics option is ``inference_sd_state_dtype``: the storage dtype of the SD state in the inference cache,
-``"bfloat16"`` (default: the state is rounded to bf16 once per decode step and once per prefill call) or ``"float32"``
-(the state is carried in fp32).  It changes no parameter and no training computation.
+The single numerics option is ``inference_spiking_state_dtype``: the storage dtype of the spiking-layer state in the
+inference cache, ``"bfloat16"`` (default: the state is rounded to bf16 once per decode step and once per prefill call)
+or ``"float32"`` (the state is carried in fp32).  It changes no parameter and no training computation.
 
 Configuration file format (``config.json`` of a checkpoint directory, see :mod:`neuronspark.utils.hf`): one JSON
 object holding
@@ -38,15 +38,15 @@ __all__ = [
     "NeuronSparkConfig",
     "MODEL_TYPE",
     "ARCHITECTURES",
-    "SD_STATE_DTYPES",
+    "SPIKING_STATE_DTYPES",
 ]
 
 # "model_type" of the configuration file
 MODEL_TYPE = "neuronspark"
 # "architectures" of the configuration file
 ARCHITECTURES = ("NeuronSparkLMHeadModel",)
-# values of the inference_sd_state_dtype option
-SD_STATE_DTYPES = ("bfloat16", "float32")
+# values of the inference_spiking_state_dtype option
+SPIKING_STATE_DTYPES = ("bfloat16", "float32")
 
 _PathLike = Union[str, "os.PathLike[str]"]
 
@@ -80,12 +80,12 @@ class NeuronSparkConfig:
     * lexical memory: ``lexical_memory_rows`` / ``_heads`` / ``_head_dims`` per n-gram order (order 1 first),
       ``lexical_memory_key_dim``, ``lexical_memory_init_std`` (table init std and fixed output scale ``1 / std``),
       ``lexical_memory_gate_bias`` (init of ``lex_beta``), ``lexical_memory_hash_seed``.
-    * SD layer: ``sd_expand``, ``sd_head_dim``, ``sd_state_size``, ``sd_chunk_size``, ``sd_theta0`` /
-      ``sd_theta_floor`` (soma threshold ``theta = floor + softplus(rho)``, launched at ``theta0``),
-      ``sd_surrogate_alpha``.
+    * spiking layer: ``spiking_expand``, ``spiking_head_dim``, ``spiking_state_size``, ``spiking_chunk_size``,
+      ``spiking_theta0`` / ``spiking_theta_floor`` (soma threshold ``theta = floor + softplus(rho)``, launched at
+      ``theta0``), ``spiking_surrogate_alpha``.
     * readout: ``readout_balance_widths`` (tiled balance projections, added width 16 first, then 32).
-    * norms: ``sd_norm_eps`` (SD pre-norm and gated norm), ``rms_norm_eps`` (every other RMSNorm).
-    * inference: ``inference_sd_state_dtype`` (see the module docstring).
+    * norms: ``spiking_norm_eps`` (spiking-layer pre-norm and gated norm), ``rms_norm_eps`` (every other RMSNorm).
+    * inference: ``inference_spiking_state_dtype`` (see the module docstring).
     """
 
     # ---- vocabulary / trunk
@@ -139,21 +139,21 @@ class NeuronSparkConfig:
     lexical_memory_init_std: float = 0.02
     lexical_memory_gate_bias: float = -2.0
     lexical_memory_hash_seed: int = 12345
-    # ---- SD layer
-    sd_expand: int = 6
-    sd_head_dim: int = 64
-    sd_state_size: int = 128
-    sd_chunk_size: int = 256
-    sd_theta0: float = 0.05
-    sd_theta_floor: float = 0.02
-    sd_surrogate_alpha: float = 8.0
+    # ---- spiking layer
+    spiking_expand: int = 6
+    spiking_head_dim: int = 64
+    spiking_state_size: int = 128
+    spiking_chunk_size: int = 256
+    spiking_theta0: float = 0.05
+    spiking_theta_floor: float = 0.02
+    spiking_surrogate_alpha: float = 8.0
     # ---- readout
     readout_balance_widths: Tuple[int, ...] = (16, 32)
     # ---- norms
-    sd_norm_eps: float = 1e-5
+    spiking_norm_eps: float = 1e-5
     rms_norm_eps: float = 1e-6
     # ---- inference (the one numerics option)
-    inference_sd_state_dtype: str = "bfloat16"
+    inference_spiking_state_dtype: str = "bfloat16"
 
     # ------------------------------------------------------------------------------------------------ validation
     def __post_init__(self) -> None:
@@ -172,9 +172,9 @@ class NeuronSparkConfig:
              tuple(tuple(_as_float("memory_pool_value_residual_anchor", x)
                          for x in _as_seq("memory_pool_value_residual_anchor", pair))
                    for pair in _as_seq("memory_pool_value_residual_anchor", self.memory_pool_value_residual_anchor)))
-        if not isinstance(self.inference_sd_state_dtype, str):
-            raise TypeError("inference_sd_state_dtype must be a string, got "
-                            f"{type(self.inference_sd_state_dtype).__name__}")
+        if not isinstance(self.inference_spiking_state_dtype, str):
+            raise TypeError("inference_spiking_state_dtype must be a string, got "
+                            f"{type(self.inference_spiking_state_dtype).__name__}")
         self._validate()
 
     def _validate(self) -> None:
@@ -195,13 +195,16 @@ class NeuronSparkConfig:
              f"D_key {self.D_key} and D_value {self.D_value} must be multiples of memory_heads {self.memory_heads}")
         need((self.D_key // self.memory_heads) % 2 == 0,
              "the memory head width D_key / memory_heads must be even (RoPE rotates pairs inside a head)")
-        need((self.sd_expand * self.D) % self.sd_head_dim == 0,
-             f"sd_expand * D = {self.sd_expand * self.D} must be a multiple of sd_head_dim {self.sd_head_dim}")
-        need(self.sd_chunk_size & (self.sd_chunk_size - 1) == 0, f"sd_chunk_size {self.sd_chunk_size} must be a power of 2")
-        need(self.sd_theta0 > self.sd_theta_floor >= 0.0,
-             f"sd_theta0 {self.sd_theta0} must exceed sd_theta_floor {self.sd_theta_floor} >= 0")
-        need(self.sd_surrogate_alpha > 0.0 and self.plif_surrogate_alpha > 0.0, "surrogate slopes must be positive")
-        need(self.sd_norm_eps > 0.0 and self.rms_norm_eps > 0.0, "norm eps must be positive")
+        need((self.spiking_expand * self.D) % self.spiking_head_dim == 0,
+             f"spiking_expand * D = {self.spiking_expand * self.D} must be a multiple of spiking_head_dim "
+             f"{self.spiking_head_dim}")
+        need(self.spiking_chunk_size & (self.spiking_chunk_size - 1) == 0,
+             f"spiking_chunk_size {self.spiking_chunk_size} must be a power of 2")
+        need(self.spiking_theta0 > self.spiking_theta_floor >= 0.0,
+             f"spiking_theta0 {self.spiking_theta0} must exceed spiking_theta_floor {self.spiking_theta_floor} >= 0")
+        need(self.spiking_surrogate_alpha > 0.0 and self.plif_surrogate_alpha > 0.0,
+             "surrogate slopes must be positive")
+        need(self.spiking_norm_eps > 0.0 and self.rms_norm_eps > 0.0, "norm eps must be positive")
         need(self.lexical_memory_init_std > 0.0, "lexical_memory_init_std must be positive")
         need(self.memory_pkm_query_dim % 2 == 0, "memory_pkm_query_dim must be even (two half-queries)")
         need(self.memory_pkm_topk <= self.memory_pkm_subkeys, "memory_pkm_topk must not exceed memory_pkm_subkeys")
@@ -226,14 +229,15 @@ class NeuronSparkConfig:
         need((self.vocab_size + 1) ** len(rows) < (1 << 63),
              "the base-(V+1) key of the highest lexical order does not fit in int64")
         need(len(self.readout_balance_widths) >= 1, "readout_balance_widths must be non-empty")
-        need(self.inference_sd_state_dtype in SD_STATE_DTYPES,
-             f"inference_sd_state_dtype must be one of {SD_STATE_DTYPES}, got {self.inference_sd_state_dtype!r}")
+        need(self.inference_spiking_state_dtype in SPIKING_STATE_DTYPES,
+             f"inference_spiking_state_dtype must be one of {SPIKING_STATE_DTYPES}, got "
+             f"{self.inference_spiking_state_dtype!r}")
 
     # ------------------------------------------------------------------------------------------------ layout
     @property
     def layer_kinds(self) -> Tuple[str, ...]:
-        """``"memory"`` or ``"sd"`` per layer index."""
-        return tuple("memory" if (i + 1) % self.memory_layer_interval == 0 else "sd" for i in range(self.num_layers))
+        """``"memory"`` or ``"spiking"`` per layer index."""
+        return tuple("memory" if (i + 1) % self.memory_layer_interval == 0 else "spiking" for i in range(self.num_layers))
 
     @property
     def memory_layer_ids(self) -> Tuple[int, ...]:
@@ -241,16 +245,16 @@ class NeuronSparkConfig:
         return tuple(i for i, k in enumerate(self.layer_kinds) if k == "memory")
 
     @property
-    def sd_layer_ids(self) -> Tuple[int, ...]:
-        """Layer indices of the 18 SD layers."""
-        return tuple(i for i, k in enumerate(self.layer_kinds) if k == "sd")
+    def spiking_layer_ids(self) -> Tuple[int, ...]:
+        """Layer indices of the 18 spiking layers."""
+        return tuple(i for i, k in enumerate(self.layer_kinds) if k == "spiking")
 
     @property
     def n_memory_layers(self) -> int:
         return sum(1 for i in range(self.num_layers) if (i + 1) % self.memory_layer_interval == 0)
 
     @property
-    def n_sd_layers(self) -> int:
+    def n_spiking_layers(self) -> int:
         return self.num_layers - self.n_memory_layers
 
     def is_memory_layer(self, layer_idx: int) -> bool:
@@ -263,36 +267,36 @@ class NeuronSparkConfig:
             raise ValueError(f"layer {layer_idx} is not a memory layer (memory layers: {ids})")
         return ids.index(int(layer_idx))
 
-    # ------------------------------------------------------------------------------------------------ SD layer
+    # ------------------------------------------------------------------------------------------------ spiking layer
     @property
-    def sd_d_inner(self) -> int:
-        """9216 = sd_expand * D."""
-        return self.sd_expand * self.D
+    def spiking_d_inner(self) -> int:
+        """9216 = spiking_expand * D."""
+        return self.spiking_expand * self.D
 
     @property
-    def sd_nheads(self) -> int:
-        """144 = sd_d_inner / sd_head_dim."""
-        return self.sd_d_inner // self.sd_head_dim
+    def spiking_nheads(self) -> int:
+        """144 = spiking_d_inner / spiking_head_dim."""
+        return self.spiking_d_inner // self.spiking_head_dim
 
     @property
-    def sd_conv_width(self) -> int:
-        """Causal depthwise conv width of the SD mixer (fixed 4)."""
+    def spiking_conv_width(self) -> int:
+        """Causal depthwise conv width of the spiking mixer (fixed 4)."""
         return 4
 
     @property
-    def sd_conv_dim(self) -> int:
-        """9472 = sd_d_inner + 2 * sd_state_size (x, B, C channels; one state group)."""
-        return self.sd_d_inner + 2 * self.sd_state_size
+    def spiking_conv_dim(self) -> int:
+        """9472 = spiking_d_inner + 2 * spiking_state_size (x, B, C channels; one state group)."""
+        return self.spiking_d_inner + 2 * self.spiking_state_size
 
     @property
-    def sd_in_proj_dim(self) -> int:
-        """18832 = 2 * sd_d_inner + 2 * sd_state_size + sd_nheads (rows z | x | B | C | dt)."""
-        return 2 * self.sd_d_inner + 2 * self.sd_state_size + self.sd_nheads
+    def spiking_in_proj_dim(self) -> int:
+        """18832 = 2 * spiking_d_inner + 2 * spiking_state_size + spiking_nheads (rows z | x | B | C | dt)."""
+        return 2 * self.spiking_d_inner + 2 * self.spiking_state_size + self.spiking_nheads
 
     @property
-    def sd_residual_branches(self) -> int:
-        """30 = 1 per SD layer + 2 per memory layer; sets the W_out init scale 1 / sqrt(30)."""
-        return self.n_sd_layers + 2 * self.n_memory_layers
+    def spiking_residual_branches(self) -> int:
+        """30 = 1 per spiking layer + 2 per memory layer; sets the W_out init scale 1 / sqrt(30)."""
+        return self.n_spiking_layers + 2 * self.n_memory_layers
 
     # ------------------------------------------------------------------------------------------------ memory layer
     @property
@@ -346,11 +350,11 @@ class NeuronSparkConfig:
         return 4 * channels + 2 * self.plif_eta_proj_rank * channels
 
     @property
-    def sd_layer_params(self) -> int:
+    def spiking_layer_params(self) -> int:
         """43,149,488: pre_norm_gain, in_proj, conv_weight, conv_bias, dt_bias, A_log, D, gamma, W_out, rho."""
-        D, di = self.D, self.sd_d_inner
-        return (D + self.sd_in_proj_dim * D + self.sd_conv_dim * self.sd_conv_width + self.sd_conv_dim
-                + 3 * self.sd_nheads + 2 * di + D * di)
+        D, di = self.D, self.spiking_d_inner
+        return (D + self.spiking_in_proj_dim * D + self.spiking_conv_dim * self.spiking_conv_width
+                + self.spiking_conv_dim + 3 * self.spiking_nheads + 2 * di + D * di)
 
     @property
     def memory_layer_params(self) -> int:
@@ -386,7 +390,7 @@ class NeuronSparkConfig:
         """1,270,342,292 parameter elements (609 tensors)."""
         lexical_tables = sum(r * h * d for r, h, d in zip(self.lexical_memory_rows, self.lexical_memory_heads,
                                                           self.lexical_memory_head_dims))
-        return (self.vocab_size * self.D + self.n_sd_layers * self.sd_layer_params
+        return (self.vocab_size * self.D + self.n_spiking_layers * self.spiking_layer_params
                 + self.n_memory_layers * self.memory_layer_params + self.D + lexical_tables
                 + sum(self.readout_balance_widths) * self.D)
 
@@ -404,9 +408,9 @@ class NeuronSparkConfig:
 
     @property
     def n_param_tensors_expected(self) -> int:
-        """609 = 4 top level + lexical tables + 10 per SD layer + 70 per memory layer."""
+        """609 = 4 top level + lexical tables + 10 per spiking layer + 70 per memory layer."""
         n_tables = sum(self.lexical_memory_heads)
-        return (2 + len(self.readout_balance_widths) + n_tables + 10 * self.n_sd_layers
+        return (2 + len(self.readout_balance_widths) + n_tables + 10 * self.n_spiking_layers
                 + (66 + self.memory_pool_extra_queries) * self.n_memory_layers)
 
     @property
@@ -471,14 +475,16 @@ _INT_FIELDS = frozenset((
     "memory_short_conv", "memory_pool_extra_queries", "memory_pool_extra_query_rank", "memory_pool_extra_query_out_rank",
     "memory_pool_value_glu_rank", "memory_pkm_heads", "memory_pkm_subkeys", "memory_pkm_topk", "memory_pkm_query_dim",
     "memory_pkm_value_dim", "memory_pkm_kmeans_iters", "rope_max_seq_len", "plif_eta_proj_rank",
-    "lexical_memory_key_dim", "lexical_memory_hash_seed", "sd_expand", "sd_head_dim", "sd_state_size", "sd_chunk_size",
+    "lexical_memory_key_dim", "lexical_memory_hash_seed", "spiking_expand", "spiking_head_dim", "spiking_state_size",
+    "spiking_chunk_size",
 ))
 _FLOAT_FIELDS = frozenset((
     "memory_base_decay", "memory_write_sparsity", "memory_pool_write_bias_spectrum_span", "memory_read_copy_gain",
     "memory_copy_novelty_gate_init", "memory_copy_novelty_gate_aux", "memory_pkm_launch_ratio",
     "memory_pkm_copy_gate_strength", "rope_base", "init_tau", "plif_surrogate_alpha", "plif_threshold_match_p",
-    "lexical_memory_init_std", "lexical_memory_gate_bias", "sd_theta0", "sd_theta_floor", "sd_surrogate_alpha",
-    "sd_norm_eps", "rms_norm_eps",
+    "lexical_memory_init_std", "lexical_memory_gate_bias", "spiking_theta0", "spiking_theta_floor",
+    "spiking_surrogate_alpha",
+    "spiking_norm_eps", "rms_norm_eps",
 ))
 _INT_TUPLE_FIELDS = frozenset((
     "memory_induction_bias_orders", "lexical_memory_rows", "lexical_memory_heads", "lexical_memory_head_dims",

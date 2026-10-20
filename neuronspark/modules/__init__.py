@@ -1,10 +1,10 @@
 """Layer modules of the NeuronSpark model.
 
 Building blocks (this package): ``Linear`` / ``ShortConvWeight`` (``linear``), ``RMSNorm`` / ``frozen_rms_norm``
-(``norms``), the RoPE tables and reference (``rope``).  Layers (imported on first access): ``SDLayer`` / ``SDMixer``
-(``sd_mixer``), ``MemoryLayer`` (``memory_layer``), ``PLIFNeuron`` (``plif``), ``SpikingFFN`` (``spiking_ffn``),
-``LexicalMemory`` (``lexical_memory``), ``ReadoutBalance`` (``readout_balance``), the induction match matrices
-(``induction``) and the copy-detector statistics (``copy_detector``).
+(``norms``), the RoPE tables and reference (``rope``).  Layers (imported on first access): ``SpikingLayer`` /
+``SpikingMixer`` (``spiking_mixer``), ``MemoryLayer`` (``memory_layer``), ``PLIFNeuron`` (``plif``), ``SpikingFFN``
+(``spiking_ffn``), ``LexicalMemory`` (``lexical_memory``), ``ReadoutBalance`` (``readout_balance``), the induction match
+matrices (``induction``) and the copy-detector statistics (``copy_detector``).
 
 ``mechanism_init_seed(base, layer_idx)`` is the seed of the forked RNG stream from which a mechanism draws its launch
 values (the run seed is ``torch.initial_seed()``, read without consuming random numbers).
@@ -20,7 +20,7 @@ from neuronspark.modules.rope import apply_rope_interleaved_ref, precompute_rope
 __all__ = [
     "Linear", "ShortConvWeight", "RMSNorm", "frozen_rms_norm", "rms_norm_ref", "precompute_rope_freqs",
     "rope_head_band_tables", "apply_rope_interleaved_ref", "mechanism_init_seed",
-    "SDLayer", "SDMixer", "MemoryLayer", "PLIFNeuron", "SpikingFFN", "LexicalMemory", "ReadoutBalance",
+    "SpikingLayer", "SpikingMixer", "MemoryLayer", "PLIFNeuron", "SpikingFFN", "LexicalMemory", "ReadoutBalance",
     "induction_match_matrices", "induction_session_match", "copy_stats_whole_row", "copy_stats_session", "copy_pi",
 ]
 
@@ -33,8 +33,8 @@ def mechanism_init_seed(base: int, layer_idx: int) -> int:
 
 
 _LAZY = {
-    "SDLayer": "neuronspark.modules.sd_mixer",
-    "SDMixer": "neuronspark.modules.sd_mixer",
+    "SpikingLayer": "neuronspark.modules.spiking_mixer",
+    "SpikingMixer": "neuronspark.modules.spiking_mixer",
     "MemoryLayer": "neuronspark.modules.memory_layer",
     "PLIFNeuron": "neuronspark.modules.plif",
     "SpikingFFN": "neuronspark.modules.spiking_ffn",

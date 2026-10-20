@@ -20,17 +20,21 @@ CUDA-graph decoding, plus tests and benchmarks.
 
 ## Architecture
 
-The model has 24 layers in a fixed 3:1 pattern, width 1536, and a vocabulary of 151,669 tokens.  The readout is tied to
-the embedding.
+NeuronSpark stacks two kinds of layers in a fixed 3:1 pattern: three spiking layers, then one memory layer.  The readout
+is tied to the embedding.
 
-| block | layers | what it computes |
-|---|---|---|
-| **SD layer** (selective dendrite) | 18 | pre-norm → input projection → causal conv + SiLU → a selective state space holding the membrane potentials of 128 compartments per soma (144 × 64 somata, chunked scan) → gated RMSNorm → bipolar soft-threshold soma `max(n − θ, 0) − max(−n − θ, 0)` → output projection |
-| **Memory layer** (layers 3, 7, …, 23) | 6 | lexical read-out; pool attention (6 heads, RoPE, PLIF write gate, gated decay, induction bias, value residual); copy gate; spiking FFN of PLIF neurons; product-key memory (4 heads × 128² keys, top-16) |
-| **Model level** | – | hashed n-gram lexical memory (orders 1–3), induction match matrices (orders 2–4), copy-detector statistics, final RMSNorm, readout balance (low-rank logit corrections of widths 16 and 32) |
+| block | what it computes |
+|---|---|
+| **Spiking layer** | pre-norm → input projection → causal conv + SiLU → a selective state space holding the membrane potentials of each soma's dendritic compartments (chunked scan) → gated RMSNorm → bipolar soft-threshold soma `max(n − θ, 0) − max(−n − θ, 0)` → output projection |
+| **Memory layer** (every fourth layer) | lexical read-out; pool attention (RoPE, PLIF write gate, gated decay, induction bias, value residual); copy gate; spiking FFN of PLIF neurons; product-key memory with top-k retrieval |
+| **Model level** | hashed n-gram lexical memory, induction match matrices, copy-detector statistics, final RMSNorm, readout balance (low-rank logit corrections) |
 
-The training loss is the token cross entropy plus a copy-switch auxiliary loss with weight 0.5.  The configuration is
-in `configs/neuronspark_1p3b.json`.
+The training loss is the token cross entropy plus a weighted copy-switch auxiliary loss.
+
+Sizes and constants (depth, width, somata and compartments, heads, memory slots, n-gram orders, vocabulary, loss
+weights) are configuration, not architecture: they are the fields of `NeuronSparkConfig`
+(`neuronspark/models/config_neuronspark.py`), and `configs/neuronspark_1p3b.json` is the configuration of the released
+1.27B checkpoint.  Each GPU operator states the shapes it supports in its docstring.
 
 ## Installation
 
@@ -58,7 +62,7 @@ from neuronspark import NeuronSparkLMHeadModel
 
 model = NeuronSparkLMHeadModel.from_pretrained("path/to/checkpoint", device="cuda")
 
-ids = torch.randint(0, 151669, (8, 1024), device="cuda")        # (B, T), T a multiple of 256
+ids = torch.randint(0, model.config.vocab_size, (8, 1024), device="cuda")  # (B, T), T a multiple of spiking_chunk_size
 logits = model(ids).logits                                        # (B, T, V)
 
 targets = torch.roll(ids, -1, dims=1)
@@ -68,7 +72,7 @@ loss.backward()
 ```
 
 A checkpoint directory holds `config.json` and `model.safetensors`.  `model.save_pretrained(path)` writes one.  To
-recompute the SD layers in the backward pass, set `model.gradient_checkpointing = True`.
+recompute the spiking layers in the backward pass, set `model.gradient_checkpointing = True`.
 
 To train from scratch, build `NeuronSparkLMHeadModel(config)` and calibrate it once on the first training rows with
 `neuronspark.utils.calibration.calibrate_fresh_model(model, batches)`.  This sets the neuron thresholds and the
@@ -95,9 +99,9 @@ with torch.no_grad():
     logits = model(token, inference_params=cache).logits                       # one decode step
 ```
 
-The SD state in the cache is stored in bf16 by default.  To store it in fp32, pass `sd_state_dtype="float32"` to
-`allocate_inference_cache` or `generate`, or `inference_sd_state_dtype="float32"` to `from_pretrained`.  fp32 storage
-uses twice the memory.
+The spiking-layer state in the cache is stored in bf16 by default.  To store it in fp32, pass
+`spiking_state_dtype="float32"` to `allocate_inference_cache` or `generate`, or
+`inference_spiking_state_dtype="float32"` to `from_pretrained`.  fp32 storage uses twice the memory.
 
 ## Operators
 
@@ -109,10 +113,10 @@ custom ops.  `neuronspark/ops/registry.py` lists every operator with its signatu
 | family | file | used in |
 |---|---|---|
 | linear with fp32 weight gradient | `ops/linear.py` | train, prefill, decode |
-| SD chunk scan + soma | `ops/sd_combined.py`, `ops/triton/sd_{states,scan,glue,soma}.py`, `ops/gluon/sd_{chunk_states,dstates,dda,chunk_scan_fwd,chunk_scan_dx}.py` | train |
-| SD prefill scan | `ops/sd_prefill.py`, `ops/gluon/sd_chunk_states.py` | prefill |
-| SD conv, norms, residual | `ops/triton/sd_{conv,prenorm,gated_norm,residual}.py` | train, prefill |
-| SD decode step | `ops/triton/sd_step.py` | decode |
+| Spiking-layer chunk scan + soma | `ops/spiking_combined.py`, `ops/triton/spiking_{states,scan,glue,soma}.py`, `ops/gluon/spiking_{chunk_states,dstates,dda,chunk_scan_fwd,chunk_scan_dx}.py` | train |
+| Spiking-layer prefill scan | `ops/spiking_prefill.py`, `ops/gluon/spiking_chunk_states.py` | prefill |
+| Spiking-layer conv, norms, residual | `ops/triton/spiking_{conv,prenorm,gated_norm,residual}.py` | train, prefill |
+| Spiking-layer decode step | `ops/triton/spiking_step.py` | decode |
 | PLIF neurons | `ops/triton/plif.py`, `ops/gluon/plif_k1_bwd.py` | train, prefill |
 | pool attention | `ops/triton/pool_{attn,bias}.py`, `ops/triton/mem_{heads,rope,norms,residual}.py` | train |
 | inference rings, extra queries | `ops/triton/pool_ring.py`, `ops/triton/xq_query.py` | prefill, decode |

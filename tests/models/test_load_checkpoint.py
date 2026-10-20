@@ -173,7 +173,7 @@ def test_post_load_checks(loaded):
                      f"layers.{l.layer_idx}.pool_value_residual_anchor")
     frozen = [n for n, p in loaded.named_parameters() if not p.requires_grad]
     assert len(frozen) == 24 and all(n.endswith(".w") for n in frozen)
-    assert loaded.config.inference_sd_state_dtype == "bfloat16"
+    assert loaded.config.inference_spiking_state_dtype == "bfloat16"
 
 
 @pytest.mark.cuda

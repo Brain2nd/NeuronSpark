@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "neuronspark"
 version = "1.0.0"
-description = "NeuronSpark: a spiking language model (selective-dendrite and memory layers) with its Triton and Gluon operators"
+description = "NeuronSpark: a spiking language model (spiking and memory layers) with its Triton and Gluon operators"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }

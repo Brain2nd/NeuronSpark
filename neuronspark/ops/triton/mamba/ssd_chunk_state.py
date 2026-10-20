@@ -18,7 +18,7 @@
 #   * _chunk_cumsum_fwd_kernel (source lines 39-86), _chunk_cumsum_bwd_kernel (source lines 101-174) and
 #     _chunk_state_fwd_kernel (source lines 191-268): the @triton.jit bodies are byte-identical; their @triton.autotune
 #     decorators (lines 27-38, 89-100, 177-190) are removed.  _chunk_cumsum_bwd_kernel has no launcher here: its only
-#     caller (neuronspark.ops.triton.sd_glue.chunk_cumsum_bwd) launches it with a fixed configuration.
+#     caller (neuronspark.ops.triton.spiking_glue.chunk_cumsum_bwd) launches it with a fixed configuration.
 #   * _chunk_cumsum_fwd (source lines 718-741) and _chunk_state_fwd (source lines 812-842): the launchers take the
 #     launch configuration as the keyword argument ``config = (kwargs, num_warps, num_stages)`` (the constants are in
 #     neuronspark.ops.triton.mamba) and compute the grid from it; every other line is the source's.

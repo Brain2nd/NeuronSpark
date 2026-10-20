@@ -12,8 +12,8 @@
   output tokens per second of greedy decoding at that batch size.
 
 Every figure is the median over the calls of a trial, then the mean over ``--trials`` (the per-trial medians are
-printed too).  The prompts are uniform random ids (``--seed``); the ring capacity of the caches is ``--ring``; the SD
-state storage is ``--sd-state-dtype`` (default: the configuration's, bfloat16).
+printed too).  The prompts are uniform random ids (``--seed``); the ring capacity of the caches is ``--ring``; the
+spiking-layer state storage is ``--spiking-state-dtype`` (default: the configuration's, bfloat16).
 
 Example::
 
@@ -52,7 +52,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--prefill-iters", type=int, default=5, help="timed prefill calls per trial")
     p.add_argument("--trials", type=int, default=3)
     p.add_argument("--ring", type=int, default=2048, help="ring capacity of the caches (a multiple of 512)")
-    p.add_argument("--sd-state-dtype", default=None, choices=("bfloat16", "float32"))
+    p.add_argument("--spiking-state-dtype", default=None, choices=("bfloat16", "float32"))
     p.add_argument("--cupti", action="store_true", help="also report the CUPTI device time of a decode replay")
     p.add_argument("--no-generate", action="store_true", help="skip the end-to-end generate timing")
     p.add_argument("--seed", type=int, default=0)
@@ -60,7 +60,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     a = p.parse_args(argv)
 
     from neuronspark.models.neuronspark_lm import NeuronSparkLMHeadModel
-    from neuronspark.utils.cache import resolve_sd_state_dtype
+    from neuronspark.utils.cache import resolve_spiking_state_dtype
     from neuronspark.utils.generation import decode, update_graph_cache
 
     if not torch.cuda.is_available():
@@ -69,20 +69,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     L, steps, W = int(a.prompt_len), int(a.decode_steps), int(a.ring)
     if L + steps > W:
         raise SystemExit(f"prompt {L} + {steps} decode steps exceed the ring capacity {W}")
-    model = NeuronSparkLMHeadModel.from_pretrained(a.ckpt, device=dev, inference_sd_state_dtype=a.sd_state_dtype)
-    dt = resolve_sd_state_dtype(model.config.inference_sd_state_dtype)
+    model = NeuronSparkLMHeadModel.from_pretrained(a.ckpt, device=dev,
+                                                   inference_spiking_state_dtype=a.spiking_state_dtype)
+    dt = resolve_spiking_state_dtype(model.config.inference_spiking_state_dtype)
     model.prepare_inference()
     V = int(model.config.vocab_size)
     g = torch.Generator(device="cpu").manual_seed(int(a.seed))
     bmax = max(_sizes(a.prefill_batches) + _sizes(a.decode_batches))
     prompts = torch.randint(0, V, (bmax, L), generator=g, dtype=torch.int64).to(dev)
-    result = {"prompt_len": L, "ring": W, "sd_state_dtype": str(dt), "device": torch.cuda.get_device_name(dev),
+    result = {"prompt_len": L, "ring": W, "spiking_state_dtype": str(dt), "device": torch.cuda.get_device_name(dev),
               "torch": torch.__version__, "prefill": {}, "decode": {}, "generate": {}}
 
     # ---- prefill
     for b in _sizes(a.prefill_batches):
         ids = prompts[:b]
-        ip = model.allocate_inference_cache(b, W, sd_state_dtype=dt)
+        ip = model.allocate_inference_cache(b, W, spiking_state_dtype=dt)
 
         def prefill(ids=ids, ip=ip):
             with torch.no_grad():
@@ -97,7 +98,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # ---- decode steps (CUDA-graph replay) and generate
     for b in _sizes(a.decode_batches):
         ids = prompts[:b]
-        model._decoding_cache = update_graph_cache(model, model._decoding_cache, b, L, W, sd_state_dtype=dt)
+        model._decoding_cache = update_graph_cache(model, model._decoding_cache, b, L, W, spiking_state_dtype=dt)
         cache = model._decoding_cache
         ip = cache.inference_params
         trial_medians, every = [], []
@@ -129,7 +130,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         result["decode"][b] = entry
         if not a.no_generate:
             def gen(ids=ids):
-                decode(ids, model, L + steps, cg=True, sd_state_dtype=dt)
+                decode(ids, model, L + steps, cg=True, spiking_state_dtype=dt)
 
             ms, med, _ = host_time_ms(gen, warmup=1, iters=1, trials=a.trials, device=dev)
             result["generate"][b] = {"ms": ms, "trial_medians": med, "output_tokens_per_s": b * steps / (ms / 1e3)}

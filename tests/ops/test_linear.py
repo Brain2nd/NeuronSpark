@@ -22,8 +22,8 @@ pytestmark = pytest.mark.cuda
 
 # (name, input shape, output features, input dtype): the projection shapes of one training step (B 8, T 1024)
 SHAPES = [
-    ("sd_in_proj", (8, 1024, 1536), 18832, torch.bfloat16),
-    ("sd_w_out", (8192, 9216), 1536, torch.bfloat16),
+    ("spiking_in_proj", (8, 1024, 1536), 18832, torch.bfloat16),
+    ("spiking_w_out", (8192, 9216), 1536, torch.bfloat16),
     ("mem_qkv_folded", (8192, 1536), 4608, torch.bfloat16),
     ("mem_ffn_gate", (1024, 8, 1536), 768, torch.bfloat16),
     ("plif_eta_v", (1024, 8, 1536), 16, torch.float32),

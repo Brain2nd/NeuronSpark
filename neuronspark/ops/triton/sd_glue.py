@@ -1,18 +1,18 @@
 """SD SSD backward driver: the store-not-recompute backward of the SSD scan of the SD call (training).
 
-``bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB, dC, dA_cumsum, dt_sp, CB, states_pre)
--> (dx, ddt, dA, dB, dC, dD, ddt_bias)`` is mamba_ssm ``_mamba_chunk_scan_combined_bwd`` for the SD call (z None, no
-initial / final states, no seq_idx, dt_softplus, dt_limit (0, inf), ngroups 1, D (nheads,)) on the tensors the forward
-kept (dA_cumsum, softplus'd dt, CB, the fp32 chunk states) instead of recomputing them.  Inputs: dout (b, l, h, P) bf16
-(the gated norm's input gradient), x (b, l, h, P) bf16 / B, C (b, l, 1, N) bf16 views of the conv output, dt_raw
-(b, l, h) bf16 view of the projection, A / D / dt_bias (h,) fp32, dx / ddt / dB / dC the output buffers (views of the
-projection and conv-input gradients, written in place), dA_cumsum / dt_sp (b, h, nc, chunk) fp32, CB (b, nc, 1,
-chunk, chunk) fp32, states_pre (b, nc, h, P, N) fp32.  Returns dx, ddt, dB, dC (the given buffers), dA, dD, ddt_bias
-(h,) fp32.  Whole chunks only (l % chunk == 0, the training regime; the chunk-scan input backward is a whole-chunk
-Gluon kernel): otherwise it raises.
+``bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB, dC, dA_cumsum, dt_sp, CB,
+states_passed) -> (dx, ddt, dA, dB, dC, dD, ddt_bias)`` is mamba_ssm ``_mamba_chunk_scan_combined_bwd`` for the SD call
+(z None, no initial / final states, no seq_idx, dt_softplus, dt_limit (0, inf), ngroups 1, D (nheads,)) on the tensors
+the forward kept (dA_cumsum, softplus'd dt, CB, the fp32 passed states) instead of recomputing them.  Inputs: dout
+(b, l, h, P) bf16 (the gated norm's input gradient), x (b, l, h, P) bf16 / B, C (b, l, 1, N) bf16 views of the conv
+output, dt_raw (b, l, h) bf16 view of the projection, A / D / dt_bias (h,) fp32, dx / ddt / dB / dC the output buffers
+(views of the projection and conv-input gradients, written in place), dA_cumsum / dt_sp (b, h, nc, chunk) fp32, CB
+(b, nc, 1, chunk, chunk) fp32, states_passed (b, nc, h, P, N) fp32 (the state entering each chunk).  Returns dx, ddt,
+dB, dC (the given buffers), dA, dD, ddt_bias (h,) fp32.  Whole chunks only (l % chunk == 0, the training regime;
+the chunk-scan input backward is a whole-chunk Gluon kernel): otherwise it raises.
 
 The sequence (each step's order and operands are fixed):
-  1. ``sd_states.spd_fused``: dstates (bf16), the state-passing ddA workspace, the passed states (bf16);
+  1. ``gluon.sd_dstates.dstates_train``: dstates (bf16), the state-passing ddA workspace, the passed states (bf16);
   2. ``gluon.sd_chunk_scan_dx.chunk_scan_dx_gluon``: dx, ddt (fp32 per position), dD;
   3. ``sd_states.db_tma`` / ``dc_tma``: dB / dC head-split partials and the ddA_next / ddA_prev workspaces;
   4. ``sd_scan.dda_tma``: dCB head-split partials and the V grid of the intra-chunk ddA;
@@ -52,7 +52,8 @@ from neuronspark.ops.triton.mamba import (
 )
 from neuronspark.ops.gluon.sd_chunk_scan_dx import chunk_scan_dx_gluon
 from neuronspark.ops.triton.sd_scan import chunk_scan_dx_ref, dda_asm, dda_ref, dda_tma, softplus_ref
-from neuronspark.ops.triton.sd_states import _chunked, db_tma, db_tma_ref, dc_tma, dc_tma_ref, spd_fused, spd_fused_ref
+from neuronspark.ops.gluon.sd_dstates import dstates_train, dstates_train_ref
+from neuronspark.ops.triton.sd_states import _chunked, db_tma, db_tma_ref, dc_tma, dc_tma_ref
 
 __all__ = ["bwd_store_glue", "bwd_store_glue_ref", "splits_sum", "ddA_combine", "chunk_cumsum_bwd"]
 
@@ -221,7 +222,8 @@ def chunk_cumsum_bwd(ddA, ddt_out, dt, A, dt_bias, ddt):
 
 
 # ------------------------------------------------------------------------------------------------ the backward body
-def bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB, dC, dA_cumsum, dt_sp, CB, states_pre):
+def bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB, dC, dA_cumsum, dt_sp, CB,
+                   states_passed):
     """The SSD backward of the SD call on the kept forward tensors (see the module docstring)."""
     require_cuda(dout, "bwd_store_glue")
     if dout.stride(-1) != 1:
@@ -233,8 +235,7 @@ def bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB
     dB_given, dC_given, ddt_given = dB, dC, ddt
     dt = dt_sp
     # dstates GEMM + both state-passing passes
-    dstates, ws_sp, nv_sp, states = spd_fused(states_pre.flatten(-2), dA_cumsum[:, :, :, -1], dout, C, dA_cumsum,
-                                              x.dtype)
+    dstates, ws_sp, nv_sp, states = dstates_train(states_passed, dA_cumsum, dout, C, x.dtype)
     states = states.unflatten(-1, (headdim, dstate))
     dstates = dstates.unflatten(-1, (headdim, dstate))
     dx, ddt, dD = chunk_scan_dx_gluon(x, dt, dA_cumsum, B, CB, dout, dstates, D, dx)
@@ -253,13 +254,13 @@ def bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB
 
 
 def bwd_store_glue_ref(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB, dC, dA_cumsum, dt_sp, CB,
-                       states_pre):
+                       states_passed):
     """Pure torch: the SSD backward of the SD call on the kept forward tensors (the sequence of
     :func:`bwd_store_glue`), each step by its piece reference -- the stock mamba_ssm math in float64 between the
     kernels' rounding points, which are reproduced:
 
-      1. ``spd_fused_ref``: dstates (bf16, from bf16(dout exp(dA)) C sums), the state-passing ddA block sums, the
-         passed states recomputed from states_pre (bf16);
+      1. ``dstates_train_ref``: dstates (bf16, from bf16(dout exp(dA)) C sums), the state-passing ddA block sums, the
+         passed states (bf16);
       2. ``chunk_scan_dx_ref``: dx, ddt_out, dD (the dot operand bf16(CB[k, m] decay) of the dx kernel);
       3. ``db_tma_ref`` / ``dc_tma_ref``: dB / dC summed over heads, ddA_next / ddA_prev;
       4. ``dda_ref``: dCB and the intra-chunk ddA;
@@ -277,8 +278,7 @@ def bwd_store_glue_ref(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt
     dstate = int(B.shape[-1])
     L = nchunks * chunk
     # 1. dstates + both state-passing passes
-    dstates, ws_sp, nv_sp, states = spd_fused_ref(states_pre.flatten(-2), dA_cumsum[:, :, :, -1], dout, C, dA_cumsum,
-                                                  x.dtype)
+    dstates, ws_sp, nv_sp, states = dstates_train_ref(states_passed, dA_cumsum, dout, C, x.dtype)
     dstates = dstates.unflatten(-1, (headdim, dstate))
     states = states.unflatten(-1, (headdim, dstate))
     # 2. dx / ddt_out / dD

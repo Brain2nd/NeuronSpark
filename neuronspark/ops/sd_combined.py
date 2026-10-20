@@ -6,8 +6,8 @@ Registry op ``sd_chunk_scan_soma(zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, g
 -> xs``:
 
 * ``zxbcdt`` (B, T, 2 d_inner + 2 N + H) bf16 contiguous: the in-projection output, columns z | x B C | dt
-  (1MIX: 9216 | 9472 | 144 = 18832); T % chunk_size == 0 (full chunks); the forward covers 1 .. 64 chunks, the
-  backward 2 .. 64 (the range of the fused state-passing backward ``sd_states.spd_fused``; it raises outside);
+  (1MIX: 9216 | 9472 | 144 = 18832); T % chunk_size == 0 (full chunks); the backward needs at least
+  2 chunks (the state gradients ``gluon.sd_dstates.dstates_train``; it raises otherwise);
 * ``conv_w`` (d_inner + 2 N, 4) fp32 contiguous (column 3 = lag 0), ``conv_b`` (d_inner + 2 N,) fp32;
 * ``dt_bias``, ``A`` (= -exp(A_log)), ``D`` (H,) fp32; ``theta`` (= floor + softplus(rho)), ``gamma`` (d_inner,) fp32;
 * ``alpha`` the soma surrogate slope (> 0; 8.0 for 1MIX), ``chunk_size`` 256;
@@ -17,7 +17,8 @@ Registry op ``sd_chunk_scan_soma(zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, g
 Forward:
   1. causal conv k4 + SiLU on x|B|C (:mod:`neuronspark.ops.triton.sd_conv`), output (B, T, C) bf16 kept;
   2. dt = softplus(dt + dt_bias) and its per-chunk cumsum of dt A (vendored mamba_ssm ``_chunk_cumsum_fwd``);
-  3. chunk states + state passing (``sd_states.csp_fused``): the fp32 chunk states kept, the passed states bf16;
+  3. chunk states + state passing (Gluon ``chunk_states_train``, Blackwell): the passed states (the state entering each
+     chunk) kept in fp32 for the backward's state gradients, and in bf16 for the chunk scan;
   4. CB = C B^T per chunk (vendored ``_bmm_chunk_fwd``, fp32), kept;
   5. the chunk scan (Gluon ``chunk_scan_fwd_gluon``, Blackwell), y bf16 kept;
   6. gated RMSNorm (unit weight, eps 1e-5) + bipolar soma + gamma (``sd_soma.gated_norm_soma_fwd``): xs, with the norm's
@@ -35,7 +36,7 @@ Gluon chunk scan), the first call eager (the Gluon work split and the dda tile t
 capture raises), autocast-agnostic (every dtype is explicit; the training regime runs it under bf16 autocast).
 
 Memory kept from forward to backward per call (1MIX, B 8, T 1024): zxbcdt 309 MB (the input), the conv output 155 MB,
-y and n 151 MB each, the fp32 chunk states 151 MB, CB 8.4 MB, dt / dA_cumsum 4.7 MB each.
+y and n 151 MB each, the fp32 passed states 151 MB, CB 8.4 MB, dt / dA_cumsum 4.7 MB each.
 """
 from __future__ import annotations
 
@@ -47,10 +48,10 @@ from neuronspark.ops.gluon.sd_chunk_scan_fwd import chunk_scan_fwd_gluon
 from neuronspark.ops.triton import require_cuda, require_sm100
 from neuronspark.ops.triton.mamba import BMM_CHUNK_FWD, CHUNK_CUMSUM_FWD_TRAIN, _bmm_chunk_fwd, _chunk_cumsum_fwd
 from neuronspark.ops.triton.sd_conv import _conv_bwd, _conv_fwd, _ensure_stride, sd_conv_silu_ref, split_dwb
+from neuronspark.ops.gluon.sd_chunk_states import chunk_states_train
 from neuronspark.ops.triton.sd_glue import bwd_store_glue
 from neuronspark.ops.triton.sd_scan import ssd_forward_ref
 from neuronspark.ops.triton.sd_soma import _gated_norm_ref, bipolar_release, gated_norm_soma_bwd, gated_norm_soma_fwd
-from neuronspark.ops.triton.sd_states import csp_fused
 
 __all__ = ["NORM_EPS", "CHUNK_SIZE", "SDChunkScanSomaFn", "sd_chunk_scan_soma", "sd_chunk_scan_soma_ref"]
 
@@ -89,7 +90,7 @@ def _geometry(zxbcdt, conv_w, D, theta):
            "Tensor gamma, int chunk_size) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)")
 def _sd_chunk_scan_soma_fwd_op(zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma, chunk_size):
     """(xs (B T, d_inner) bf16, y (B, T, H, P) bf16, rstd (B T,) fp32, conv output (B, T, C) bf16, dt (B, H, nc, cs)
-    fp32, dA_cumsum (B, H, nc, cs) fp32, CB (B, nc, 1, cs, cs) fp32, chunk states (B, nc, H, P, N) fp32, n (B T,
+    fp32, dA_cumsum (B, H, nc, cs) fp32, CB (B, nc, 1, cs, cs) fp32, passed states (B, nc, H, P, N) fp32, n (B T,
     d_inner) bf16)"""
     nheads, dim, headdim, dstate = _geometry(zxbcdt, conv_w, D, theta)
     batch, seqlen, _ = zxbcdt.shape
@@ -107,13 +108,13 @@ def _sd_chunk_scan_soma_fwd_op(zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gam
         raise RuntimeError("neuronspark.sd_chunk_scan_soma: x / B / C / D are not in the SD layout")
     dA_cumsum, dt_sp = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=True, dt_limit=_DT_LIMIT,
                                          config=CHUNK_CUMSUM_FWD_TRAIN)
-    states_pre, states = csp_fused(B, x, dt_sp, dA_cumsum, C.dtype)
+    states_passed, states = chunk_states_train(B, x, dt_sp, dA_cumsum, C.dtype, passed_fp32=True)
     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=None, output_dtype=torch.float32, config=BMM_CHUNK_FWD)
     out_x = chunk_scan_fwd_gluon(CB, x, dt_sp, dA_cumsum, C, states, D)
     x_rms = out_x.view(batch * seqlen, dim)
     z_rms = z.view(batch * seqlen, dim)
     xs, rstd, n = gated_norm_soma_fwd(x_rms, _ones(dim, zxbcdt.device), NORM_EPS, z_rms, theta, gamma)
-    return xs, out_x, rstd, xBC_conv, dt_sp, dA_cumsum, CB, states_pre, n
+    return xs, out_x, rstd, xBC_conv, dt_sp, dA_cumsum, CB, states_passed, n
 
 
 @_sd_chunk_scan_soma_fwd_op.register_fake
@@ -138,10 +139,10 @@ def _sd_chunk_scan_soma_fwd_fake(zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, g
     "neuronspark::sd_chunk_scan_soma_bwd", mutates_args=(),
     schema="(Tensor dout, Tensor zxbcdt, Tensor conv_w, Tensor conv_b, Tensor dt_bias, Tensor A, Tensor D, "
            "Tensor theta, Tensor gamma, Tensor out_x, Tensor rstd, Tensor xBC_conv, Tensor dt_sp, Tensor dA_cumsum, "
-           "Tensor CB, Tensor states_pre, Tensor n, float alpha, int chunk_size) "
+           "Tensor CB, Tensor states_passed, Tensor n, float alpha, int chunk_size) "
            "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)")
 def _sd_chunk_scan_soma_bwd_op(dout, zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma, out_x, rstd, xBC_conv,
-                               dt_sp, dA_cumsum, CB, states_pre, n, alpha, chunk_size):
+                               dt_sp, dA_cumsum, CB, states_passed, n, alpha, chunk_size):
     """(dzxbcdt bf16 (zxbcdt's shape), dconv (5 C,) fp32 = conv weight gradient flattened then conv bias gradient,
     ddt_bias, dA, dD (H,) fp32, dtheta, dgamma (d_inner,) fp32)"""
     nheads, dim, headdim, dstate = _geometry(zxbcdt, conv_w, D, theta)
@@ -168,7 +169,7 @@ def _sd_chunk_scan_soma_bwd_op(dout, zxbcdt, conv_w, conv_b, dt_bias, A, D, thet
     dy = dy.view(batch, seqlen, nheads, headdim)
     dx, ddt, dA, dB, dC, dD, ddt_bias = bwd_store_glue(
         dy, x, dt, A, B, C, chunk_size, D, dt_bias, dx=dx, ddt=ddt_given, dB=dB, dC=dC,
-        dA_cumsum=dA_cumsum, dt_sp=dt_sp, CB=CB, states_pre=states_pre)
+        dA_cumsum=dA_cumsum, dt_sp=dt_sp, CB=CB, states_passed=states_passed)
     dxBC_given_update, dconv = _conv_bwd(_ensure_stride(xBC).transpose(1, 2), conv_w, conv_b,
                                          _ensure_stride(dxBC).transpose(1, 2),
                                          _ensure_stride(dxBC_given).transpose(1, 2))
@@ -180,7 +181,7 @@ def _sd_chunk_scan_soma_bwd_op(dout, zxbcdt, conv_w, conv_b, dt_bias, A, D, thet
 
 @_sd_chunk_scan_soma_bwd_op.register_fake
 def _sd_chunk_scan_soma_bwd_fake(dout, zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma, out_x, rstd, xBC_conv,
-                                 dt_sp, dA_cumsum, CB, states_pre, n, alpha, chunk_size):
+                                 dt_sp, dA_cumsum, CB, states_passed, n, alpha, chunk_size):
     nheads, dim, headdim, dstate = _geometry(zxbcdt, conv_w, D, theta)
     dev = zxbcdt.device
     e = torch.empty
@@ -202,11 +203,11 @@ class SDChunkScanSomaFn(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda")
     def forward(ctx, zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma, alpha, chunk_size):
-        (xs, out_x, rstd, xBC_conv, dt_sp, dA_cumsum, CB, states_pre,
+        (xs, out_x, rstd, xBC_conv, dt_sp, dA_cumsum, CB, states_passed,
          n) = torch.ops.neuronspark.sd_chunk_scan_soma_fwd(zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma,
                                                             int(chunk_size))
         ctx.save_for_backward(zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma, out_x, rstd, xBC_conv, dt_sp,
-                              dA_cumsum, CB, states_pre, n)
+                              dA_cumsum, CB, states_passed, n)
         ctx.alpha = float(alpha)
         ctx.chunk_size = int(chunk_size)
         return xs
@@ -214,7 +215,7 @@ class SDChunkScanSomaFn(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_bwd(device_type="cuda")
     def backward(ctx, dout):
-        (zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma, out_x, rstd, xBC_conv, dt_sp, dA_cumsum, CB, states_pre,
+        (zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma, out_x, rstd, xBC_conv, dt_sp, dA_cumsum, CB, states_passed,
          n) = ctx.saved_tensors
         if dout.dtype != torch.bfloat16 or tuple(dout.shape) != (int(zxbcdt.shape[0]) * int(zxbcdt.shape[1]),
                                                                   int(theta.shape[0])):
@@ -223,7 +224,7 @@ class SDChunkScanSomaFn(torch.autograd.Function):
                                f"{dout.dtype} {tuple(dout.shape)}")
         dzxbcdt, dconv, ddt_bias, dA, dD, dtheta, dgamma = torch.ops.neuronspark.sd_chunk_scan_soma_bwd(
             dout, zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma, out_x, rstd, xBC_conv, dt_sp, dA_cumsum, CB,
-            states_pre, n, ctx.alpha, ctx.chunk_size)
+            states_passed, n, ctx.alpha, ctx.chunk_size)
         dweight, dbias = split_dwb(dconv, int(conv_w.shape[0]))
         need = ctx.needs_input_grad
         return (dzxbcdt, dweight, dbias, ddt_bias, dA, dD, dtheta if need[6] else None, dgamma if need[7] else None,

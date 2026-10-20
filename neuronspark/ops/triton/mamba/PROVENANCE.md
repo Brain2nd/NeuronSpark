@@ -49,8 +49,10 @@ the SD layer's shapes (nheads 144). The values used here:
 | `CHUNK_STATE_FWD_PREFILL` | `_chunk_state_fwd_kernel` | `({BLOCK_SIZE_M: 64, BLOCK_SIZE_N: 128, BLOCK_SIZE_K: 32}, 4, 4)` | prefill: a measured configuration (stages 4, warps 4) |
 | `STATE_PASSING_FWD_PREFILL` | `_state_passing_fwd_kernel` | `({BLOCK_SIZE: 1024}, 4, 3)` | prefill: a measured configuration (stages 3, warps 4) |
 
-The training forward does not run `_chunk_state_fwd_kernel` or `_state_passing_fwd_kernel` (both are replaced by the
-fused `neuronspark.ops.triton.sd_states.csp_fused`); the training backward does not run any other mamba_ssm kernel.
+Neither the training forward nor the inference prefill runs `_chunk_state_fwd_kernel` or `_state_passing_fwd_kernel`
+(both are replaced by the Gluon chunk-states kernel of `neuronspark.ops.gluon.sd_chunk_states`; the two configurations
+above are those of the vendored pair the tests compare it with); the training backward does not run any other mamba_ssm
+kernel.
 
 ## Pre-hooks of the registered configurations
 

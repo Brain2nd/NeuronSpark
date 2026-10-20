@@ -3,13 +3,13 @@ soma read-out as one autograd Function (training regime).
 
 * against the pure-torch references of its operators at B 1, T 512, each fed with the Function's own input to that
   operator (the forward intermediates from the forward op, the backward stage inputs from the same stage launches the
-  backward op makes): the conv, the chunk cumsum, CB, the chunk states, the chunk scan, the gated norm, the soma
+  backward op makes): the conv, the chunk cumsum, CB, the passed states, the chunk scan, the gated norm, the soma
   read-out, the soma and gated-norm backward, the SSD backward, the conv backward.  Every output (xs) and gradient
   (zxbcdt, conv weight / bias, dt_bias, A, D, theta, gamma) of the Function and every intermediate are compared.
   (An end-to-end pure-torch chain recomputes each bf16 intermediate independently; where the fp32 values lie on
   either side of a rounding boundary the intermediate differs by one unit in the last place, and the next operator can
   carry that past the rule's relative bound.)
-* autocast independence (T 512, two chunks; the fused state-passing backward covers 2 .. 64 chunks);
+* autocast independence (T 512, two chunks; the state gradients need at least two);
 * the call contract (full chunks, chunk 256, dtypes) and the layout of xs.
 
 Every comparison is the per-operator rule of ``neuronspark.utils.testing``.
@@ -34,7 +34,8 @@ from neuronspark.ops.triton.sd_soma import (
     soma_bwd,
     soma_bwd_ref,
 )
-from neuronspark.ops.triton.sd_states import csp_fused, csp_fused_ref
+from neuronspark.ops.gluon.sd_chunk_states import chunk_states_train
+from neuronspark.ops.triton.sd_states import csp_fused_ref
 from neuronspark.utils.testing import assert_all_match, rand_tensor
 
 pytestmark = [pytest.mark.cuda, pytest.mark.sm100]
@@ -93,7 +94,7 @@ def _per_operator(p):
     z_in, xBC_in, dt_raw = torch.split(zx, [DI, C_CONV, H], dim=-1)
     z2 = z_in.view(M, DI)
     with torch.no_grad():
-        xs, y, rstd, xbc, dt, dA, CB, states_pre, n = torch.ops.neuronspark.sd_chunk_scan_soma_fwd(
+        xs, y, rstd, xbc, dt, dA, CB, states_passed, n = torch.ops.neuronspark.sd_chunk_scan_soma_fwd(
             zx, p["conv_w"], p["conv_b"], dt_bias, A, D, th, ga, CHUNK)
     x = xbc[..., :DI].unflatten(-1, (H, P))
     Bm = xbc[..., DI:DI + N].unflatten(-1, (1, N))
@@ -115,9 +116,10 @@ def _per_operator(p):
     Bc = Bm[:, :, 0].double().reshape(Bn, nc, CHUNK, N)
     stage("CB", CB, torch.einsum("bcln,bcsn->bcls", Cc, Bc)[:, :, None].float())
     with torch.no_grad():
-        _, states = csp_fused(Bm, x, dt, dA, torch.bfloat16)          # the passed states the forward op scans with
-    r_pre, r_states = csp_fused_ref(Bm, x, dt, dA, torch.bfloat16)
-    stage("states_pre", states_pre, r_pre)
+        _, states = chunk_states_train(Bm, x, dt, dA, torch.bfloat16)  # the passed states the forward op scans with
+    _, r_states = csp_fused_ref(Bm, x, dt, dA, torch.bfloat16)
+    _, r_passed = csp_fused_ref(Bm, x, dt, dA, torch.float32)
+    stage("states_passed", states_passed, r_passed)
     stage("states", states, r_states)
     stage("y", y, chunk_scan_fwd_tma_ref(CB, x, dt, dA, Cm, states, D))
     r_norm = gated_norm_soma_fwd_ref(y2, ones, NORM_EPS, z2, th, ga)
@@ -133,13 +135,13 @@ def _per_operator(p):
         bwd_store_glue(dy4, x, dt_raw, A, Bm, Cm, CHUNK, D, dt_bias, dxBC[..., :DI].unflatten(-1, (H, P)),
                        torch.empty((Bn, T, H), dtype=torch.bfloat16, device=dev),
                        dxBC[..., DI:DI + N].unflatten(-1, (1, N)), dxBC[..., DI + N:].unflatten(-1, (1, N)),
-                       dA, dt, CB, states_pre)
+                       dA, dt, CB, states_passed)
     r_gn, r_dtheta, r_dgamma = soma_bwd_ref(dxs, n, th, ga, ALPHA)
     stage("grad_n", gn, r_gn)
     r_dy, r_dz = gated_rmsnorm_bwd_ref(gn, y2, ones, rstd, z2)
     stage("dy", dy, r_dy)
     r_dx, r_ddt, r_dA, r_dB, r_dC, r_dD, r_ddt_bias = bwd_store_glue_ref(
-        dy4, x, dt_raw, A, Bm, Cm, CHUNK, D, dt_bias, None, None, None, None, dA, dt, CB, states_pre)
+        dy4, x, dt_raw, A, Bm, Cm, CHUNK, D, dt_bias, None, None, None, None, dA, dt, CB, states_passed)
     stage("dxBC", dxBC, torch.cat([r_dx.flatten(-2), r_dB.flatten(-2), r_dC.flatten(-2)], dim=-1))
     xl = xBC_in.detach().requires_grad_(True)
     wl = p["conv_w"].detach().clone().requires_grad_(True)

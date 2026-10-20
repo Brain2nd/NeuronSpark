@@ -1,5 +1,5 @@
-"""ops.triton.sd_states: chunk states + state passing (``csp_fused``), the state-passing backward with its dstates GEMM
-(``spd_fused``) and the dB / dC pieces of the SSD backward (``db_tma`` / ``dc_tma``).
+"""ops.triton.sd_states: the dB / dC pieces of the SSD backward (``db_tma`` / ``dc_tma``), on chunk states from the
+Gluon forward (``ops.gluon.sd_chunk_states``).
 
 Each against its float64 reference ``*_ref`` (after the head-split / tile reductions) at B 1 x L 512 and a
 partial-chunk length (H 144, P 64, N 128, chunk 256).
@@ -13,15 +13,12 @@ import pytest
 import torch
 
 from neuronspark.ops.triton.mamba import BMM_CHUNK_FWD, CHUNK_CUMSUM_FWD_TRAIN, _bmm_chunk_fwd, _chunk_cumsum_fwd
+from neuronspark.ops.gluon.sd_chunk_states import chunk_states_train
 from neuronspark.ops.triton.sd_states import (
-    csp_fused,
-    csp_fused_ref,
     db_tma,
     db_tma_ref,
     dc_tma,
     dc_tma_ref,
-    spd_fused,
-    spd_fused_ref,
 )
 from neuronspark.utils.testing import assert_all_match, rand_tensor
 
@@ -44,7 +41,7 @@ def operands(B, L, device):
     o["dA"], o["dt"] = _chunk_cumsum_fwd(dt_raw, A, CS, dt_bias=dt_bias, dt_softplus=True,
                                          dt_limit=(0.0, float("inf")), config=CHUNK_CUMSUM_FWD_TRAIN)
     o["CB"] = _bmm_chunk_fwd(o["C"], o["B"], CS, seq_idx=None, output_dtype=torch.float32, config=BMM_CHUNK_FWD)
-    o["states_pre"], o["states"] = csp_fused(o["B"], o["x"], o["dt"], o["dA"], torch.bfloat16)
+    _, o["states"] = chunk_states_train(o["B"], o["x"], o["dt"], o["dA"], torch.bfloat16)
     nc = o["dA"].shape[2]
     o["dout"] = (rand_tensor((B, L, H, P), torch.float32, device) * 1e-2).to(torch.bfloat16)
     o["dstates"] = (rand_tensor((B, nc, H, P, N), torch.float32, device) * 0.1).to(torch.bfloat16)
@@ -57,34 +54,11 @@ def views(o):
             "C": xbc[..., DI + N:].unflatten(-1, (1, N))}
 
 
-def _run_spd(o):
-    dst, ws, nv, conv = spd_fused(o["states_pre"].flatten(-2), o["dA"][:, :, :, -1], o["dout"], o["C"], o["dA"],
-                                  torch.bfloat16)
-    return {"dstates": dst, "ws": ws[..., :nv].contiguous(), "states_converted": conv}
-
-
 def _run_dbdc(o):
     dB, wsb, nvb = db_tma(o["x"], o["dt"], o["dA"], o["dstates"], o["B"], 1)
     dC, wsc, nvc = dc_tma(o["states"], o["dA"], o["dout"], o["C"], 1)
     return {"dB_parts": dB, "ws_db": wsb[..., 1:, :nvb].contiguous(), "dC_parts": dC,
             "ws_dc": wsc[..., :nvc].contiguous()}
-
-
-@pytest.mark.parametrize("B,L", REF_SHAPES, ids=[f"B{b}_L{l}" for b, l in REF_SHAPES])
-def test_csp_vs_reference(device, B, L):
-    o = operands(B, L, device)
-    pre, st = csp_fused_ref(o["B"], o["x"], o["dt"], o["dA"], torch.bfloat16)
-    assert_all_match({"states_pre": o["states_pre"], "states": o["states"]}, {"states_pre": pre, "states": st},
-                     prefix="csp_ref")
-
-
-@pytest.mark.parametrize("B,L", REF_SHAPES, ids=[f"B{b}_L{l}" for b, l in REF_SHAPES])
-def test_spd_vs_reference(device, B, L):
-    o = operands(B, L, device)
-    dst, ws, nv, conv = spd_fused_ref(o["states_pre"].flatten(-2), o["dA"][:, :, :, -1], o["dout"], o["C"], o["dA"],
-                                      torch.bfloat16)
-    assert_all_match(_run_spd(o), {"dstates": dst, "ws": ws[..., :nv].contiguous(), "states_converted": conv},
-                     prefix="spd_ref")
 
 
 @pytest.mark.parametrize("B,L", REF_SHAPES, ids=[f"B{b}_L{l}" for b, l in REF_SHAPES])

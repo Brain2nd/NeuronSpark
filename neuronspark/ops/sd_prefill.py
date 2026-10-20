@@ -5,7 +5,7 @@
 # neuronspark/ops/triton/mamba/LICENSE (see NOTICE).
 # Modified by NeuronSpark: specialised to the SD layer's call (ngroups 1, D of shape (nheads,), no z, no seq_idx, no
 # varlen states, dt_softplus on, dt_limit (0, inf)); the kernels run at fixed launch configurations; the chunk states
-# and the state passing are one kernel (neuronspark.ops.triton.sd_states.csp_prefill); the chunk-scan forward is the
+# and the state passing are one kernel (neuronspark.ops.gluon.sd_chunk_states.chunk_states_prefill); the chunk-scan forward is the
 # Gluon kernel of neuronspark.ops.gluon.sd_chunk_scan_fwd for calls of whole chunks and the tensor-descriptor kernel of
 # neuronspark.ops.triton.sd_scan otherwise; the einops rearranges are reshapes.
 """SD prefill scan: the selective state-space scan of an SD mixer over a prompt chunk, started from the carried state.
@@ -32,7 +32,7 @@ softplus(dt_raw + dt_bias)`` clamped to [0, inf), ``a_t = exp(dt_t A)``)::
 evaluated chunk-wise as the mamba_ssm chunked scan (in this order, each piece one kernel launch):
 
 1. ``_chunk_cumsum_fwd``: dt (softplus, clamp) and the per-chunk inclusive cumsum of ``dt A`` (fp32);
-2. ``csp_prefill``: each chunk's own end state ``sum_s exp(dA_end - dA_s) dt_s x_s B_s^T`` (fp32, kept in registers)
+2. ``chunk_states_prefill``: each chunk's own end state ``sum_s exp(dA_end - dA_s) dt_s x_s B_s^T`` (fp32, on chip)
    and the states entering each chunk, ``s_c = exp(dA_chunk_end) s_{c-1} + chunk_state_c`` from ``initial_state`` in
    fp32, stored bf16 (C's dtype) for the scan, and the final state in fp32 -- mamba_ssm's ``_chunk_state_fwd`` and
    ``_state_passing_fwd`` in one kernel;
@@ -63,7 +63,7 @@ it replaces.
 Contract (anything else raises): CUDA tensors on one device of a Blackwell GPU (compute capability >= 10.0: TMA
 descriptors, tcgen05 / TMEM); the dtypes and shapes above with ngroups 1, N in {64, 128}, P in {16, 32, 64, 128}
 (P <= 64 and H even when T is a multiple of 256: the Gluon kernel's two heads per item in tensor memory),
-``chunk_size`` 256, T <= 64 chunks (16384 tokens) per call; ``x`` with a contiguous (H, P) part (or a non-unit last
+``chunk_size`` 256, any number of chunks per call; ``x`` with a contiguous (H, P) part (or a non-unit last
 stride, which is copied as mamba_ssm does); ``initial_state`` fp32 or bf16.  For whole-chunk calls an ``x`` / ``Cm`` whose
 batch stride is not T times its row stride (a time slice of a longer buffer) is copied to the standard layout first
 (a layout change only).  The Gluon kernel builds its work split on the first call per (B, nchunks, device): that
@@ -95,8 +95,8 @@ from neuronspark.ops.triton.mamba import (
     _bmm_chunk_fwd,
     _chunk_cumsum_fwd,
 )
+from neuronspark.ops.gluon.sd_chunk_states import chunk_states_prefill
 from neuronspark.ops.triton.sd_scan import chunk_scan_fwd_tma
-from neuronspark.ops.triton.sd_states import CSP_MAX_CHUNKS, csp_prefill
 
 __all__ = [
     "CHUNK_SIZE",
@@ -154,7 +154,7 @@ def _prefill_stages(x: torch.Tensor, dt: torch.Tensor, A: torch.Tensor, Bm: torc
         dt_out = dt_out.contiguous()
     if not dA_cumsum.is_contiguous():
         dA_cumsum = dA_cumsum.contiguous()
-    states, final_state = csp_prefill(Bm, x, dt_out, dA_cumsum, initial_state, Cm.dtype)
+    states, final_state = chunk_states_prefill(Bm, x, dt_out, dA_cumsum, initial_state, Cm.dtype)
     CB = _bmm_chunk_fwd(Cm, Bm, chunk_size, seq_idx=None, output_dtype=torch.float32, config=BMM_CHUNK_FWD)
     if seqlen % chunk_size == 0:
         out = chunk_scan_fwd_gluon(CB, _rows_packed(x), dt_out, dA_cumsum, _rows_packed(Cm), states, D)
@@ -214,8 +214,6 @@ def _check_operands(x, dt, A, Bm, Cm, D, dt_bias, initial_state, chunk_size) -> 
     ngroups, dstate = int(Bm.shape[2]), int(Bm.shape[3])
     if batch < 1 or seqlen < 1:
         _fail(f"empty input {tuple(x.shape)}")
-    if seqlen > CSP_MAX_CHUNKS * CHUNK_SIZE:
-        _fail(f"T = {seqlen} exceeds {CSP_MAX_CHUNKS} chunks of {CHUNK_SIZE} per call (split the prompt)")
     if ngroups != 1 or tuple(Bm.shape) != (batch, seqlen, 1, dstate) or tuple(Cm.shape) != tuple(Bm.shape):
         _fail(f"Bm / Cm must be (B, T, 1, N) of x's (B, T) = ({batch}, {seqlen}); got {tuple(Bm.shape)} "
               f"{tuple(Cm.shape)}")

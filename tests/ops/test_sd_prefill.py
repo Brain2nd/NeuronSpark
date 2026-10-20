@@ -1,6 +1,6 @@
 """ops.sd_prefill: the SD prefill scan from a carried state, and its fused kernels.
 
-* the fused chunk states + state passing kernel (``ops.triton.sd_states.csp_prefill``) against its reference
+* the chunk states + state passing kernel (``ops.gluon.sd_chunk_states.chunk_states_prefill``) against its reference
   ``csp_prefill_ref`` and against the vendored mamba_ssm pair computing the same quantities (``_chunk_state_fwd`` +
   ``_state_passing_fwd`` at the prefill configurations of ``ops.triton.mamba``), from a carried state and from the
   zero state (a first call);
@@ -16,6 +16,7 @@
   from the op's chunk quantities, and y from the op's chunk quantities and states (why stage by stage:
   ``neuronspark.ops.sd_prefill.sd_prefill_chunk_scan_ref``);
 * a prompt split at multiples of the chunk size over several calls with the carried state against the single call;
+* a call of more than 64 chunks against the stage references;
 * the refusals outside the contract.
 
 Every comparison is the per-operator rule of ``neuronspark.utils.testing``.
@@ -39,7 +40,8 @@ from neuronspark.ops.triton.mamba import (
     _state_passing_fwd,
 )
 from neuronspark.ops.triton.sd_scan import chunk_scan_fwd_tma
-from neuronspark.ops.triton.sd_states import csp_prefill, csp_prefill_ref
+from neuronspark.ops.gluon.sd_chunk_states import chunk_states_prefill
+from neuronspark.ops.triton.sd_states import csp_prefill_ref
 from neuronspark.utils.testing import assert_all_match, rand_tensor
 
 pytestmark = [pytest.mark.cuda, pytest.mark.sm100]
@@ -133,7 +135,7 @@ def test_csp_prefill_vs_reference_and_mamba(device, b, T, seed, init_kind):
     o = check_operands(b, T, seed, init_kind, device)
     x, dt, Bm, Cm, st = _stages(o)
     with torch.no_grad():
-        states, final = csp_prefill(Bm, x, st["dt_out"], st["dA_cumsum"], o["init"], torch.bfloat16)
+        states, final = chunk_states_prefill(Bm, x, st["dt_out"], st["dA_cumsum"], o["init"], torch.bfloat16)
         mamba = _mamba_states(Bm, x, st["dt_out"], st["dA_cumsum"], o["init"])
     new = {"states": states, "final_state": final}
     assert states.dtype == torch.bfloat16 and final.dtype == torch.float32
@@ -197,6 +199,18 @@ def test_prefill_split_at_chunk_multiples(device, b, splits):
     assert_all_match({"y": torch.cat(ys, dim=1), "final_state": state}, whole, prefix=f"prefill_split_b{b}")
 
 
+@pytest.mark.parametrize("T", [65 * CHUNK, 65 * CHUNK + 44], ids=["t16640", "t16684"])
+def test_prefill_long_prompt(device, T):
+    """A call of more than 64 chunks (whole chunks and a partial last chunk) against the stage references."""
+    o = operands(1, T, device, "bf16")
+    x, dt, Bm, Cm, st = _stages(o)
+    new = _op(o)
+    states_ref, final_ref = sd_prefill_states_ref(x, Bm, o["init"], st["dt_out"], st["dA_cumsum"], out_dtype=Cm.dtype)
+    assert_all_match({"states": st["states"]}, {"states": states_ref}, prefix=f"long_states_T{T}")
+    y_ref = sd_prefill_chunk_scan_ref(x, Cm, o["D"], st["dt_out"], st["dA_cumsum"], st["CB"], st["states"])
+    assert_all_match(new, {"y": y_ref, "final_state": final_ref}, prefix=f"long_ref_T{T}")
+
+
 @pytest.mark.parametrize("b,T", [(1, 1024), (8, 1024), (2, 300)], ids=["b1_t1024", "b8_t1024", "b2_t300"])
 def test_prefill_scan_bf16_initial_state(device, b, T):
     """A bf16 carried state handed to the scan as is (the state-passing kernel widens it on load) gives the outputs of its
@@ -234,9 +248,3 @@ def test_refusals(device):
     A_req = A.clone().requires_grad_(True)
     with pytest.raises(RuntimeError):
         sd_chunk_scan_prefill(x, dt, A_req, Bm, Cm, D, dtb, init, chunk_size=CHUNK)            # autograd requested
-    # more than 64 chunks in one call
-    o_long = operands(1, 64 * CHUNK + 1, device)
-    x, dt, Bm, Cm = views(o_long)
-    with torch.no_grad(), pytest.raises(RuntimeError):
-        sd_chunk_scan_prefill(x, dt, o_long["A"], Bm, Cm, o_long["D"], o_long["dt_bias"], o_long["init"],
-                              chunk_size=CHUNK)

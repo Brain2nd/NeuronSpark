@@ -19,7 +19,7 @@ from neuronspark.ops.triton.sd_scan import (
     dda_ref,
     dda_tma,
 )
-from neuronspark.ops.triton.sd_states import csp_fused
+from neuronspark.ops.gluon.sd_chunk_states import chunk_states_train
 from neuronspark.utils.testing import assert_all_match, rand_tensor
 
 pytestmark = [pytest.mark.cuda, pytest.mark.sm100]
@@ -43,7 +43,7 @@ def operands(B, L, device):
     dA, dt = _chunk_cumsum_fwd(dt_raw, A, CS, dt_bias=dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")),
                                config=CHUNK_CUMSUM_FWD_TRAIN)
     CB = _bmm_chunk_fwd(Cm, Bm, CS, seq_idx=None, output_dtype=torch.float32, config=BMM_CHUNK_FWD)
-    _, states = csp_fused(Bm, x, dt, dA, torch.bfloat16)
+    _, states = chunk_states_train(Bm, x, dt, dA, torch.bfloat16)
     nc = dA.shape[2]
     dout = (rand_tensor((B, L, H, P), torch.float32, device) * 1e-2).to(torch.bfloat16)
     dstates = (rand_tensor((B, nc, H, P, N), torch.float32, device) * 0.1).to(torch.bfloat16)

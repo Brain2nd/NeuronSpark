@@ -1,6 +1,5 @@
 """SD gated RMSNorm + soma read-out: the SSD output's gated norm (unit weight), the bipolar soft-threshold soma with its
-sigmoid surrogate, the axonal gain gamma and the bf16 rounding of W_out's input.  Training forward / backward and the
-inference prefill read-out.
+sigmoid surrogate, the axonal gain gamma and the bf16 rounding of W_out's input.  Training forward / backward.
 
 Pieces:
 
@@ -17,8 +16,9 @@ Pieces:
   written into the given buffer, dy (M, N) bf16).  Its two stages are also callable on their own:
   ``soma_bwd(dxs, n, theta, gamma, alpha) -> (grad_n, dtheta, dgamma)`` and ``gated_rmsnorm_bwd(grad_n, x, weight,
   rstd, z, dz) -> (dy, dz)`` (the same launches).
-* ``sd_soma_readout(n, theta, gamma) -> x`` (registry op, prefill): ``x = bf16(S(n, theta) * gamma)`` per element with
-  the IEEE single-rounding PTX of the training form (fp fusion off); n (..., C) bf16 contiguous.
+* ``sd_soma_readout_ref(n, theta, gamma)``: the read-out ``bf16(S(n, theta) * gamma)`` in torch, the reference of the
+  inference read-outs (the prefill one is fused into :mod:`neuronspark.ops.triton.sd_gated_norm`, the decode one into
+  :mod:`neuronspark.ops.triton.sd_step`).
 
 Numerics: the gated norm forward / backward are fp32-reduction-order class vs mamba_ssm's ``layernorm_gated`` (chunk
 lanes instead of one 16384-lane row); the soma forward is the torch chain's arithmetic exactly given n; the soma
@@ -26,8 +26,7 @@ backward is fp32-rounding class (approximate exp2 / division, reordered paramete
 per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the references below.
 
 Launch constants: forward R 1 row / program, 16 warps, CH 1024 (NCH 9), n stored for the backward; soma backward ROWS 128, BM 2, BC 1024, 4 warps, STAGES 4, sum BR 32 BC 64 4 warps; gated norm backward
-R 1, 8 warps, CH 1024 (two passes); prefill read-out BLOCK_M 2, BLOCK_C 1024, 4 warps (the read-out kernel's
-defaults).  The PTX helpers ``_sr_*`` are :mod:`neuronspark.ops.triton._ptx`'s.
+R 1, 8 warps, CH 1024 (two passes).  The PTX helpers ``_sr_*`` are :mod:`neuronspark.ops.triton._ptx`'s.
 """
 from __future__ import annotations
 
@@ -39,8 +38,8 @@ from neuronspark.ops.triton import require_cuda
 from neuronspark.ops.triton._ptx import _sr_bf16_to_f32, _sr_f32_to_bf16, _sr_mul_rn, _sr_release
 
 __all__ = [
-    "SOMA_FWD_CFG", "SOMA_BWD_CFG", "SOMA_SUM_CFG", "NORM_BWD_CFG", "READOUT_CFG",
-    "gated_norm_soma_fwd", "gated_norm_soma_bwd", "soma_bwd", "gated_rmsnorm_bwd", "sd_soma_readout",
+    "SOMA_FWD_CFG", "SOMA_BWD_CFG", "SOMA_SUM_CFG", "NORM_BWD_CFG",
+    "gated_norm_soma_fwd", "gated_norm_soma_bwd", "soma_bwd", "gated_rmsnorm_bwd",
     "gated_norm_soma_fwd_ref", "gated_norm_soma_bwd_ref", "soma_bwd_ref", "gated_rmsnorm_bwd_ref", "sd_soma_readout_ref",
     "BipolarRelease", "bipolar_release",
 ]
@@ -51,7 +50,6 @@ SOMA_FWD_NCH = 9                        # the forward kernel handles rows of 9 c
 SOMA_BWD_CFG = (128, 2, 1024, 4, 4)     # ROWS / program, BM rows / iteration, BC columns, num_warps, STAGES
 SOMA_SUM_CFG = (32, 64, 4)              # BR, BC, num_warps of the partial-sum reduction
 NORM_BWD_CFG = (1, 8, 1024)             # rows / program, num_warps, CH
-READOUT_CFG = (2, 1024, 4)              # BLOCK_M, BLOCK_C, num_warps (prefill read-out)
 
 
 # ================================================================================================================
@@ -277,21 +275,6 @@ def _gated_norm_bwd_kernel(X, W, Z, DY, DX, DZ, Rstd, sx, sz, sdy, sdx, sdz, M, 
         tl.store(pdx + c * CH, g * (z * s), mask=rm)
 
 
-@triton.jit
-def _sd_soma_readout_fwd_kernel(N, TH, GA, X, M, C, BLOCK_M: tl.constexpr, BLOCK_C: tl.constexpr):
-    """x = bf16(S(n, theta) * gamma) over a (M, C) contiguous tile grid: axis 0 = row blocks, axis 1 = column blocks."""
-    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    cols = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
-    cm = cols < C
-    m = (rows < M)[:, None] & cm[None, :]
-    offs = rows.to(tl.int64)[:, None] * C + cols[None, :]
-    th = tl.load(TH + cols, mask=cm, other=0.0)[None, :]
-    ga = tl.load(GA + cols, mask=cm, other=0.0)[None, :]
-    v = _sr_bf16_to_f32(tl.load(N + offs, mask=m, other=0.0))
-    s, a, b = _sr_release(v, th)
-    tl.store(X + offs, _sr_f32_to_bf16(_sr_mul_rn(s, ga)), mask=m)
-
-
 # ------------------------------------------------------------------------------------------------ launchers
 def _soma_operands(x, weight, z, theta, gamma, what):
     M, N = x.shape
@@ -406,44 +389,6 @@ def gated_rmsnorm_bwd(grad_n, x, weight, rstd, z, dz):
     gated RMSNorm backward on grad_n with the stored rstd, the same launch)."""
     require_cuda(x, "gated_rmsnorm_bwd")
     return _gated_rmsnorm_bwd(grad_n, x, weight, rstd, z, dz)
-
-
-@torch.library.custom_op("neuronspark::sd_soma_readout", mutates_args=(),
-                         schema="(Tensor n, Tensor theta, Tensor gamma) -> Tensor")
-def _sd_soma_readout_op(n, theta, gamma):
-    """bf16 x = bf16(S(n, theta) * gamma), contiguous, shape of n"""
-    C = int(n.shape[-1])
-    x = torch.empty(n.shape, dtype=torch.bfloat16, device=n.device)
-    n2 = n.reshape(-1, C)
-    x2 = x.view(-1, C)
-    M = int(n2.shape[0])
-    bm, bc, nw = READOUT_CFG
-    with torch.cuda.device(n.device.index):
-        _sd_soma_readout_fwd_kernel[(triton.cdiv(M, bm), triton.cdiv(C, bc))](
-            n2, theta, gamma, x2, M, C, BLOCK_M=bm, BLOCK_C=bc, num_warps=nw, enable_fp_fusion=False)
-    return x
-
-
-@_sd_soma_readout_op.register_fake
-def _sd_soma_readout_fake(n, theta, gamma):
-    return torch.empty(n.shape, dtype=torch.bfloat16, device=n.device)
-
-
-def sd_soma_readout(n: torch.Tensor, theta: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
-    """Prefill soma read-out ``bf16(S(n, theta) * gamma)`` (no autograd).  n: CUDA bf16, contiguous, (..., C) with at
-    least one element; theta / gamma: contiguous fp32 (C,) on n's device.  Returns a contiguous bf16 tensor of n's
-    shape."""
-    require_cuda(n, "sd_soma_readout")
-    if n.dtype != torch.bfloat16 or n.dim() < 1 or n.numel() == 0 or not n.is_contiguous():
-        raise RuntimeError(f"neuronspark.sd_soma_readout: n must be a contiguous non-empty bf16 tensor, got {n.dtype} "
-                           f"{tuple(n.shape)} strides {tuple(n.stride())}")
-    C = int(n.shape[-1])
-    for name, t in (("theta", theta), ("gamma", gamma)):
-        if (not isinstance(t, torch.Tensor) or t.device != n.device or t.dtype != torch.float32 or t.dim() != 1
-                or int(t.shape[0]) != C or not t.is_contiguous()):
-            raise RuntimeError(f"neuronspark.sd_soma_readout: {name} must be a contiguous float32 (C={C},) tensor on "
-                               f"{n.device}, got {getattr(t, 'dtype', None)} {tuple(getattr(t, 'shape', ()))}")
-    return torch.ops.neuronspark.sd_soma_readout(n, theta, gamma)
 
 
 # ------------------------------------------------------------------------------------------------ references

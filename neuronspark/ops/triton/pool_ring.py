@@ -32,12 +32,10 @@ Operators (each: private launcher, ``torch.library`` custom op with a fake, publ
     fp32, one rounding to bf16 at the store.  The memory layer uses it at the decode batch sizes whose ring read is the
     torch chain.
 ``ring_write_prefill``  prefill (T >= 2): the call's ring write as one kernel over the (t, b, h) rows: the k row's fp32
-    norm in the reduction order of ATen's ``norm`` kernel for a 256-wide bf16 row (4-wide input vectors over two
-    128-element chunks per lane, the four slots combined in order, then the shuffle-down tree over 32 lanes),
-    ``sqrt.rn``, ``max(norm, 1e-12)``, the IEEE division, one rounding to bf16 into ``pool_k``; the q row the same way
-    times the head's fp32 gain, stored fp32 (the recall's query); the fp32 gate through IEEE add / sub and ATen's
-    sigmoid ``1 / (1 + expf(-x))``, rounded to bf16, times v, rounded, into ``pool_gv``.  Every fp32 operation is
-    inline PTX without flush-to-zero.  Operands whose channel dimension is not unit-stride (the T = 2 form of the qkv
+    norm (Triton's row sum of the squares, sqrt), ``max(norm, 1e-12)``, the fp32 division, one rounding to bf16 into
+    ``pool_k``; the q row the same way times the head's fp32 gain, stored fp32 (the recall's query); the fp32 gate
+    through IEEE add / sub and ATen's sigmoid ``1 / (1 + expf(-x))`` (inline PTX without flush-to-zero: the sigmoid is
+    rounded to bf16 before the product, so its exact form is kept), rounded to bf16, times v, rounded, into ``pool_gv``.  Operands whose channel dimension is not unit-stride (the T = 2 form of the qkv
     conv) take the reference expression chain ``ring_write_prefill_ref``.
 ``ring_recall_prefill``  prefill: the pool read of every query row of the call over the whole ring (earlier calls'
     events at their clocks, this call's events causal), for the six heads (``xq=False``: group g reads ring head g) or
@@ -67,7 +65,7 @@ from triton.language.extra import libdevice
 
 from neuronspark.ops.triton import require_cuda
 from neuronspark.ops.triton._ptx import (  # noqa: F401  (Triton resolves the helpers through this module's globals)
-    _add_rn, _div_rn, _fma_rn, _mul_rn, _rn_add_f32, _rn_mul_f32, _sqrt_rn, _sub_rn,
+    _add_rn, _div_rn, _mul_rn, _rn_add_f32, _rn_mul_f32, _sub_rn,
 )
 
 __all__ = [
@@ -640,48 +638,12 @@ def xq_head_gain(gain_ratio: torch.Tensor, q_dtype: torch.dtype) -> torch.Tensor
 # ================================================================================================ prefill ring write
 
 @triton.jit
-def _lane_tree(v, R: tl.constexpr):
-    # v: (R, 32) the lanes' values -> (R,): ATen block_x_reduce's shfl_down tree (offsets 1, 2, 4, 8, 16): lane 0 ends
-    # with the balanced tree over the lanes in order, ((v0 + v1) + (v2 + v3)) + ((v4 + v5) + (v6 + v7)) ...
-    a, b = tl.split(tl.reshape(v, [R, 16, 2]))
-    v = _add_rn(a, b)
-    a, b = tl.split(tl.reshape(v, [R, 8, 2]))
-    v = _add_rn(a, b)
-    a, b = tl.split(tl.reshape(v, [R, 4, 2]))
-    v = _add_rn(a, b)
-    a, b = tl.split(tl.reshape(v, [R, 2, 2]))
-    v = _add_rn(a, b)
-    a, b = tl.split(tl.reshape(v, [R, 1, 2]))
-    v = _add_rn(a, b)
-    return tl.reshape(v, [R])
-
-
-@triton.jit
-def _four_slots(acc, R: tl.constexpr):
-    # acc: (R, 32, 4) [lane, slot] -> (R, 32): ATen's combine loop over value_list, ((s0 + s1) + s2) + s3
-    e, o = tl.split(tl.reshape(acc, [R, 32, 2, 2]))          # e: slots 0, 2; o: slots 1, 3
-    s0, s2 = tl.split(e)
-    s1, s3 = tl.split(o)
-    return _add_rn(_add_rn(_add_rn(s0, s1), s2), s3)
-
-
-@triton.jit
-def _sumsq_aten(x, R: tl.constexpr):
-    # x: (R, 256) fp32 -> (R,) the sum of squares in ATen's Reduce.cuh order for a contiguous 256-wide bf16 row reduced
-    # by one warp: 4-wide input vectors, two chunks -- lane l, slot i: elements 4 l + i (chunk 0) and 128 + 4 l + i
-    # (chunk 1)
-    c0, c1 = tl.split(tl.permute(tl.reshape(x, [R, 2, 128]), [0, 2, 1]))      # (R, 128) each, element 4 l + i
-    acc = _fma_rn(c1, c1, _mul_rn(c0, c0))                                     # reduce(reduce(0, x0), x1)
-    return _lane_tree(_four_slots(tl.reshape(acc, [R, 32, 4]), R), R)
-
-
-@triton.jit
-def _normalize_rows(x, R: tl.constexpr):
-    # x: (R, 256) fp32 (the bf16 operands upcast, exact) -> fp32 (R, 256): F.normalize(x_bf16, dim=-1) under autocast --
-    # the fp32 norm (no bf16 rounding of the norm), clamp_min(1e-12) in fp32, the IEEE fp32 division
-    nrm = _sqrt_rn(_sumsq_aten(x, R))
+def _normalize_rows(x):
+    # x: (R, 256) fp32 (the bf16 operands upcast, exact) -> fp32 (R, 256): F.normalize(x, dim=-1) -- the fp32 norm
+    # (Triton's row sum of the squares, sqrt), clamp_min(1e-12), the fp32 division
+    nrm = tl.sqrt(tl.sum(x * x, axis=1))
     denom = tl.maximum(nrm, 1e-12)
-    return _div_rn(x, denom[:, None])
+    return x / denom[:, None]
 
 
 @triton.jit
@@ -704,13 +666,13 @@ def _ring_write_kernel(K, Q, G, V, GAIN, WBIAS, PK, PGV, QOUT, PTR,
     # ---- k: unit tag into pool_k
     koff = t.to(tl.int64)[:, None] * sKt + b.to(tl.int64)[:, None] * sKb + h.to(tl.int64)[:, None] * sKh + cols[None, :]
     k = tl.load(K + koff, mask=m2, other=0.0).to(tl.float32)
-    tl.store(PK + ring_row, _normalize_rows(k, R).to(tl.bfloat16), mask=m2)       # k_hat fp32 -> bf16 at the ring write
+    tl.store(PK + ring_row, _normalize_rows(k).to(tl.bfloat16), mask=m2)          # k_hat fp32 -> bf16 at the ring write
     # ---- q: the unit query (fp32) times the head's fp32 gain, into QOUT (T, B, H, DK) fp32 contiguous
     qoff = t.to(tl.int64)[:, None] * sQt + b.to(tl.int64)[:, None] * sQb + h.to(tl.int64)[:, None] * sQh + cols[None, :]
-    q = _normalize_rows(tl.load(Q + qoff, mask=m2, other=0.0).to(tl.float32), R)
+    q = _normalize_rows(tl.load(Q + qoff, mask=m2, other=0.0).to(tl.float32))
     if HAS_GAIN:
         gain = tl.load(GAIN + h, mask=rmask, other=0.0)                  # (H,) fp32 gain, applied after the normalisation
-        q = _mul_rn(q, gain[:, None])
+        q = q * gain[:, None]
     tl.store(QOUT + rows.to(tl.int64)[:, None] * DKC + cols[None, :], q, mask=m2)
     # ---- gate / value: sigmoid(g.float() + wbias - sparsity).to(bf16) * v into pool_gv
     goff = t.to(tl.int64)[:, None] * sGt + b.to(tl.int64)[:, None] * sGb + h.to(tl.int64)[:, None] * sGh + cols[None, :]

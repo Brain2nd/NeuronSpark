@@ -28,8 +28,9 @@ Regimes (the caller picks one per call; :class:`SDLayer` dispatches on ``inferen
   layer is an SD layer, ``sd_resid_norm`` (the addition and the next layer's pre-norm in one operator).
 * prefill (inference, T >= 2, carried state): ``sd_prenorm_rows`` -> bf16 GEMM with W_in on the (B, T, D) view of the
   T-major stream -> ``sd_conv_silu_prefill`` from the carried conv tail -> ``sd_chunk_scan_prefill`` from the carried
-  state (the final state is written back in the cache's storage dtype) -> ``sd_gated_rmsnorm`` on the z view of the
-  projection -> ``sd_soma_readout`` -> bf16 GEMM with W_out -> ``sd_res_add``, the residual addition of the transposed
+  state (the final state is written back in the cache's storage dtype) -> ``sd_gated_norm_soma`` (the gated norm on the
+  z view of the projection and the soma read-out in one kernel) -> bf16 GEMM with W_out -> ``sd_res_add``, the residual
+  addition of the transposed
   GEMM output (the bf16 operand converted exactly to fp32, one row-coalesced kernel).
 * decode (inference, T == 1): ``sd_prenorm_rows`` -> bf16 GEMM -> ``sd_step_core`` (conv tail roll, state update in
   the state's storage dtype, gated norm, soma) -> bf16 GEMM -> the residual addition.
@@ -355,8 +356,7 @@ class SDMixer(nn.Module):
         y, final_state = o.sd_chunk_scan_prefill(x, dt, self.A(), Bm, Cm, self.D, self.dt_bias, state.ssm.float(),
                                                  chunk_size=self.chunk_size)
         state.ssm.copy_(final_state)
-        n = o.sd_gated_rmsnorm(y.reshape(B * T, di), z.reshape(B * T, di), self.norm_eps)
-        xo = o.sd_soma_readout(n, self.theta(), self.gamma)
+        xo = o.sd_gated_norm_soma(y.reshape(B * T, di), z.reshape(B * T, di), self.theta(), self.gamma, self.norm_eps)
         upd = o.linear(xo, self.W_out).view(B, T, Dm).transpose(0, 1)                   # (T, B, D) bf16
         return o.sd_res_add(h, upd)                        # h + upd: the bf16 operand converted exactly, fp32
 

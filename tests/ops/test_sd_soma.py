@@ -2,7 +2,6 @@
 
 * ``gated_norm_soma_fwd`` / ``gated_norm_soma_bwd`` (training: the fused forward storing n, the two-stage backward)
   on the rows of a training step (8192, 9216) and fewer, with z the strided slice of a projection (row stride 18832);
-* ``sd_soma_readout`` (prefill registry op) at prefill row counts;
 * each against its pure-torch reference, operator by operator on the same inputs: the gated norm (rstd, n); the
   soma read-out x_soma given the stored n (the read-out is defined on n, which is compared on its own); the soma
   backward (grad_n, dtheta, dgamma) given the stored n; the gated-norm backward (dy, dz) given the first stage's
@@ -23,7 +22,6 @@ from neuronspark.ops.triton.sd_soma import (
     gated_norm_soma_fwd,
     gated_norm_soma_fwd_ref,
     gated_rmsnorm_bwd_ref,
-    sd_soma_readout,
     sd_soma_readout_ref,
     soma_bwd,
     soma_bwd_ref,
@@ -37,7 +35,6 @@ WIDTH = 18832
 ALPHA = 8.0
 EPS = 1e-5
 ROWS = [8192, 1024, 77]
-READOUT_ROWS = [1, 2, 63, 1024, 8192]
 
 
 def operands(M, device):
@@ -86,21 +83,8 @@ def test_gated_norm_soma_vs_reference(device, M):
     assert_all_match(new, {"dy": rdy, "dz": rdz, "dtheta": rth, "dgamma": rga}, prefix="soma_bwd_ref")
 
 
-@pytest.mark.parametrize("M", READOUT_ROWS)
-def test_readout_vs_reference(device, M):
-    o = operands(M, device)
-    n = rand_tensor((M, DI), torch.bfloat16, device) * 0.2
-    with torch.no_grad():
-        assert_all_match({"x": sd_soma_readout(n, o["theta"], o["gamma"])},
-                         {"x": sd_soma_readout_ref(n, o["theta"], o["gamma"])}, prefix="readout_ref")
-
-
 def test_refusals(device):
     o = operands(4, device)
     with pytest.raises(RuntimeError):
         gated_norm_soma_fwd(o["x"][:, :4096], o["w"][:4096], EPS, o["proj"][:, :4096], o["theta"][:4096],
                             o["gamma"][:4096])                                   # not 9 x 1024 columns
-    with pytest.raises(RuntimeError):
-        sd_soma_readout(o["x"].float(), o["theta"], o["gamma"])                  # fp32 n
-    with pytest.raises(RuntimeError):
-        sd_soma_readout(o["x"], o["theta"].double(), o["gamma"])                 # fp64 theta

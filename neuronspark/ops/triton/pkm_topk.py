@@ -26,7 +26,12 @@ Operators (regime: public function -> what runs):
   against autograd's), the (2, 128) gradient row zero-filled, then the 16 + 16 sums scatter-stored at i1 / i2 (each
   value ``sum + 0.0``, every other slot +0.0).
 * prefill :func:`pkm_topk_prefill` (s1, s2 (T, B, H, n) fp32 with unit inner stride): custom op
-  ``neuronspark::pkm_topk_prefill``, one program per row with both halves batched as (2, n), 1 warp.
+  ``neuronspark::pkm_topk_prefill``, one program per row with both halves batched as (2, n), 1 warp.  Each half's top-16
+  is the first 16 of its composite int64 keys (radix key << 32 | (2^32 - 1 - index)) sorted descending; when no two of
+  the 16 compare equal under ``GTOp`` (==, -0 == +0, NaN == NaN) the network's output is that order, so the values
+  (re-read by index) and indices come from the sort.  The candidate top-k is taken over the 50 non-dominated pairs,
+  sorted the same way.  A row with such a tie in either step, or a non-finite half value, runs the row-batched
+  selection (sort, index-order prefix counts, compaction, the 32-slot network) instead.
 * decode  :func:`pkm_topk_softmax_t1` (raw scores (B, H, 2, n) and the (H, 2) score gain): custom op
   ``neuronspark::pkm_topk_softmax_t1``: the gain multiply at the load, the same exact selection and the softmax of the
   16 selected scores (max, libdevice exp, 16-term sum, division: the sum is the only reordered arithmetic) in one
@@ -230,7 +235,7 @@ def _topk_prefill(s1: torch.Tensor, s2: torch.Tensor, k: int):
     R = T * B * H
     if R:
         _product_topk_prefill_kernel[(R,)](
-            s1, s2, sc, u, ii, jj, s1.stride(0), s1.stride(1), s1.stride(2), s2.stride(0), s2.stride(1),
+            s1, s2, sc, u, ii, jj, _pix(dev), s1.stride(0), s1.stride(1), s1.stride(2), s2.stride(0), s2.stride(1),
             s2.stride(2), B, H, n, N=n, num_warps=PREFILL_WARPS)
     return sc, u, ii, jj
 
@@ -274,7 +279,7 @@ def _topk_softmax_t1(s_raw: torch.Tensor, beta: torch.Tensor, k: int):
     ii = torch.empty(shp, dtype=torch.int64, device=dev)
     jj = torch.empty(shp, dtype=torch.int64, device=dev)
     if B * H:
-        _pkm_topk_sm_kernel[(B * H,)](s_raw, beta, sc, w, u, ii, jj, s_raw.stride(0), s_raw.stride(1),
+        _pkm_topk_sm_kernel[(B * H,)](s_raw, beta, sc, w, u, ii, jj, _pix(dev), s_raw.stride(0), s_raw.stride(1),
                                       s_raw.stride(2), H, n, N=n, num_warps=DECODE_WARPS)
     return sc, w, u, ii, jj
 
@@ -649,9 +654,86 @@ def _topk16_rows(x, R: tl.constexpr, N: tl.constexpr):
 
 
 @triton.jit
-def _product_topk_prefill_kernel(S1, S2, SC, U, II, JJ, s1_t, s1_b, s1_h, s2_t, s2_b, s2_h, B, H, n_sub,
+def _pack_desc(key, idx):
+    # composite int64 key: descending order = radix key descending, then index ascending
+    return (key.to(tl.int64) << 32) | (4294967295 - idx.to(tl.int64))
+
+
+@triton.jit
+def _unpack_idx(p):
+    return (4294967295 - (p & 4294967295)).to(tl.int32)
+
+
+@triton.jit
+def _first16_of(x, R: tl.constexpr, N: tl.constexpr):
+    # x (R, N) -> (R, 16): the first 16 columns (one nonzero term per sum)
+    G: tl.constexpr = N // 16
+    x3 = tl.reshape(x, (R, G, 16))
+    g = tl.arange(0, G)[None, :, None]
+    return tl.sum(tl.where(g == 0, x3, 0), axis=1)
+
+
+@triton.jit
+def _net_ties(v, R: tl.constexpr):
+    # (R,) int32: 1 when two of the row's 16 values compare equal under GTOp (==, or both NaN)
+    a = v[:, :, None]
+    b = v[:, None, :]
+    eq = ((a == b) | ((a != a) & (b != b))).to(tl.int32)
+    return (tl.sum(tl.sum(eq, axis=2), axis=1) > 16).to(tl.int32)
+
+
+@triton.jit
+def _product16(x, hb, beta, PIX, N: tl.constexpr, HAS_BETA: tl.constexpr):
+    """the product top-16 of one row from its (2, N) half scores ``x`` (row 0 = s1, row 1 = s2; ``hb`` (2, 1) the rows'
+    pointers, ``x`` = the loaded rows [* ``beta`` (2, 1)]): (scores fp32, ii int32, jj int32), each (16,)"""
+    offs = tl.arange(0, N)
+    srt = tl.sort(_pack_desc(_order_key(x), offs[None, :]), 1, True)
+    ti = _unpack_idx(_first16_of(srt, 2, N))                              # (2, 16) int32
+    tv = tl.load(hb + ti)                                                 # the values' own bits
+    if HAS_BETA:
+        tv = tv * beta                                                    # the same fp32 multiply as x's
+    bad = tl.max(_net_ties(tv, 2), axis=0)
+    fin = (tv == tv) & (tl.abs(tv) < float("inf"))
+    bad = tl.maximum(bad, 1 - tl.min(tl.min(fin.to(tl.int32), axis=1), axis=0))
+    t1, t2 = tl.split(tl.permute(tv, (1, 0)))                             # (16,) each
+    i1, i2 = tl.split(tl.permute(ti, (1, 0)))
+    # the 50 non-dominated candidates (PIX: j = r * 16 + c, -1 = padding)
+    jc = tl.load(PIX + tl.arange(0, 64))
+    rc = tl.where(jc >= 0, jc // 16, 0)
+    cc = tl.where(jc >= 0, jc % 16, 0)
+    sel16 = tl.arange(0, 16)[None, :]
+    b1 = tl.sum(tl.where(rc[:, None] == sel16, t1.to(tl.int32, bitcast=True)[None, :], 0), axis=1).to(tl.float32, bitcast=True)
+    b2 = tl.sum(tl.where(cc[:, None] == sel16, t2.to(tl.int32, bitcast=True)[None, :], 0), axis=1).to(tl.float32, bitcast=True)
+    cand = b1 + b2                                                        # the fp32 candidate add
+    ck = tl.where(jc >= 0, _order_key(cand), -2147483648)
+    cs = tl.sort(_pack_desc(ck, tl.where(jc >= 0, jc, 0)), 0, True)
+    j = tl.reshape(_unpack_idx(_first16_of(tl.reshape(cs, (1, 64)), 1, 64)), (16,))
+    jr = j // 16
+    jcol = j % 16
+    s1v = tl.sum(tl.where(jr[:, None] == sel16, t1.to(tl.int32, bitcast=True)[None, :], 0), axis=1).to(tl.float32, bitcast=True)
+    s2v = tl.sum(tl.where(jcol[:, None] == sel16, t2.to(tl.int32, bitcast=True)[None, :], 0), axis=1).to(tl.float32, bitcast=True)
+    sc = s1v + s2v
+    bad = tl.maximum(bad, tl.max(_net_ties(tl.reshape(sc, (1, 16)), 1), axis=0))
+    ii = tl.sum(tl.where(jr[:, None] == sel16, i1[None, :], 0), axis=1)
+    jj = tl.sum(tl.where(jcol[:, None] == sel16, i2[None, :], 0), axis=1)
+    if bad != 0:
+        # the row-batched selection (ties / non-finite values)
+        vv, vi = _topk16_rows(x, 2, N)
+        u1, u2 = tl.split(tl.permute(vv, (1, 0)))
+        k1, k2 = tl.split(tl.permute(vi, (1, 0)))
+        cnd = tl.reshape(u1[:, None] + u2[None, :], (1, 256))
+        scv, jv = _topk16_rows(cnd, 1, 256)
+        sc = tl.reshape(scv, (16,))
+        j2 = tl.reshape(jv, (16,))
+        ii = tl.sum(tl.where((j2 // 16)[:, None] == sel16, k1[None, :], 0), axis=1)
+        jj = tl.sum(tl.where((j2 % 16)[:, None] == sel16, k2[None, :], 0), axis=1)
+    return sc, ii, jj
+
+
+@triton.jit
+def _product_topk_prefill_kernel(S1, S2, SC, U, II, JJ, PIX, s1_t, s1_b, s1_h, s2_t, s2_b, s2_h, B, H, n_sub,
                                  N: tl.constexpr):
-    # the product top-k of one (t, b, h) row, the two half top-16s computed together as a (2, N) batch
+    # the product top-k of one (t, b, h) row, the two halves as a (2, N) batch
     row = tl.program_id(0)
     h = row % H
     b = (row // H) % B
@@ -660,17 +742,9 @@ def _product_topk_prefill_kernel(S1, S2, SC, U, II, JJ, s1_t, s1_b, s1_h, s2_t, 
     half = tl.arange(0, 2)[:, None]
     base1 = S1 + t * s1_t + b * s1_b + h * s1_h
     base2 = S2 + t * s2_t + b * s2_b + h * s2_h
-    x = tl.load(tl.where(half == 0, base1, base2) + offs[None, :])        # (2, N): row 0 = s1, row 1 = s2
-    tv, ti = _topk16_rows(x, 2, N)                                         # (2, 16)
-    t1, t2 = tl.split(tl.permute(tv, (1, 0)))                             # (16,) each
-    i1, i2 = tl.split(tl.permute(ti, (1, 0)))
-    cand = tl.reshape(t1[:, None] + t2[None, :], (1, 256))                # cand[r * 16 + c] = t1[r] + t2[c], fp32
-    scv, jv = _topk16_rows(cand, 1, 256)                                  # (1, 16)
-    sc = tl.reshape(scv, (16,))
-    j = tl.reshape(jv, (16,))
-    sel = tl.arange(0, 16)[None, :]
-    ii = tl.sum(tl.where((j // 16)[:, None] == sel, i1[None, :], 0), axis=1)
-    jj = tl.sum(tl.where((j % 16)[:, None] == sel, i2[None, :], 0), axis=1)
+    hb = tl.where(half == 0, base1, base2)                                # (2, 1)
+    x = tl.load(hb + offs[None, :])                                       # (2, N): row 0 = s1, row 1 = s2
+    sc, ii, jj = _product16(x, hb, x, PIX, N, False)
     ii64 = ii.to(tl.int64)
     jj64 = jj.to(tl.int64)
     o = row * 16 + tl.arange(0, 16)
@@ -681,7 +755,7 @@ def _product_topk_prefill_kernel(S1, S2, SC, U, II, JJ, s1_t, s1_b, s1_h, s2_t, 
 
 
 @triton.jit
-def _pkm_topk_sm_kernel(S, BETA, SC, W, U, II, JJ, s_b, s_h, s_a, H, n_sub, N: tl.constexpr):
+def _pkm_topk_sm_kernel(S, BETA, SC, W, U, II, JJ, PIX, s_b, s_h, s_a, H, n_sub, N: tl.constexpr):
     """_product_topk_prefill_kernel for one (b, h) row of the raw (B, H, 2, N) scores: the two halves scaled by
     beta[h, a] at the load (the `s * beta` fp32 multiply of the PKM read), the exact half / product top-16s, and the
     softmax of the 16 selected scores (fp32: max, libdevice exp, sum, division)"""
@@ -690,19 +764,11 @@ def _pkm_topk_sm_kernel(S, BETA, SC, W, U, II, JJ, s_b, s_h, s_a, H, n_sub, N: t
     b = row // H
     offs = tl.arange(0, N)
     half = tl.arange(0, 2)[:, None]
-    x = tl.load(S + b * s_b + h * s_h + half * s_a + offs[None, :])          # (2, N): row 0 = half 0, row 1 = half 1
+    hb = S + b * s_b + h * s_h + half * s_a                                  # (2, 1): row 0 = half 0, row 1 = half 1
+    x = tl.load(hb + offs[None, :])                                          # (2, N)
     beta = tl.load(BETA + h * 2 + half)                                      # (2, 1) fp32
     x = x * beta
-    tv, ti = _topk16_rows(x, 2, N)                                           # (2, 16)
-    t1, t2 = tl.split(tl.permute(tv, (1, 0)))                               # (16,) each
-    i1, i2 = tl.split(tl.permute(ti, (1, 0)))
-    cand = tl.reshape(t1[:, None] + t2[None, :], (1, 256))                  # cand[r * 16 + c] = t1[r] + t2[c], fp32
-    scv, jv = _topk16_rows(cand, 1, 256)                                    # (1, 16)
-    sc = tl.reshape(scv, (16,))
-    j = tl.reshape(jv, (16,))
-    sel = tl.arange(0, 16)[None, :]
-    ii = tl.sum(tl.where((j // 16)[:, None] == sel, i1[None, :], 0), axis=1)
-    jj = tl.sum(tl.where((j % 16)[:, None] == sel, i2[None, :], 0), axis=1)
+    sc, ii, jj = _product16(x, hb, beta, PIX, N, True)
     ii64 = ii.to(tl.int64)
     jj64 = jj.to(tl.int64)
     m = tl.max(sc, axis=0)

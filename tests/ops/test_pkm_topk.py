@@ -143,3 +143,35 @@ def test_pkm_topk_softmax_t1_refusals(device):
         pkm_topk_softmax_t1(s_raw, beta, 8)                      # k != 16
     with pytest.raises(RuntimeError):
         pkm_topk_softmax_t1(s_raw.transpose(2, 3).contiguous().transpose(2, 3), beta, K)   # inner stride != 1
+
+
+# ------------------------------------------------------------------------------------------------ special values
+def _special_scores(lead, kind, device):
+    """cosines with NaN / +-inf entries ("nonfinite": the inference kernels' row-batched path) or half-integer halves
+    ("cand_ties": equal candidate sums)"""
+    if kind == "nonfinite":
+        v = _raw_scores(lead, "cosine", device)
+        v[..., 7] = float("nan")
+        v[..., 0, 13] = float("inf")
+        v[..., 1, 11] = float("-inf")
+        return v.contiguous()
+    return (torch.randint(-40, 40, (*lead, H, 2, N), device=device).float() * 0.5).contiguous()
+
+
+def _bits(t):
+    return t.view(torch.int32) if t.dtype == torch.float32 else t
+
+
+@pytest.mark.parametrize("kind", ("nonfinite", "cand_ties"))
+def test_pkm_topk_inference_exact_on_special_values(device, kind):
+    """the selection outputs are torch.topk's element for element (the scores as bit patterns)"""
+    s = _special_scores((256, 8), kind, device)
+    new = pkm_topk_prefill(s[..., 0, :], s[..., 1, :], K)
+    ref = pkm_topk_prefill_ref(s[..., 0, :], s[..., 1, :], K)
+    for name, a, b in zip(("sc", "u", "ii", "jj"), new, ref):
+        assert torch.equal(_bits(a.contiguous()), _bits(b.contiguous())), f"prefill {kind} {name}"
+    s_raw, beta = _special_scores((32,), kind, device), _gain(device)
+    new = pkm_topk_softmax_t1(s_raw, beta, K)
+    ref = pkm_topk_softmax_t1_ref(s_raw, beta, K)
+    for name, a, b in zip(("sc", "u", "ii", "jj"), new[:1] + new[2:], ref[:1] + ref[2:]):
+        assert torch.equal(_bits(a.contiguous()), _bits(b.contiguous())), f"decode {kind} {name}"

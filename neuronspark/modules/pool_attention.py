@@ -65,7 +65,7 @@ import torch.nn.functional as F
 
 from neuronspark.modules.linear import Linear, ShortConvWeight
 from neuronspark.modules.norms import RMSNorm
-from neuronspark.modules.plif import (PLIFNeuron, centred_running_step, forked_rng, linear_init, rows_rmsnorm)
+from neuronspark.modules.plif import PLIFNeuron, centred_running_step, forked_rng, linear_init
 from neuronspark.modules.rope import apply_rope_interleaved_ref, rope_head_band_tables
 from neuronspark.utils.cache import MemoryState
 
@@ -418,12 +418,11 @@ class PoolAttentionMixin:
         return o.xq_queries_prefill(qs, psi, head_gain, cos5, sin5)
 
     def _out_norm_gate_infer(self, attn: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        """Inference output norm x gate: zero-centred rms norm of attn (``ops.rmsnorm_rows``) times
-        sigmoid(bf16(h @ attn_out_gate^T)) (bf16 sigmoid), fp32."""
+        """Inference output norm x gate in one operator (``ops.rmsnorm_gate_rows``): the zero-centred rms norm of attn
+        (fp32) times sigmoid(bf16(h @ attn_out_gate^T)) (bf16 sigmoid), rounded to bf16 for the output projection."""
         o = self._ops
-        an = rows_rmsnorm(o, attn.to(h.dtype), self.attn_out_norm.eps, weight=self.attn_out_norm.weight,
-                          zero_centered=True, out_dtype=h.dtype)
-        return torch.sigmoid(o.linear(h, self.attn_out_gate.weight)) * an
+        return o.rmsnorm_gate_rows(attn.to(h.dtype), self.attn_out_norm.eps, self.attn_out_norm.weight,
+                                   o.linear(h, self.attn_out_gate.weight))
 
     def _out_proj_centred(self, attn: torch.Tensor) -> torch.Tensor:
         r = self._ops.linear(attn, self.attn_out_proj.weight)

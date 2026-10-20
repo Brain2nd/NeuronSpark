@@ -68,7 +68,7 @@ __all__ = [
     "RowNormFn", "row_rmsnorm", "row_rmsnorm_ref",
     "OutNormGateFn", "out_norm_gate", "out_norm_gate_ref",
     "NovNormFn", "nov_norm", "nov_norm_ref",
-    "rmsnorm_rows", "rmsnorm_rows_ref",
+    "rmsnorm_rows", "rmsnorm_rows_ref", "rmsnorm_gate_rows", "rmsnorm_gate_rows_ref",
 ]
 
 # ------------------------------------------------------------------------------------------------ fixed constants
@@ -376,9 +376,10 @@ def _four_slots(acc, R: tl.constexpr):
 
 @triton.jit
 def _rmsnorm_kernel(X, W, Y, sx, sy, N, factor, eps, R: tl.constexpr, C: tl.constexpr, HAS_W: tl.constexpr,
-                    OUT_BF16: tl.constexpr):
+                    OUT_BF16: tl.constexpr, G=None, sg=0, HAS_G: tl.constexpr = False):
     """R rows of C chunks of 128: the sum of squares with lane l, slot i, chunk c -> element 128 c + 4 l + i (ATen's
-    vectorised order), the slots combined in order, the lane tree; then the scaled row [* w], cast."""
+    vectorised order), the slots combined in order, the lane tree; then the scaled row [* w] [* bf16(sigmoid(g))],
+    cast."""
     pid = tl.program_id(axis=0)
     rows = pid * R + tl.arange(0, R)
     rmask = rows < N
@@ -397,6 +398,12 @@ def _rmsnorm_kernel(X, W, Y, sx, sy, N, factor, eps, R: tl.constexpr, C: tl.cons
         if HAS_W:
             w = tl.load(W + c * 128 + offs128)
             y = _mul_rn(y, w[None, :])
+        if HAS_G:
+            # the output gate: torch.sigmoid of the bf16 gate logits (one / (one + expf(-x)) in fp32, rounded to bf16)
+            # times the fp32 norm
+            gx = tl.load(G + rows.to(tl.int64)[:, None] * sg + c * 128 + offs128[None, :], mask=rmask[:, None],
+                         other=0.0).to(tl.float32)
+            y = _mul_rn(_g_sigmoid(gx).to(tl.bfloat16).to(tl.float32), y)
         yo = Y + rows.to(tl.int64)[:, None] * sy + c * 128 + offs128[None, :]
         if OUT_BF16:
             tl.store(yo, y.to(tl.bfloat16), mask=rmask[:, None])
@@ -820,6 +827,56 @@ def rmsnorm_rows(x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = N
     if w1 is not None and (w1.numel() != N or w1.device != x.device):
         raise RuntimeError(f"neuronspark.rmsnorm_rows: the weight must be an (N,) = ({N},) tensor on x's device")
     return _rmsnorm_rows_op(x, float(eps), w1, out_dtype)
+
+
+@torch.library.custom_op("neuronspark::mem_rmsnorm_gate_rows", mutates_args=(),
+                         schema="(Tensor x, float eps, Tensor w1, Tensor gate) -> Tensor")
+def _rmsnorm_gate_rows_op(x, eps, w1, gate):
+    N = int(x.shape[-1])
+    x2 = x.reshape(-1, N)
+    if x2.stride(1) != 1 or (x2.shape[0] > 1 and x2.stride(0) != N):
+        x2 = x2.contiguous()
+    g2 = gate.reshape(-1, N)
+    if g2.stride(1) != 1 or (g2.shape[0] > 1 and g2.stride(0) != N):
+        g2 = g2.contiguous()
+    rows = int(x2.shape[0])
+    y = torch.empty(tuple(x.shape), dtype=torch.bfloat16, device=x.device)
+    factor = float(np.float32(1.0) / np.float32(N))
+    _rmsnorm_kernel[(triton.cdiv(rows, RMS_ROWS_PER_PROGRAM),)](
+        x2, w1, y, x2.stride(0), N, rows, factor, float(np.float32(eps)), R=RMS_ROWS_PER_PROGRAM, C=N // 128,
+        HAS_W=True, OUT_BF16=True, G=g2, sg=g2.stride(0), HAS_G=True, num_warps=RMS_WARPS)
+    return y
+
+
+@_rmsnorm_gate_rows_op.register_fake
+def _rmsnorm_gate_rows_fake(x, eps, w1, gate):
+    return torch.empty(tuple(x.shape), dtype=torch.bfloat16, device=x.device)
+
+
+def rmsnorm_gate_rows(x: torch.Tensor, eps: float, weight: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """The memory layer's inference output norm and gate in one kernel: ``bf16(sigmoid(gate) * rmsnorm(x) * (1 +
+    weight))`` (the zero-centred norm in fp32, torch's bf16 sigmoid of the gate logits, the product rounded to bf16 --
+    the output projection's input).  ``x`` CUDA fp32 / bf16 (..., N) with unit last stride, N a multiple of 128 and at
+    most 4096; ``weight`` the zero-centred fp32 (N,) norm weight; ``gate`` bf16 of x's shape.  Inference, no autograd."""
+    require_cuda(x, "rmsnorm_gate_rows")
+    if x.dim() < 1 or x.stride(-1) != 1 or x.dtype not in (torch.float32, torch.bfloat16):
+        raise RuntimeError(f"neuronspark.rmsnorm_gate_rows: CUDA fp32 / bf16 with unit last stride, got {x.dtype} "
+                           f"{tuple(x.shape)} {tuple(x.stride())}")
+    N = int(x.shape[-1])
+    if N % 128 or N > RMS_MAX_N or N == 0:
+        raise RuntimeError(f"neuronspark.rmsnorm_gate_rows: N must be a positive multiple of 128 <= {RMS_MAX_N}, got {N}")
+    if (not isinstance(gate, torch.Tensor) or gate.dtype != torch.bfloat16 or tuple(gate.shape) != tuple(x.shape)
+            or gate.stride(-1) != 1 or gate.device != x.device):
+        raise RuntimeError(f"neuronspark.rmsnorm_gate_rows: the gate must be bf16 {tuple(x.shape)} with unit last stride")
+    w1 = _w1_of(weight, True)
+    if w1.numel() != N or w1.device != x.device:
+        raise RuntimeError(f"neuronspark.rmsnorm_gate_rows: the weight must be an (N,) = ({N},) tensor on x's device")
+    return _rmsnorm_gate_rows_op(x, float(eps), w1, gate)
+
+
+def rmsnorm_gate_rows_ref(x: torch.Tensor, eps: float, weight: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+    """The torch lines of the inference output norm and gate: the zero-centred norm in fp32, sigmoid(gate) * it, bf16."""
+    return (torch.sigmoid(gate) * rmsnorm_rows_ref(x, eps, weight, True, torch.float32)).to(torch.bfloat16)
 
 
 def rmsnorm_rows_ref(x: torch.Tensor, eps: float, weight: Optional[torch.Tensor] = None, zero_centered: bool = False,

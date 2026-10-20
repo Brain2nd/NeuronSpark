@@ -1,13 +1,16 @@
-"""ops.triton.mem_residual: value residual, centring, read gain and PKM tail (training).
+"""ops.triton.mem_residual: value residual, centring, read gain and PKM tail.
 
-Forward and backward at T 1024, B 8, C 1536 in the trunk's layouts, against the torch references.  Every comparison is
+Forward and backward at T 1024, B 8, C 1536 in the trunk's layouts, against the torch references; the read gain and the
+PKM tail also without autograd at the inference shapes (prefill T x B in 1024 x 8, 37 x 8, 1024 x 1; decode 1 x 32,
+1 x 1) on contiguous T-major rows.  Every comparison is
 the per-operator rule of ``neuronspark.utils.testing`` (matched ratio 1.0).
 """
 import pytest
 import torch
 
-from neuronspark.ops.triton.mem_residual import (pkm_tail, pkm_tail_ref, read_gain_residual, read_gain_residual_ref,
-                                                 value_residual, value_residual_ref, zc_center, zc_center_ref)
+from neuronspark.ops.triton.mem_residual import (PKM_TAIL_MIN_ROWS, pkm_tail, pkm_tail_ref, read_gain_residual,
+                                                 read_gain_residual_ref, value_residual, value_residual_ref, zc_center,
+                                                 zc_center_ref)
 from neuronspark.utils.precision import regime
 from neuronspark.utils.testing import assert_all_match, rand_tensor
 
@@ -123,3 +126,27 @@ def test_pkm_tail_rejects_rho_with_grad(device):
     hb, ffn, y, rho, _ = _pkt_inputs(device)
     with pytest.raises(RuntimeError):
         pkm_tail(hb.transpose(0, 1), ffn, y, rho.requires_grad_(True))
+
+
+# ------------------------------------------------------------------------------------------------ inference shapes
+INFER_SHAPES = ((1024, 8), (37, 8), (1024, 1), (1, 32), (1, 1))
+
+
+@pytest.mark.parametrize("Ti,Bi", INFER_SHAPES, ids=[f"t{t}_b{b}" for t, b in INFER_SHAPES])
+def test_read_gain_and_pkm_tail_inference(device, Ti, Bi):
+    h = rand_tensor((Ti, Bi, D), torch.float32, device) * 5.0
+    r = rand_tensor((Ti, Bi, D), torch.bfloat16, device)
+    f = torch.rand((Ti, Bi), device=device)
+    ffn = rand_tensor((Ti, Bi, D), torch.bfloat16, device)
+    y = rand_tensor((Ti, Bi, D), torch.bfloat16, device)
+    rho = 2.0 * torch.sigmoid(-4.0 * torch.rand((Ti, Bi), device=device))
+    with torch.no_grad(), regime("infer"):
+        h1 = read_gain_residual(h, r, f)
+        h1_ref = read_gain_residual_ref(h, r, f)
+        assert_all_match({"h1": h1}, {"h1": h1_ref}, prefix="read_gain_infer")
+        if Ti * Bi >= PKM_TAIL_MIN_ROWS:
+            assert_all_match({"out": pkm_tail(h1, ffn, y, rho)}, {"out": pkm_tail_ref(h1, ffn, y, rho)}, prefix="pkm_tail_infer")
+        else:
+            with pytest.raises(RuntimeError):           # below the reproduced reduction layout: the caller keeps the torch lines
+                pkm_tail(h1, ffn, y, rho)
+

@@ -2,6 +2,7 @@
 
 * ``row_rmsnorm`` (weightless and weighted), ``out_norm_gate``, ``nov_norm``: forward and backward at the training
   shape (T 1024, B 8, C 1536) in the trunk's layouts, against the pure-torch references;
+* ``rmsnorm_gate_rows``: the zero-centred norm with the output gate, bf16 out, at ``rmsnorm_rows``' row shapes;
 * ``rmsnorm_rows``: the prefill / decode row shapes, fp32 and bf16 inputs, with and without the (zero-centred) weight,
   against the torch chain; out-of-domain widths raise.
 
@@ -10,8 +11,9 @@ Every comparison is the per-operator rule of ``neuronspark.utils.testing`` (matc
 import pytest
 import torch
 
-from neuronspark.ops.triton.mem_norms import (nov_norm, nov_norm_ref, out_norm_gate, out_norm_gate_ref, rmsnorm_rows,
-                                              rmsnorm_rows_ref, row_rmsnorm, row_rmsnorm_ref)
+from neuronspark.ops.triton.mem_norms import (nov_norm, nov_norm_ref, out_norm_gate, out_norm_gate_ref,
+                                              rmsnorm_gate_rows, rmsnorm_gate_rows_ref, rmsnorm_rows, rmsnorm_rows_ref,
+                                              row_rmsnorm, row_rmsnorm_ref)
 from neuronspark.utils.precision import regime
 from neuronspark.utils.testing import assert_all_match, rand_tensor
 
@@ -136,3 +138,17 @@ def test_rmsnorm_rows_three_dim_view(device):
 def test_rmsnorm_rows_rejects_out_of_domain(device, n):
     with pytest.raises(RuntimeError):
         rmsnorm_rows(rand_tensor((4, n), torch.float32, device), EPS)
+
+
+# ------------------------------------------------------------------------------------------------ rmsnorm_gate_rows
+@pytest.mark.parametrize("shape", ROW_SHAPES, ids=[f"{s[0]}x{s[1]}" for s in ROW_SHAPES])
+def test_rmsnorm_gate_rows_vs_reference(device, shape):
+    x = rand_tensor(shape, torch.float32, device) * 3.0
+    w = rand_tensor((int(shape[-1]),), torch.float32, device) * 0.1
+    gate = (rand_tensor(shape, torch.float32, device) * 2.0).to(torch.bfloat16)
+    with torch.no_grad(), regime("infer"):
+        new = rmsnorm_gate_rows(x, EPS, w, gate)
+        ref = rmsnorm_gate_rows_ref(x, EPS, w, gate)
+    assert new.dtype == torch.bfloat16 and tuple(new.shape) == tuple(shape)
+    assert_all_match(new, ref, prefix="rmsnorm_gate_rows")
+

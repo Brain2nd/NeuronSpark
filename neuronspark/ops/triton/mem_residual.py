@@ -66,7 +66,7 @@ __all__ = [
     "ValueResidualFn", "value_residual", "value_residual_ref",
     "ZcCenterFn", "zc_center", "zc_center_ref",
     "ReadGainFn", "read_gain_residual", "read_gain_residual_ref",
-    "PkmTailFn", "pkm_tail", "pkm_tail_ref",
+    "PkmTailFn", "pkm_tail", "pkm_tail_ref", "PKM_TAIL_MIN_ROWS",
 ]
 
 # ------------------------------------------------------------------------------------------------ fixed constants
@@ -580,7 +580,8 @@ class ReadGainFn(torch.autograd.Function):
 def read_gain_residual(h: torch.Tensor, r: torch.Tensor, f: torch.Tensor) -> torch.Tensor:
     """``h + bf16(r.float() * (1 + f))`` for fp32 (T, B, D) ``h``, bf16 ``r`` of h's shape and the fp32 (T, B) read-gain
     factor ``f`` -> fp32.  The gained residual is :class:`ReadGainFn`; the add is torch's (an exact widening of the
-    bf16 value plus one fp32 rounding; h's gradient passes through, rg's gradient arrives as bf16).  Training regime."""
+    bf16 value plus one fp32 rounding; h's gradient passes through, rg's gradient arrives as bf16).  Every regime (the
+    inference calls run without autograd)."""
     require_cuda(h, "read_gain_residual")
     if not (h.dtype == torch.float32 and h.dim() == 3 and h.numel() < 2 ** 31):
         raise RuntimeError("neuronspark.read_gain_residual: h must be a 3-D fp32 CUDA tensor")
@@ -675,9 +676,15 @@ class PkmTailFn(torch.autograd.Function):
         return g, gb, gy, None
 
 
+#: the fewest (T x B) rows pkm_tail takes: below it ATen's row mean leaves the one-warp-per-row vectorized reduction the
+#: kernel reproduces, and the caller keeps the torch lines (the memory layer's decode at B < 16)
+PKM_TAIL_MIN_ROWS = 16
+
+
 def pkm_tail(h: torch.Tensor, ffn: torch.Tensor, y: torch.Tensor, rho: torch.Tensor) -> torch.Tensor:
     """``h + (ffn + (y_g - mean_c(y_g)))`` with ``y_g = bf16(y.float() * rho)``: fp32 (T, B, D) ``h``, bf16 ``ffn`` /
-    ``y`` of h's shape, fp32 (T, B) ``rho`` without gradient -> fp32.  Training regime."""
+    ``y`` of h's shape, fp32 (T, B) ``rho`` without gradient -> fp32.  Every regime (the inference calls run without
+    autograd)."""
     require_cuda(h, "pkm_tail")
     if not (h.dtype == torch.float32 and h.dim() == 3 and h.numel() < 2 ** 31):
         raise RuntimeError("neuronspark.pkm_tail: h must be a 3-D fp32 CUDA tensor")

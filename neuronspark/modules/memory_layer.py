@@ -58,6 +58,7 @@ from neuronspark.modules.plif import PLIFNeuron, check_init, linear_init, rows_r
 from neuronspark.modules.pool_attention import PoolAttentionMixin
 from neuronspark.modules.spiking_ffn import SpikingFFN
 from neuronspark.ops import namespace
+from neuronspark.ops.triton.mem_residual import PKM_TAIL_MIN_ROWS
 from neuronspark.utils.cache import InferenceParams, MemoryState
 
 __all__ = ["MemoryLayer"]
@@ -213,14 +214,15 @@ class MemoryLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMMixin,
         c = self.copy_novelty(z, r, lambda t: rows_rmsnorm(o, t, NOVELTY_RMS_EPS, out_dtype=torch.float32))
         with torch.autocast(h.device.type, enabled=False):
             f = self.read_gain_factor(pi, c)
-            r = (r.float() * (1.0 + f).unsqueeze(-1)).to(r.dtype)
-        h = h + r
+            h = o.read_gain_residual(h, r, f)
         x_hat = rows_rmsnorm(o, h, self.ffn_norm.eps, weight=self.ffn_norm.weight, out_dtype=h.dtype)
         zs = self.input_neuron2(x_hat, st.input_neuron2, pos0)
         ffn = o.linear(self.snn_ffn(zs, st.ffn_gate, st.ffn_up, pos0), self.ffn_out_proj.weight)
         y = self._pkm_read_step(x_hat) if step else self._pkm_read_prefill(x_hat)
         with torch.autocast(h.device.type, enabled=False):
             rho = self.pkm_copy_rho(pi)
+        if T * B >= PKM_TAIL_MIN_ROWS:
+            return o.pkm_tail(h, ffn, y, rho), carry_out
+        with torch.autocast(h.device.type, enabled=False):
             y = (y.float() * rho.unsqueeze(-1)).to(y.dtype)
-        ffn = ffn + (y - y.mean(dim=-1, keepdim=True))
-        return h + ffn, carry_out
+        return h + (ffn + (y - y.mean(dim=-1, keepdim=True))), carry_out

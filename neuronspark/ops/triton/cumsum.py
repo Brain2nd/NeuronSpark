@@ -21,9 +21,12 @@ Numerics contract
   fp32 chain over its chunk (pass 1 the chunk totals, an exclusive prefix over the totals, pass 2 the chain again from
   that offset).  Within a chunk the order is ATen's; the chunk offsets make the result the per-operator rule class.
 * A single column (``numel == size(0)``) is ``x.cumsum(dim=0)`` itself (ATen scans it with cub's inclusive scan).
-* ``exact_cumsum0`` / ``centred_running``: the same IEEE fp32 operations as the torch chains in the same order
-  (``add.rn``, ``div.rn``, ``sub.rn``, ``mul.rn``; the accumulator from +0, the carried sum first), the output cast
-  fused (round to nearest even).
+* ``exact_cumsum0``: the same IEEE fp32 operations as ``torch.cumsum`` in the same order (``add.rn``; the accumulator
+  from +0).
+* ``centred_running``: the tokens in tiles; a tile's prefix sums by a parallel scan plus the carried sum of the earlier
+  tiles (the order of the fp32 additions differs from the sequential chain: the per-operator rule class), then the
+  chain's per-element ``div.rn`` by max(n + t, 1), the difference and the mask, the output cast fused (round to nearest
+  even).
 
 Launchers are ``torch.library`` custom ops (``neuronspark::cumsum0``, ``::exact_cumsum0``, ``::centred_running``,
 the last declaring its in-place update of ``run_sum``) with fake implementations.  References: ``torch.cumsum``
@@ -53,8 +56,13 @@ __all__ = ["Cumsum0Fn", "cumsum0", "cumsum0_ref", "exact_cumsum0", "exact_cumsum
 NARROW_N = 32                          # widths up to 32 columns are "narrow"
 SEQ_BLOCK_N, SEQ_WARPS = 32, 1         # sequential kernel for the narrow scans (one warp, 32 columns per program)
 CHUNK_CH, CHUNK_BLOCK_N, CHUNK_WARPS, CHUNK_STAGES = 32, 32, 8, 4   # chunked kernel for the wide scans
-# Prefill kernels: one warp per program, one column per lane.
+# Prefill exact cumsum: one warp per program, one column per lane.
 PREFILL_BLOCK = 32
+# centred_running (TT tokens, BC columns, warps) by the call's width N = B * C: narrow (one prefill row) long tiles over few
+# columns, wide (eight rows) short tiles over more
+CENTRED_NARROW_N = 4096
+CENTRED_NARROW = (512, 8, 4)
+CENTRED_WIDE = (128, 32, 4)
 _OUT_TL = {torch.float32: tl.float32, torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
 
 
@@ -684,101 +692,34 @@ def _cumsum0_kernel(X, OUT, L, N, BLOCK: tl.constexpr):
 
 
 @triton.jit
-def _centred_step(acc, x, t, cnt, OUT, off, m, OUT_DTYPE: tl.constexpr):
-    """one token of the running-mean centring: o = (x - run / max(fp32(n + t), 1)) * [n + t > 0], cast to OUT_DTYPE;
-    then run = run + x (every operation fp32 RN, in the order torch evaluates the expression)"""
-    pos = cnt + t
-    xn = tl.maximum(pos.to(tl.float32), 1.0)
-    hp = tl.where(pos > 0, 1.0, 0.0)
-    q = _rn_div_f32(acc, xn)
-    d = _rn_sub_f32(x, q)
-    o = _rn_mul_f32(d, hp)
-    tl.store(OUT + off, o.to(OUT_DTYPE), mask=m)
-    return tl.where(m, _rn_add_f32(acc, x), acc)
-
-
-@triton.jit
-def _centred_kernel(X, S, CNT, OUT, L, N, C, sxt, sxb, sxc, sot, sob, soc, OUT_DTYPE: tl.constexpr,
-                    BLOCK: tl.constexpr):
-    """X (L, B, C) of strides (sxt, sxb, sxc) (any float dtype, read as fp32), S (B, C) fp32 contiguous carried sum
-    (read, then written with the sum through the last token), CNT (B,) int64 row position of the call's first token,
-    OUT (L, B, C) OUT_DTYPE of strides (sot, sob, soc); column j = b * C + c of N = B * C"""
+def _centred_tiled_kernel(X, S, CNT, OUT, L, N, C, sxt, sxb, sxc, sot, sob, soc, OUT_DTYPE: tl.constexpr,
+                          TT: tl.constexpr, BC: tl.constexpr):
+    """centred_running: BC columns (j = b * C + c of N = B * C) per program, the T tokens in tiles of TT; per tile the prefix
+    sums by a parallel scan plus the carried sum of the earlier tiles, then the per-element division, difference and mask;
+    X (L, B, C) of strides (sxt, sxb, sxc) read as fp32, S (B, C) fp32 contiguous (read, then written with the sum through
+    the last token), CNT (B,) int64, OUT (L, B, C) OUT_DTYPE of strides (sot, sob, soc)"""
     pid = tl.program_id(0)
-    cols = pid * BLOCK + tl.arange(0, BLOCK)
+    cols = pid * BC + tl.arange(0, BC)
     cm = cols < N
     bb = cols // C
-    cc = cols % C
+    cc = cols - bb * C
     xcol = bb * sxb + cc * sxc
     ocol = bb * sob + cc * soc
     cnt = tl.load(CNT + bb, mask=cm, other=0)
-    s0 = tl.load(S + cols, mask=cm, other=0.0)
-    acc = _rn_add_f32(tl.zeros([BLOCK], dtype=tl.float32), s0)          # cumsum's first output: 0 + S
-    x0 = tl.load(X + (0 + 0) * sxt + xcol, mask=cm & (0 + 0 < L), other=0.0).to(tl.float32)
-    x1 = tl.load(X + (0 + 1) * sxt + xcol, mask=cm & (0 + 1 < L), other=0.0).to(tl.float32)
-    x2 = tl.load(X + (0 + 2) * sxt + xcol, mask=cm & (0 + 2 < L), other=0.0).to(tl.float32)
-    x3 = tl.load(X + (0 + 3) * sxt + xcol, mask=cm & (0 + 3 < L), other=0.0).to(tl.float32)
-    x4 = tl.load(X + (0 + 4) * sxt + xcol, mask=cm & (0 + 4 < L), other=0.0).to(tl.float32)
-    x5 = tl.load(X + (0 + 5) * sxt + xcol, mask=cm & (0 + 5 < L), other=0.0).to(tl.float32)
-    x6 = tl.load(X + (0 + 6) * sxt + xcol, mask=cm & (0 + 6 < L), other=0.0).to(tl.float32)
-    x7 = tl.load(X + (0 + 7) * sxt + xcol, mask=cm & (0 + 7 < L), other=0.0).to(tl.float32)
-    x8 = tl.load(X + (0 + 8) * sxt + xcol, mask=cm & (0 + 8 < L), other=0.0).to(tl.float32)
-    x9 = tl.load(X + (0 + 9) * sxt + xcol, mask=cm & (0 + 9 < L), other=0.0).to(tl.float32)
-    x10 = tl.load(X + (0 + 10) * sxt + xcol, mask=cm & (0 + 10 < L), other=0.0).to(tl.float32)
-    x11 = tl.load(X + (0 + 11) * sxt + xcol, mask=cm & (0 + 11 < L), other=0.0).to(tl.float32)
-    x12 = tl.load(X + (0 + 12) * sxt + xcol, mask=cm & (0 + 12 < L), other=0.0).to(tl.float32)
-    x13 = tl.load(X + (0 + 13) * sxt + xcol, mask=cm & (0 + 13 < L), other=0.0).to(tl.float32)
-    x14 = tl.load(X + (0 + 14) * sxt + xcol, mask=cm & (0 + 14 < L), other=0.0).to(tl.float32)
-    x15 = tl.load(X + (0 + 15) * sxt + xcol, mask=cm & (0 + 15 < L), other=0.0).to(tl.float32)
-    for tile in range(0, L, 16):
-        n0 = tl.load(X + (tile + 16 + 0) * sxt + xcol, mask=cm & (tile + 16 + 0 < L), other=0.0).to(tl.float32)
-        n1 = tl.load(X + (tile + 16 + 1) * sxt + xcol, mask=cm & (tile + 16 + 1 < L), other=0.0).to(tl.float32)
-        n2 = tl.load(X + (tile + 16 + 2) * sxt + xcol, mask=cm & (tile + 16 + 2 < L), other=0.0).to(tl.float32)
-        n3 = tl.load(X + (tile + 16 + 3) * sxt + xcol, mask=cm & (tile + 16 + 3 < L), other=0.0).to(tl.float32)
-        n4 = tl.load(X + (tile + 16 + 4) * sxt + xcol, mask=cm & (tile + 16 + 4 < L), other=0.0).to(tl.float32)
-        n5 = tl.load(X + (tile + 16 + 5) * sxt + xcol, mask=cm & (tile + 16 + 5 < L), other=0.0).to(tl.float32)
-        n6 = tl.load(X + (tile + 16 + 6) * sxt + xcol, mask=cm & (tile + 16 + 6 < L), other=0.0).to(tl.float32)
-        n7 = tl.load(X + (tile + 16 + 7) * sxt + xcol, mask=cm & (tile + 16 + 7 < L), other=0.0).to(tl.float32)
-        n8 = tl.load(X + (tile + 16 + 8) * sxt + xcol, mask=cm & (tile + 16 + 8 < L), other=0.0).to(tl.float32)
-        n9 = tl.load(X + (tile + 16 + 9) * sxt + xcol, mask=cm & (tile + 16 + 9 < L), other=0.0).to(tl.float32)
-        n10 = tl.load(X + (tile + 16 + 10) * sxt + xcol, mask=cm & (tile + 16 + 10 < L), other=0.0).to(tl.float32)
-        n11 = tl.load(X + (tile + 16 + 11) * sxt + xcol, mask=cm & (tile + 16 + 11 < L), other=0.0).to(tl.float32)
-        n12 = tl.load(X + (tile + 16 + 12) * sxt + xcol, mask=cm & (tile + 16 + 12 < L), other=0.0).to(tl.float32)
-        n13 = tl.load(X + (tile + 16 + 13) * sxt + xcol, mask=cm & (tile + 16 + 13 < L), other=0.0).to(tl.float32)
-        n14 = tl.load(X + (tile + 16 + 14) * sxt + xcol, mask=cm & (tile + 16 + 14 < L), other=0.0).to(tl.float32)
-        n15 = tl.load(X + (tile + 16 + 15) * sxt + xcol, mask=cm & (tile + 16 + 15 < L), other=0.0).to(tl.float32)
-        acc = _centred_step(acc, x0, tile + 0, cnt, OUT, (tile + 0) * sot + ocol, cm & (tile + 0 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x1, tile + 1, cnt, OUT, (tile + 1) * sot + ocol, cm & (tile + 1 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x2, tile + 2, cnt, OUT, (tile + 2) * sot + ocol, cm & (tile + 2 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x3, tile + 3, cnt, OUT, (tile + 3) * sot + ocol, cm & (tile + 3 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x4, tile + 4, cnt, OUT, (tile + 4) * sot + ocol, cm & (tile + 4 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x5, tile + 5, cnt, OUT, (tile + 5) * sot + ocol, cm & (tile + 5 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x6, tile + 6, cnt, OUT, (tile + 6) * sot + ocol, cm & (tile + 6 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x7, tile + 7, cnt, OUT, (tile + 7) * sot + ocol, cm & (tile + 7 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x8, tile + 8, cnt, OUT, (tile + 8) * sot + ocol, cm & (tile + 8 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x9, tile + 9, cnt, OUT, (tile + 9) * sot + ocol, cm & (tile + 9 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x10, tile + 10, cnt, OUT, (tile + 10) * sot + ocol, cm & (tile + 10 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x11, tile + 11, cnt, OUT, (tile + 11) * sot + ocol, cm & (tile + 11 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x12, tile + 12, cnt, OUT, (tile + 12) * sot + ocol, cm & (tile + 12 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x13, tile + 13, cnt, OUT, (tile + 13) * sot + ocol, cm & (tile + 13 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x14, tile + 14, cnt, OUT, (tile + 14) * sot + ocol, cm & (tile + 14 < L), OUT_DTYPE)
-        acc = _centred_step(acc, x15, tile + 15, cnt, OUT, (tile + 15) * sot + ocol, cm & (tile + 15 < L), OUT_DTYPE)
-        x0 = n0
-        x1 = n1
-        x2 = n2
-        x3 = n3
-        x4 = n4
-        x5 = n5
-        x6 = n6
-        x7 = n7
-        x8 = n8
-        x9 = n9
-        x10 = n10
-        x11 = n11
-        x12 = n12
-        x13 = n13
-        x14 = n14
-        x15 = n15
-    tl.store(S + cols, acc, mask=cm)
+    carry = tl.load(S + cols, mask=cm, other=0.0)
+    rows = tl.arange(0, TT)
+    for t0 in range(0, L, TT):
+        t = t0 + rows
+        m = (t < L)[:, None] & cm[None, :]
+        x = tl.load(X + t[:, None] * sxt + xcol[None, :], mask=m, other=0.0).to(tl.float32)
+        inc = tl.cumsum(x, axis=0)
+        run = carry[None, :] + (inc - x)                                 # the sum before token t
+        pos = cnt[None, :] + t[:, None]
+        q = _rn_div_f32(run, tl.maximum(pos.to(tl.float32), 1.0))
+        o = (x - q) * tl.where(pos > 0, 1.0, 0.0)
+        tl.store(OUT + t[:, None] * sot + ocol[None, :], o.to(OUT_DTYPE), mask=m)
+        carry = carry + tl.sum(x, axis=0)
+    tl.store(S + cols, carry, mask=cm)
 
 
 # ================================================================================================ training launchers
@@ -931,11 +872,11 @@ def _centred_running_op(x, run_sum, count, out_dtype):
     T, B, C = (int(s) for s in x.shape)
     out = _centred_out(x, out_dtype)
     sx, so = [int(v) for v in x.stride()], [int(v) for v in out.stride()]
-    if (T + 32) * max(sx[0], so[0]) + B * max(sx[1], so[1]) + C * max(sx[2], so[2]) >= 2 ** 31 or min(sx + so) < 0:
-        raise RuntimeError("neuronspark.centred_running: offsets beyond the int32 range")   # (the prefetch reaches T + 31)
-    _centred_kernel[_prefill_grid(B * C)](x, run_sum, count, out, T, B * C, C, sx[0], sx[1], sx[2], so[0], so[1], so[2],
-                                          OUT_DTYPE=_OUT_TL[out_dtype], BLOCK=PREFILL_BLOCK, num_warps=1, num_stages=1,
-                                          enable_fp_fusion=False)
+    if (T + 512) * max(sx[0], so[0]) + B * max(sx[1], so[1]) + C * max(sx[2], so[2]) >= 2 ** 31 or min(sx + so) < 0:
+        raise RuntimeError("neuronspark.centred_running: offsets beyond the int32 range")   # (a tile reaches T + 511)
+    tt, bc, nw = CENTRED_NARROW if B * C < CENTRED_NARROW_N else CENTRED_WIDE
+    _centred_tiled_kernel[(triton.cdiv(B * C, bc),)](x, run_sum, count, out, T, B * C, C, sx[0], sx[1], sx[2], so[0], so[1],
+                                                     so[2], OUT_DTYPE=_OUT_TL[out_dtype], TT=tt, BC=bc, num_warps=nw)
     return out
 
 

@@ -101,7 +101,7 @@ class LexicalReadMixin:
         the gate and the residual after the projections as ``ops.lex_read_prefill``."""
         self._check_lex(h, lex)
         o = self._ops
-        hn = rows_rmsnorm(o, h, LEX_EPS, out_dtype=h.dtype)
+        hn = rows_rmsnorm(o, h, LEX_EPS, out_dtype=torch.bfloat16)          # its only consumer is the bf16 lex_q projection
         m_in = lex.to(h.dtype)
         if int(h.shape[0]) > 1:
             q_raw = o.linear(hn, self.lex_q.weight)

@@ -228,12 +228,16 @@ class PLIFNeuron(nn.Module):
 
     # ------------------------------------------------------------------------------------------------ forward
     def forward(self, x: torch.Tensor, state: Optional[PLIFState] = None,
-                pos: Optional[torch.Tensor] = None) -> torch.Tensor:
+                pos: Optional[torch.Tensor] = None, out_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        """S (T, B, C) in ``x.dtype``; ``out_dtype`` (the inference forms) stores the spikes in that dtype instead -- a
+        caller whose only consumers are bf16 projections passes ``torch.bfloat16`` (the rounding of their input cast)."""
         if x.dim() != 3 or int(x.shape[-1]) != self.dim:
             raise ValueError(f"PLIFNeuron: expected x (T, B, {self.dim}), got {tuple(x.shape)}")
         if x.dtype not in (torch.float32, torch.bfloat16):
             raise RuntimeError(f"PLIFNeuron: x must be fp32 or bf16, got {x.dtype}")
         if state is None:
+            if out_dtype is not None:
+                raise RuntimeError("PLIFNeuron: out_dtype applies to the inference forms (a carried state)")
             return self._forward_train(x)
         if torch.is_grad_enabled():
             raise RuntimeError("PLIFNeuron: the inference forms (a carried state) run without autograd "
@@ -248,9 +252,10 @@ class PLIFNeuron(nn.Module):
             if pos is None or tuple(pos.shape) != (B,) or pos.dtype != torch.int64:
                 raise RuntimeError(f"PLIFNeuron: the centred neuron needs pos ({B},) int64, the row position of the "
                                    "call's first token")
+        od = x.dtype if out_dtype is None else out_dtype
         if int(x.shape[0]) == 1:
-            return self._forward_step(x, state, pos)
-        return self._forward_prefill(x, state, pos)
+            return self._forward_step(x, state, pos).to(od)
+        return self._forward_prefill(x, state, pos, od)
 
     def _eta_projection(self, xc: torch.Tensor, contiguous: bool) -> torch.Tensor:
         """bf16 (T, B, C) token term of the gate logit: bf16(bf16(xc @ eta_V^T) @ eta_U^T)."""
@@ -269,7 +274,8 @@ class PLIFNeuron(nn.Module):
         S = self._ops.plif_scan_train(self.w_eta, self.b_eta, zp, x, self.v_th, alpha=self.alpha, out_dtype=x.dtype)
         return S.to(x.dtype)
 
-    def _forward_prefill(self, x: torch.Tensor, state: PLIFState, pos: Optional[torch.Tensor]) -> torch.Tensor:
+    def _forward_prefill(self, x: torch.Tensor, state: PLIFState, pos: Optional[torch.Tensor],
+                         out_dtype: torch.dtype) -> torch.Tensor:
         """Prefill form (T >= 2): the membrane ``state.v`` and the input sum ``state.xsum`` (centred neuron) are carried
         in place."""
         if self.centred:
@@ -279,8 +285,8 @@ class PLIFNeuron(nn.Module):
             xc = x
         zp = self._eta_projection(xc, contiguous=False)                    # bf16, widened in the gate kernel
         a, drive = self._ops.plif_gate_prefill(x, self.w_eta, self.b_eta, zp)
-        S = self._ops.plif_scan_prefill(a, drive, self.v_th, state.v, x.dtype)
-        return S.to(x.dtype)
+        S = self._ops.plif_scan_prefill(a, drive, self.v_th, state.v, out_dtype)
+        return S.to(out_dtype)
 
     def _forward_step(self, x: torch.Tensor, state: PLIFState, pos: Optional[torch.Tensor]) -> torch.Tensor:
         """Single-token form (torch): the gate chain, one leaky step, the bipolar release, the soft reset; the membrane

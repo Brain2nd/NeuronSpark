@@ -174,7 +174,8 @@ class PoolAttentionMixin:
     ``pool_ind_beta`` (18; 0, viewed (3 orders, 6 heads)).
     Persistent buffers: ``decay_A_log_init`` (256) = -linspace(0, ln 512, 256), ``pool_bias_gain_spectrum_raw`` (6),
     ``pool_dendritic_gain_spectrum_log`` (6), ``pool_write_bias_spectrum`` (6) = linspace(0, 6, 6),
-    ``pool_value_residual_anchor`` (1536).  Non-persistent: ``rope_cos`` / ``rope_sin`` (8192, 768) fp32.
+    ``pool_value_residual_anchor`` (1536).  Non-persistent: ``rope_cos`` / ``rope_sin`` (8192, 768) fp32 and their bf16
+    roundings ``rope_cos_bf16`` / ``rope_sin_bf16`` (gathered by the prefill: the rounding of the gathered rows).
     """
 
     # ------------------------------------------------------------------------------------------------ build
@@ -275,6 +276,8 @@ class PoolAttentionMixin:
                                                    device=device)
         self.register_buffer("rope_cos", rope_cos, persistent=False)
         self.register_buffer("rope_sin", rope_sin, persistent=False)
+        self.register_buffer("rope_cos_bf16", rope_cos.to(torch.bfloat16), persistent=False)
+        self.register_buffer("rope_sin_bf16", rope_sin.to(torch.bfloat16), persistent=False)
 
     def _finish_pool_attention_init(self, out_std: float) -> None:
         """Launch draws taken after the FFN sub-block is built (global stream): qkv_proj Xavier-uniform, attn_out_proj
@@ -561,8 +564,8 @@ class PoolAttentionMixin:
             carry_in = carry_out = carry
         v = o.vr_mix_prefill(v, carry_in, lin(zc, self.pool_vr_gate), self.value_residual_lambda0(), self._glu_addend(z))
         positions = pos0.view(1, B) + torch.arange(T, device=h.device, dtype=torch.int64).view(T, 1)
-        cos = self.rope_cos[positions].to(q.dtype)
-        sin = self.rope_sin[positions].to(q.dtype)
+        cos = self.rope_cos_bf16[positions].to(q.dtype)
+        sin = self.rope_sin_bf16[positions].to(q.dtype)
         q = o.rope_interleaved(q, cos, sin)
         k = o.rope_interleaved(k, cos, sin)
         gate = self.gate_neuron(z, st.gate_neuron, pos0)
@@ -586,8 +589,9 @@ class PoolAttentionMixin:
         st.pool_run.copy_(cum_abs[-1])
         # extra queries of the last head over its ring
         xq = self._xq_queries_prefill(z, cos, sin, q.dtype)
+        # the reads in bf16: their only consumer is the bf16 pool_xq_out_in projection
         reads = o.ring_recall_prefill(xq, st.pool_k, st.pool_gv, st.pool_cum, None, ptr0, (matches, beta),
-                                      self.match_scale, T, B, self.xq_count, W, dk, dv, h.dtype, True, H - 1)
+                                      self.match_scale, T, B, self.xq_count, W, dk, dv, torch.bfloat16, True, H - 1)
         xq_add = lin(lin(reads, self.pool_xq_out_in), self.pool_xq_out)
         last = (H - 1) * dv
         attn = torch.cat([out[..., :last], out[..., last:] + xq_add], dim=-1)

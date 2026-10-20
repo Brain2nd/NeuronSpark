@@ -216,7 +216,8 @@ class MemoryLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMMixin,
             f = self.read_gain_factor(pi, c)
             h = o.read_gain_residual(h, r, f)
         x_hat = rows_rmsnorm(o, h, self.ffn_norm.eps, weight=self.ffn_norm.weight, out_dtype=h.dtype)
-        zs = self.input_neuron2(x_hat, st.input_neuron2, pos0)
+        # the spikes in bf16: their only consumers are the FFN's bf16 projections (the rounding of their input cast)
+        zs = self.input_neuron2(x_hat, st.input_neuron2, pos0, out_dtype=torch.bfloat16)
         ffn = o.linear(self.snn_ffn(zs, st.ffn_gate, st.ffn_up, pos0), self.ffn_out_proj.weight)
         y = self._pkm_read_step(x_hat) if step else self._pkm_read_prefill(x_hat)
         with torch.autocast(h.device.type, enabled=False):

@@ -1,6 +1,7 @@
 # NeuronSpark
 
 [![arXiv](https://img.shields.io/badge/arXiv-2603.16148-b31b1b.svg)](https://arxiv.org/abs/2603.16148)
+[![OpenReview](https://img.shields.io/badge/OpenReview-NeurIPS%202026%20submission-8c1b13.svg)](https://openreview.net/forum?id=P7pyNdvnfr)
 
 > **NeuronSpark: A Spiking Neural Network Language Model with Selective State Space Dynamics**\
 > Zhengzheng Tang, Hao Zhu, Zhewei Chen, Dajiang Tao\

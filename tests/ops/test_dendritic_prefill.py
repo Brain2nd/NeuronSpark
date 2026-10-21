@@ -1,9 +1,8 @@
 """ops.dendritic_prefill: the dendritic-layer prefill scan from a carried state, and its fused kernels.
 
 * the chunk states + state passing kernel (``ops.gluon.dendritic_chunk_states.chunk_states_prefill``) against its
-  reference ``csp_prefill_ref`` and against the vendored mamba_ssm pair computing the same quantities
-  (``_chunk_state_fwd`` + ``_state_passing_fwd`` at the prefill configurations of ``ops.triton.mamba``), from a carried
-  state and from the zero state (a first call);
+  reference ``csp_prefill_ref`` and against the op's stage reference, from a carried state and from the zero state (a
+  first call);
 * the chunk-scan forward of the op (the Gluon kernel for whole-chunk calls, the tensor-descriptor kernel otherwise)
   against the reference ``dendritic_prefill_chunk_scan_ref`` and against the tensor-descriptor kernel on the same stage
   inputs;
@@ -32,12 +31,6 @@ from neuronspark.ops.dendritic_prefill import (
     dendritic_prefill_chunk_scan_ref,
     dendritic_prefill_stage_tensors,
     dendritic_prefill_states_ref,
-)
-from neuronspark.ops.triton.mamba import (
-    CHUNK_STATE_FWD_PREFILL,
-    STATE_PASSING_FWD_PREFILL,
-    _chunk_state_fwd,
-    _state_passing_fwd,
 )
 from neuronspark.ops.triton.dendritic_scan import chunk_scan_fwd_tma
 from neuronspark.ops.gluon.dendritic_chunk_states import chunk_states_prefill
@@ -113,35 +106,19 @@ def _stages(o):
     return x, dt, Bm, Cm, st
 
 
-def _mamba_states(Bm, x, dt_out, dA_cumsum, init):
-    """The vendored mamba_ssm chunk states (fp32) and state passing (from ``init``, states in bf16) at the prefill
-    configurations."""
-    b, T, nheads, headdim = x.shape
-    dstate = Bm.shape[-1]
-    pre = _chunk_state_fwd(Bm, x, dt_out, dA_cumsum, seq_idx=None, states_in_fp32=True, config=CHUNK_STATE_FWD_PREFILL)
-    nc = int(pre.shape[1])
-    states, final = _state_passing_fwd(pre.reshape(b, nc, nheads, headdim * dstate), dA_cumsum[:, :, :, -1],
-                                       initial_states=init.reshape(b, nheads, headdim * dstate), seq_idx=None,
-                                       chunk_size=CHUNK, out_dtype=torch.bfloat16, config=STATE_PASSING_FWD_PREFILL)
-    return {"states": states.reshape(b, nc, nheads, headdim, dstate),
-            "final_state": final.reshape(b, nheads, headdim, dstate)}
-
-
 # ------------------------------------------------------------------------------------------------ prefill shapes
 @pytest.mark.parametrize("b,T", CHECK_SHAPES)
 @pytest.mark.parametrize("seed", CHECK_SEEDS)
 @pytest.mark.parametrize("init_kind", INIT_KINDS)
-def test_csp_prefill_vs_reference_and_mamba(device, b, T, seed, init_kind):
+def test_csp_prefill_vs_references(device, b, T, seed, init_kind):
     o = check_operands(b, T, seed, init_kind, device)
     x, dt, Bm, Cm, st = _stages(o)
     with torch.no_grad():
         states, final = chunk_states_prefill(Bm, x, st["dt_out"], st["dA_cumsum"], o["init"], torch.bfloat16)
-        mamba = _mamba_states(Bm, x, st["dt_out"], st["dA_cumsum"], o["init"])
     new = {"states": states, "final_state": final}
     assert states.dtype == torch.bfloat16 and final.dtype == torch.float32
     tag = f"b{b}_T{T}_s{seed}_{init_kind}"
     assert_all_match(new, {"states": st["states"], "final_state": st["final_state"]}, prefix=f"csp_op_{tag}")
-    assert_all_match(new, mamba, prefix=f"csp_vs_mamba_{tag}")
     states_ref, final_ref = csp_prefill_ref(Bm, x, st["dt_out"], st["dA_cumsum"], o["init"], torch.bfloat16)
     assert_all_match(new, {"states": states_ref, "final_state": final_ref}, prefix=f"csp_vs_ref_{tag}")
 

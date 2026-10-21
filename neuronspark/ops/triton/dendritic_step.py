@@ -27,8 +27,8 @@ The step, per row (default configuration: di 9216 = H 144 x P 64, N 128, conv_di
 
 Kernels (two or three launches per step, routed by the decode batch b with a constant table):
 
-* K1 -- conv update + SiLU + bf16 rounding + selective state update (mamba_ssm ``_selective_scan_update_kernel``'s
-  lines, TIE_HDIM, dt bias, D, softplus, no z), the x channels' conv tails rolled by their owner program.  Three
+* K1 -- conv update + SiLU + bf16 rounding + the membrane update of the compartments (one write strength per head,
+  dt bias, D skip, softplus), the x channels' conv tails rolled by their owner program.  Three
   routes, the same per-element operations in the same order:
     * ``gated`` (b == 1): one kernel, grid (P / 16, H, 1), 4 warps; it also forms the gate ``f32(bf16(y)) * z *
       sigmoid(z)`` and stores it fp32;
@@ -178,21 +178,21 @@ def _dendritic_k1_kernel(PROJ, CS, SS, CW, CB, A, DTB, DD, Y,
     B, _b1, _b2, _bn = _conv_ch(proj_row, cs_row, CW, CB, DI + offs_n, s_cs_c, s_cs_l, DI)
     C, _c1, _c2, _cn = _conv_ch(proj_row, cs_row, CW, CB, DI + NS + offs_n, s_cs_c, s_cs_l, DI)
 
-    # mamba_ssm _selective_scan_update_kernel, TIE_HDIM, HAS_DT_BIAS, HAS_D, DT_SOFTPLUS, no z: its lines
-    state_ptrs = SS + pid_b * s_ss_b + pid_h * s_ss_h + (offs_m[:, None] * s_ss_p + offs_n[None, :] * s_ss_n)
-    state = tl.load(state_ptrs)
-    dt = tl.load(PROJ + pid_b * s_proj_b + 2 * DI + 2 * NS + pid_h).to(tl.float32)
-    dt += tl.load(DTB + pid_h).to(tl.float32)
-    dt = tl.where(dt <= 20.0, _softplus(dt), dt)
-    Ah = tl.load(A + pid_h).to(tl.float32)
-    dA = tl.exp(Ah * dt)  # scalar, not a matrix
-    D = tl.load(DD + pid_h + offs_m * 0).to(tl.float32)
-    dB = B * dt  # vector of size (dstate,)
-    state = state * dA + dB * x[:, None]
-    out = tl.sum(state * C[None, :], axis=1)
-    out += x * D
+    # membrane update of the head's compartments V (P somata x NS compartments, one write strength per head):
+    #   dt = softplus(dt_raw + dt_bias),  V <- V exp(A dt) + (B dt) x^T,  read-out V C + D x
+    v_ptrs = SS + pid_b * s_ss_b + pid_h * s_ss_h + (offs_m[:, None] * s_ss_p + offs_n[None, :] * s_ss_n)
+    v = tl.load(v_ptrs)
+    strength = tl.load(PROJ + pid_b * s_proj_b + 2 * DI + 2 * NS + pid_h).to(tl.float32)
+    strength += tl.load(DTB + pid_h).to(tl.float32)
+    strength = tl.where(strength <= 20.0, _softplus(strength), strength)
+    leak = tl.exp(tl.load(A + pid_h).to(tl.float32) * strength)
+    skip = tl.load(DD + pid_h + offs_m * 0).to(tl.float32)
+    write = B * strength
+    v = v * leak + write * x[:, None]
+    out = tl.sum(v * C[None, :], axis=1)
+    out += x * skip
     tl.debug_barrier()
-    tl.store(state_ptrs, state)
+    tl.store(v_ptrs, v)
     tl.store(Y + pid_b * s_y_b + pid_h * P + offs_m, out)
     tl.store(cs_row + cx * s_cs_c, xs1)
     tl.store(cs_row + cx * s_cs_c + s_cs_l, xs2)
@@ -221,21 +221,20 @@ def _dendritic_k1_gated_kernel(PROJ, CS, SS, CW, CB, A, DTB, DD, Y,
     B, _b1, _b2, _bn = _conv_ch(proj_row, cs_row, CW, CB, DI + offs_n, s_cs_c, s_cs_l, DI)
     C, _c1, _c2, _cn = _conv_ch(proj_row, cs_row, CW, CB, DI + NS + offs_n, s_cs_c, s_cs_l, DI)
 
-    # mamba_ssm _selective_scan_update_kernel, TIE_HDIM, HAS_DT_BIAS, HAS_D, DT_SOFTPLUS, no z: its lines
-    state_ptrs = SS + pid_b * s_ss_b + pid_h * s_ss_h + (offs_m[:, None] * s_ss_p + offs_n[None, :] * s_ss_n)
-    state = tl.load(state_ptrs).to(tl.float32)                             # fp32 or bf16 storage
-    dt = tl.load(PROJ + pid_b * s_proj_b + 2 * DI + 2 * NS + pid_h).to(tl.float32)
-    dt += tl.load(DTB + pid_h).to(tl.float32)
-    dt = tl.where(dt <= 20.0, _softplus(dt), dt)
-    Ah = tl.load(A + pid_h).to(tl.float32)
-    dA = tl.exp(Ah * dt)  # scalar, not a matrix
-    D = tl.load(DD + pid_h + offs_m * 0).to(tl.float32)
-    dB = B * dt  # vector of size (dstate,)
-    state = state * dA + dB * x[:, None]
-    out = tl.sum(state * C[None, :], axis=1)
-    out += x * D
+    # membrane update of the head's compartments (as in _dendritic_k1_kernel), storage fp32 or bf16
+    v_ptrs = SS + pid_b * s_ss_b + pid_h * s_ss_h + (offs_m[:, None] * s_ss_p + offs_n[None, :] * s_ss_n)
+    v = tl.load(v_ptrs).to(tl.float32)
+    strength = tl.load(PROJ + pid_b * s_proj_b + 2 * DI + 2 * NS + pid_h).to(tl.float32)
+    strength += tl.load(DTB + pid_h).to(tl.float32)
+    strength = tl.where(strength <= 20.0, _softplus(strength), strength)
+    leak = tl.exp(tl.load(A + pid_h).to(tl.float32) * strength)
+    skip = tl.load(DD + pid_h + offs_m * 0).to(tl.float32)
+    write = B * strength
+    v = v * leak + write * x[:, None]
+    out = tl.sum(v * C[None, :], axis=1)
+    out += x * skip
     tl.debug_barrier()
-    tl.store(state_ptrs, state)
+    tl.store(v_ptrs, v)
     # Keep the bf16 K1 output boundary before the gate.
     out16 = out.to(tl.bfloat16)
     gate_x = _sr_bf16_to_f32(out16)
@@ -263,16 +262,14 @@ def _dendritic_k1_conv_kernel(PROJ, CS, CW, CB, A, DTB, XB, BB, CBO, DTO, DAB,
         offs_p = tl.arange(0, P)
         cx = pid * P + offs_p
         x, xs1, xs2, xn = _conv_ch(proj_row, cs_row, CW, CB, cx, s_cs_c, s_cs_l, DI)
-        dt_raw = tl.load(PROJ + pid_b * s_proj_b + 2 * DI + 2 * NS + pid).to(tl.float32)
-        dt_bias = tl.load(DTB + pid).to(tl.float32)
-        Ah = tl.load(A + pid).to(tl.float32)
-        dt = dt_raw
-        dt += dt_bias
-        dt = tl.where(dt <= 20.0, _softplus(dt), dt)
-        dA = tl.exp(Ah * dt)
+        # the head's write strength and leak factor for the state phase
+        strength = tl.load(PROJ + pid_b * s_proj_b + 2 * DI + 2 * NS + pid).to(tl.float32)
+        strength += tl.load(DTB + pid).to(tl.float32)
+        strength = tl.where(strength <= 20.0, _softplus(strength), strength)
+        leak = tl.exp(tl.load(A + pid).to(tl.float32) * strength)
         tl.store(XB + pid_b * s_x_b + cx, x)
-        tl.store(DTO + pid_b * H + pid, dt)
-        tl.store(DAB + pid_b * H + pid, dA)
+        tl.store(DTO + pid_b * H + pid, strength)
+        tl.store(DAB + pid_b * H + pid, leak)
         tl.store(cs_row + cx * s_cs_c, xs1)
         tl.store(cs_row + cx * s_cs_c + s_cs_l, xs2)
         tl.store(cs_row + cx * s_cs_c + 2 * s_cs_l, xn)
@@ -290,28 +287,28 @@ def _dendritic_k1_conv_kernel(PROJ, CS, CW, CB, A, DTB, XB, BB, CBO, DTO, DAB,
 def _dendritic_k1_state_kernel(PROJ, SS, XB, BB, CBO, DTO, DAB, DD, Y,
                         s_proj_b, s_ss_b, s_ss_h, s_ss_p, s_ss_n, s_x_b, s_y_b,
                         H: tl.constexpr, NS: tl.constexpr, P: tl.constexpr, BLOCK_M: tl.constexpr):
-    """K1 ``split`` route, state phase.  grid (P / BLOCK_M, H, b): the state update on one BLOCK_M x N tile with the
-    conv results read from the buffers (dB = B * dt formed here, the same multiply on the same fp32 operands); the
-    state tile is loaded first."""
+    """K1 ``split`` route, state phase.  grid (P / BLOCK_M, H, b): the membrane update on one BLOCK_M x N tile of the
+    head's compartments with the conv results read from the buffers (the write B * strength formed here, the same
+    multiply on the same fp32 operands); the compartment tile is loaded first."""
     pid_m = tl.program_id(axis=0)
     pid_h = tl.program_id(axis=1)
     pid_b = tl.program_id(axis=2)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = tl.arange(0, NS)
     cx = pid_h * P + offs_m
-    state_ptrs = SS + pid_b * s_ss_b + pid_h * s_ss_h + (offs_m[:, None] * s_ss_p + offs_n[None, :] * s_ss_n)
-    state = tl.load(state_ptrs).to(tl.float32)                           # fp32 or bf16 storage
+    v_ptrs = SS + pid_b * s_ss_b + pid_h * s_ss_h + (offs_m[:, None] * s_ss_p + offs_n[None, :] * s_ss_n)
+    v = tl.load(v_ptrs).to(tl.float32)                                    # fp32 or bf16 storage
     x = tl.load(XB + pid_b * s_x_b + cx)
     B = tl.load(BB + pid_b * NS + offs_n)
     C = tl.load(CBO + pid_b * NS + offs_n)
-    dt = tl.load(DTO + pid_b * H + pid_h)
-    dA = tl.load(DAB + pid_b * H + pid_h)
-    D = tl.load(DD + pid_h + offs_m * 0).to(tl.float32)
-    dB = B * dt
-    state = state * dA + dB * x[:, None]
-    out = tl.sum(state * C[None, :], axis=1)
-    out += x * D
-    tl.store(state_ptrs, state)
+    strength = tl.load(DTO + pid_b * H + pid_h)
+    leak = tl.load(DAB + pid_b * H + pid_h)
+    skip = tl.load(DD + pid_h + offs_m * 0).to(tl.float32)
+    write = B * strength
+    v = v * leak + write * x[:, None]
+    out = tl.sum(v * C[None, :], axis=1)
+    out += x * skip
+    tl.store(v_ptrs, v)
     out16 = out.to(tl.bfloat16)
     gate_x = _sr_bf16_to_f32(out16)
     gate_ptr = PROJ + pid_b * s_proj_b + pid_h * P + offs_m

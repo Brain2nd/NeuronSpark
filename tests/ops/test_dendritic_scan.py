@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from neuronspark.ops.triton.mamba import BMM_CHUNK_FWD, CHUNK_CUMSUM_FWD_TRAIN, _bmm_chunk_fwd, _chunk_cumsum_fwd
+from neuronspark.ops.triton.dendritic_chunk import chunk_cb, chunk_dt_cumsum
 from neuronspark.ops.triton.dendritic_scan import (
     chunk_scan_fwd_tma,
     chunk_scan_fwd_tma_ref,
@@ -36,9 +36,8 @@ def operands(B, L, device):
     x = xbc[..., :DI].unflatten(-1, (H, P))
     Bm = xbc[..., DI:DI + N].unflatten(-1, (1, N))
     Cm = xbc[..., DI + N:].unflatten(-1, (1, N))
-    dA, dt = _chunk_cumsum_fwd(dt_raw, A, CS, dt_bias=dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")),
-                               config=CHUNK_CUMSUM_FWD_TRAIN)
-    CB = _bmm_chunk_fwd(Cm, Bm, CS, seq_idx=None, output_dtype=torch.float32, config=BMM_CHUNK_FWD)
+    dA, dt = chunk_dt_cumsum(dt_raw, A, CS, dt_bias=dt_bias)
+    CB = chunk_cb(Cm, Bm, CS)
     _, states = chunk_states_train(Bm, x, dt, dA, torch.bfloat16)
     nc = dA.shape[2]
     dout = (rand_tensor((B, L, H, P), torch.float32, device) * 1e-2).to(torch.bfloat16)

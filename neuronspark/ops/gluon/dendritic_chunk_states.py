@@ -6,14 +6,13 @@ For chunk c of an item (chunk length CS, dA_last = dA_cumsum[b, h, c, CS - 1]):
     A_c     = sum_k x[k]^T bf16(B[k] scale[k])        scale[k] = exp(min(dA_last - dA_cumsum[k], 0)) dt[k]   (P, N) fp32
     s_{c+1} = exp(dA_last) s_c + A_c                                                                          (fp32)
 
-the stock chunk-state body (the bf16 rounding point of the scaled B, fp32 accumulation) and the stock state-passing step.
+the chunk-state body (the bf16 rounding point of the scaled B, fp32 accumulation) and the state-passing step.
 Forms:
 
 * :func:`chunk_states_train` (no initial state): ``states_pre[c] = A_c`` fp32 (or, with ``passed_fp32``, the passed
-  state ``s_c`` fp32) and ``states[c] = s_c`` in the output dtype (``states[0] = 0``; the final state is not stored) --
-  the outputs of mamba_ssm's ``_chunk_state_fwd(.., states_in_fp32=True)`` + ``_state_passing_fwd``;
+  state ``s_c`` fp32) and ``states[c] = s_c`` in the output dtype (``states[0] = 0``; the final state is not stored);
 * :func:`chunk_states_prefill` (the carried state ``s_0``, or zero): ``states[c] = s_c`` in the output dtype and the final
-  state ``s_nc`` fp32 -- the same pair from ``initial_states``.
+  state ``s_nc`` fp32 -- the same quantities from the initial state.
 
 Per CTA (persistent, items (b, h) in round-robin): a load warp streams the (BK, P) x tiles and the (BK, N) B tiles of
 each K step through an R-deep mbarrier ring; a compute partition of NWC warps scales each B tile in place (one row
@@ -21,12 +20,12 @@ factor per token, bf16); an MMA warp issues A_c += x_tile^T . B_tile (the x tile
 two TMEM accumulators; the default partition (4 warps) waits for each chunk's last MMA, reads A_c, carries the state and
 stores the outputs.
 
-Numerics: the scale and the passing step are the stock expressions (``exp``), the scaled B rounded to bf16 at the stock
-point; the fp32 accumulation over the chunk's tokens is the tensor cores' order (the per-operator rule class of
-:mod:`neuronspark.utils.testing` against :func:`chunk_states_train_ref` / :func:`chunk_states_prefill_ref`).  A partial
-last chunk is supported: its rows past the sequence get a zero scaled B (dA_last is the chunk's last element, as the stock
-passing reads it).  x and B are read through 3-D (batch, seqlen, .) descriptors: any batch stride (a time slice of a longer
-buffer qualifies).
+Numerics: the scale and the passing step are the reference's expressions (``exp``), the scaled B rounded to bf16 at the
+reference's point; the fp32 accumulation over the chunk's tokens is the tensor cores' order (the per-operator rule class
+of :mod:`neuronspark.utils.testing` against :func:`chunk_states_train_ref` / :func:`chunk_states_prefill_ref`).  A
+partial last chunk is supported: its rows past the sequence get a zero scaled B (dA_last is the chunk's last element, as
+the passing reads it).  x and B are read through 3-D (batch, seqlen, .) descriptors: any batch stride (a time slice of a
+longer buffer qualifies).
 
 Launch constants: BK 64 tokens per K step, R 4 ring slots, NWC 8 compute warps, registers 40 (load / MMA warps) and 128
 (compute); grid = #SM persistent CTAs.  The epilogue's per-chunk outputs leave through shared-memory staging tiles (two
@@ -106,7 +105,7 @@ def _epilogue_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, 
                 fence_async_shared()
                 gl.thread_barrier()
                 tma.async_copy_shared_to_global(pred, [row, 0], pre_s.index(u))
-            s = gl.exp(da_last) * s + ac                               # the stock state-passing step
+            s = gl.exp(da_last) * s + ac                               # the state-passing step
             cc += 1
         if STORE_FIN:
             tma.store_wait(2 * NST - 1)
@@ -177,7 +176,7 @@ def _compute_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, p
             da_last = gl.load(DA + base + (CS - 1))
             dk = gl.load(DA + base + offs_kc)                          # the chunk's dA / dt, (NKT, BK)
             tk = gl.load(DT + base + offs_kc)
-            sc = gl.exp(gl.minimum(da_last - dk, 0.0)) * tk            # the stock scale of every token of the chunk
+            sc = gl.exp(gl.minimum(da_last - dk, 0.0)) * tk            # the scale of every token of the chunk
             lim = seqlen - c * CS                                      # tokens of the chunk inside the sequence
             for kt in gl.static_range(NKT):
                 slot = t % R

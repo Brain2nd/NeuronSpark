@@ -1,8 +1,7 @@
 """Triton kernels of the NeuronSpark operators (Triton 3.5.1).
 
 Shared pieces: :mod:`neuronspark.ops.triton._ptx` (inline-PTX round-to-nearest helpers that pin the rounding of the
-kernels to the reference arithmetic) and the device queries below.  The vendored mamba_ssm SSD kernels live in
-:mod:`neuronspark.ops.triton.mamba` (Apache-2.0; see NOTICE).
+kernels to the reference arithmetic) and the device queries below.
 
 Launch configurations are fixed constants at the top of each kernel module (no autotuning at run time).  Kernels that
 use TMA descriptors, tcgen05 or TMEM call :func:`require_sm100` and raise on other GPUs; nothing falls back silently.

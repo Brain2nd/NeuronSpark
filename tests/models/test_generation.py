@@ -138,18 +138,17 @@ def test_generate_api_and_graph_cache(model):
     with pytest.raises(ValueError):
         model.generate(prompt, max_length=model.config.rope_max_seq_len + 1)
     assert ring_capacity(48, 8192) == 512 and ring_capacity(513, 8192) == 1024
-    cache = model._decoding_cache
-    run = cache.callables[(2, 1)]
+    g = model._decode_graph
+    graph0 = g.graph
     model.generate(prompt, max_length=40)                               # same batch, smaller length: reused
-    assert model._decoding_cache is cache and cache.callables[(2, 1)] is run
+    assert model._decode_graph is g and g.graph is graph0
     with torch.no_grad():
         model.backbone.norm.weight.mul_(1.0)                           # a weight write (same values)
     model.generate(prompt, max_length=40)
-    assert cache.callables[(2, 1)] is not run                           # re-captured
-    run2 = cache.callables[(2, 1)]
+    assert g.graph is not graph0                                        # re-captured
+    graph1 = g.graph
     model.generate(_prompts(3, 16, seed=51), max_length=40)             # another batch size: re-allocated
-    assert (3, 1) in cache.callables and (2, 1) not in cache.callables and cache.max_batch_size == 3
-    assert run2 is not cache.callables[(3, 1)]
+    assert g.params.max_batch_size == 3 and g.graph is not graph1
     eager = decode(prompt, model, 40, cg=False)                          # eager decode after graph decode
     graph = decode(prompt, model, 40, cg=True)
     assert tuple(eager.sequences.shape) == tuple(graph.sequences.shape) == (2, 40)

@@ -32,8 +32,6 @@ calibration's values) unless ``allow_uncalibrated``.
 Loading never writes a parameter after ``load_state_dict``: the model is built with ``init="empty"`` (no random draw;
 every PLIF ``b_eta`` comes from the file), loaded strictly, and the hippocampal layers mark their product-key memory
 ready from the loaded ``pkm_calibrated`` buffer.
-
-Structure follows mamba_ssm ``utils/hf.py`` (``load_config_hf`` / ``load_state_dict_hf``), for local paths.
 """
 from __future__ import annotations
 

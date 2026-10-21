@@ -10,10 +10,9 @@ For an item with the forward's passed states ``s_c`` (fp32, the state entering c
     A_k      = sum_t bf16(dout[t] exp(dA_cumsum[t]))^T C[t]            (P, N) fp32
     d        = exp(dA_end[k]) d + A_k ;  dstates[k - 1] = d           (output dtype)
 
-with ``dstates[nc - 1] = 0``, ``conv[0] = 0`` and ``ws[0] = 0`` -- mamba_ssm ``_chunk_scan_bwd_dstates`` (the stock dout
-scaling and its bf16 rounding point, fp32 accumulation) feeding ``_state_passing_bwd`` (CONVERT_STATES, no dfinal /
-dinit), on the forward's stored passed states (``chunk_states_train(.., passed_fp32=True)``: the fp32 values the stock
-backward recomputes with ``_state_passing_fwd``).
+with ``dstates[nc - 1] = 0``, ``conv[0] = 0`` and ``ws[0] = 0`` -- the state gradients (the dout scaling rounded to
+bf16, fp32 accumulation) and their backward passing through the chunks (no final / initial state gradients), on the
+forward's stored passed states (``chunk_states_train(.., passed_fp32=True)``: fp32, nothing recomputed).
 
 Per CTA (persistent, items (b, h) in round-robin): a load warp streams the (BK, P) dout and (BK, N) C tiles of each K step
 through an R-deep mbarrier ring and each chunk's passed-state tile; a compute partition scales each dout tile in place
@@ -21,9 +20,9 @@ through an R-deep mbarrier ring and each chunk's passed-state tile; a compute pa
 view) into one of two TMEM accumulators; the default partition (4 warps) carries d and stores the outputs through
 shared tiles and TMA stores (the 16 workspace values per chunk by plain stores).
 
-Numerics: the stock expressions and rounding points; the fp32 accumulation order of the tensor cores and of the block
-sums (the per-operator rule class of :mod:`neuronspark.utils.testing` against :func:`dstates_train_ref`).  A partial last
-chunk is supported (its rows past the sequence get a zero scaled dout).
+Numerics: the reference's expressions and rounding points; the fp32 accumulation order of the tensor cores and of the
+block sums (the per-operator rule class of :mod:`neuronspark.utils.testing` against :func:`dstates_train_ref`).  A
+partial last chunk is supported (its rows past the sequence get a zero scaled dout).
 
 Launch constants: BK 64 tokens per K step, R 4 ring slots, NWC 4 compute warps, registers 40 (load / MMA warps) and
 128 (compute); grid = #SM persistent CTAs.
@@ -49,7 +48,7 @@ R = 4            # ring slots (K steps in flight)
 NWC = 4          # compute warps (the dout scaling)
 REGS_W = 40      # registers of the load / MMA warps
 REGS_C = 128     # registers of the compute partition
-WS_ROWS = 4      # rows of P per workspace block (512 elements at N 128: the stock state-passing block)
+WS_ROWS = 4      # rows of P per workspace block (512 elements at N 128)
 _GL_DT = {torch.bfloat16: gl.bfloat16, torch.float32: gl.float32}
 
 
@@ -110,7 +109,7 @@ def _epilogue_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc,
             _tc_fence(0, 4)
             gl.thread_barrier()
             mbarrier.arrive(acc_free.index(u))
-            d = scale * d + ak                                         # the stock state-passing backward step
+            d = scale * d + ak                                         # the state-passing backward step
             tma.store_wait(3)
             dst_s.index(u).store(d.to(dst_s.dtype))
             fence_async_shared()
@@ -171,7 +170,7 @@ def _compute_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, 
         for i in range(nchunks - 1):
             k = nchunks - 1 - i
             base = ((b * H + h) * nchunks + k) * CS
-            sc = gl.exp(gl.load(DA + base + offs_kc))                  # the stock dout scale of every token of the chunk
+            sc = gl.exp(gl.load(DA + base + offs_kc))                  # the dout scale of every token of the chunk
             lim = seqlen - k * CS
             for kt in gl.static_range(NKT):
                 slot = t % R
@@ -310,8 +309,8 @@ def dstates_train(states, dA_cumsum, dout, C, out_dtype):
 
 
 def dstates_train_ref(states, dA_cumsum, dout, C, out_dtype):
-    """Pure-torch reference (float64 sums; the scaled dout rounded to bf16 at the stock point, every exponential in the
-    kernels' fp32 form ``exp2(t log2 e)``): the returns of :func:`dstates_train` (ws of shape (b, h, nc, P / 4))."""
+    """Pure-torch reference (float64 sums; the scaled dout rounded to bf16 at the kernel's point, every exponential in
+    the kernels' fp32 form ``exp2(t log2 e)``): the returns of :func:`dstates_train` (ws of shape (b, h, nc, P / 4))."""
     from neuronspark.ops.triton.dendritic_states import _exp_f32
     b, nc, h, p, n = states.shape
     L = int(dout.shape[1])
@@ -321,8 +320,8 @@ def dstates_train_ref(states, dA_cumsum, dout, C, out_dtype):
     pad = nc * chunk - L
     do = torch.nn.functional.pad(dout, (0, 0, 0, 0, 0, pad)).view(b, nc, chunk, h, p)
     cc = torch.nn.functional.pad(C[:, :, 0], (0, 0, 0, pad)).view(b, nc, chunk, n).double()
-    scale_t = _exp_f32(dA_cumsum).permute(0, 2, 3, 1)                  # (b, nc, chunk, h) fp32, the stock factor
-    ds = (do.float() * scale_t[..., None]).to(torch.bfloat16).double()  # bf16(dout exp(dA)) as the stock operand
+    scale_t = _exp_f32(dA_cumsum).permute(0, 2, 3, 1)                  # (b, nc, chunk, h) fp32, the dout scale
+    ds = (do.float() * scale_t[..., None]).to(torch.bfloat16).double()  # bf16(dout exp(dA)) as the kernel's operand
     A = torch.einsum("bctgp,bctn->bcgpn", ds, cc)                      # (b, nc, h, P, N)
     dst = torch.zeros_like(s64)
     conv = torch.zeros_like(s64)

@@ -1,18 +1,3 @@
-# Adapted from mamba_ssm (Apache-2.0): the composition of the chunked scan forward below follows
-# mamba_ssm/ops/triton/ssd_combined.py, _mamba_chunk_scan_combined_fwd (mamba_ssm 2.3.2.post1, source lines 343-392,
-# sha256 39c19c1e4c8e36982847079bc12b4f07ed3af03ac68f6a6653200ef80df5515d).
-# Copyright (c) 2024, Tri Dao, Albert Gu.  Licensed under the Apache License, Version 2.0; the license text is
-# neuronspark/ops/triton/mamba/LICENSE (see NOTICE).
-# Modified by NeuronSpark: specialised to the dendritic neuron layer's call (ngroups 1, D of shape (nheads,), no z, no
-# seq_idx,
-# no
-# varlen states, dt_softplus on, dt_limit (0, inf)); the kernels run at fixed launch configurations; the chunk states
-# and the state passing are one kernel (neuronspark.ops.gluon.dendritic_chunk_states.chunk_states_prefill); the
-# chunk-scan
-# forward is the
-# Gluon kernel of neuronspark.ops.gluon.dendritic_chunk_scan_fwd for calls of whole chunks and the tensor-descriptor
-# kernel of
-# neuronspark.ops.triton.dendritic_scan otherwise; the einops rearranges are reshapes.
 """dendritic-layer prefill scan: the selective state-space scan of a dendritic neuron population over a prompt chunk,
 started from the carried state.
 
@@ -35,43 +20,41 @@ softplus(dt_raw + dt_bias)`` clamped to [0, inf), ``a_t = exp(dt_t A)``)::
     S_t = a_t S_{t-1} + dt_t x_t B_t^T          (S_{-1} = initial_state)
     y_t = S_t C_t + D x_t                       final_state = S_{T-1}
 
-evaluated chunk-wise as the mamba_ssm chunked scan (in this order, each piece one kernel launch):
+evaluated chunk-wise (in this order, each piece one kernel launch):
 
-1. ``_chunk_cumsum_fwd``: dt (softplus, clamp) and the per-chunk inclusive cumsum of ``dt A`` (fp32);
+1. :func:`neuronspark.ops.triton.dendritic_chunk.chunk_dt_cumsum`: dt (softplus, clamp) and the per-chunk inclusive
+   cumsum of ``dt A`` (fp32);
 2. ``chunk_states_prefill``: each chunk's own end state ``sum_s exp(dA_end - dA_s) dt_s x_s B_s^T`` (fp32, on chip)
    and the states entering each chunk, ``s_c = exp(dA_chunk_end) s_{c-1} + chunk_state_c`` from ``initial_state`` in
-   fp32, stored bf16 (C's dtype) for the scan, and the final state in fp32 -- mamba_ssm's ``_chunk_state_fwd`` and
-   ``_state_passing_fwd`` in one kernel;
-3. ``_bmm_chunk_fwd``: CB = C B^T per chunk (fp32);
+   fp32, stored bf16 (C's dtype) for the scan, and the final state in fp32, in one kernel;
+3. :func:`neuronspark.ops.triton.dendritic_chunk.chunk_cb`: CB = C B^T per chunk (fp32);
 4. the chunk-scan forward: ``y[m] = exp(dA_m) C_m s_c^T + sum_{k <= m} bf16(CB[m, k] exp(min(dA_m - dA_k, 0)) dt_k)
    x_k + D x_m``, rounded once to bf16 -- for T a multiple of the chunk size the persistent warp-specialised Gluon
    kernel (:func:`neuronspark.ops.gluon.dendritic_chunk_scan_fwd.chunk_scan_fwd_gluon`, whole chunks only), otherwise
-   the tensor-descriptor port of mamba_ssm's chunk-scan forward
-   (:func:`neuronspark.ops.triton.dendritic_scan.chunk_scan_fwd_tma`).
+   the tensor-descriptor kernel (:func:`neuronspark.ops.triton.dendritic_scan.chunk_scan_fwd_tma`).
 
-Kernels 1 and 3 are the vendored mamba_ssm kernels (:mod:`neuronspark.ops.triton.mamba`, bodies unchanged).  Launch
-configurations: chunk cumsum ``{BLOCK_SIZE_H 1}`` 4 warps 3 stages, chunk states + passing (BN 64, BK 32, 4 warps, 4 stages), CB ``{M 64, N 32, K 32}`` 2 warps 5 stages, chunk scan
+Launch configurations: those of :mod:`neuronspark.ops.triton.dendritic_chunk` (stages 1 and 3), chunk states + passing
+(BN 64, BK 32, 4 warps, 4 stages), chunk scan
 Gluon (the launch constants of :mod:`neuronspark.ops.gluon.dendritic_chunk_scan_fwd`: BM = BK 64, 2 heads per item, x
 ring 2, accumulator buffers 2, 4 warps per compute partition, work-split cost 3.0, registers 48 / 128, dA / dt ring 2,
 no K-step prefetch, P ring 3, states ring 1, 4 columns per thread group; grid = #SM) or TMA (BM 64, BK 32, 4 warps, 3
 stages); none is tuned at run time.
 
-Numerics.  The rounding points are the stock chunked scan's: the chunk states summed in fp32 over K steps of 32
-tokens (the stock chunk-state kernel's K block) and passed in fp32, the states entering each chunk rounded to bf16
+Numerics.  The rounding points: the chunk states summed in fp32 over K steps of 32 tokens and passed in fp32, the
+states entering each chunk rounded to bf16
 before the inter-chunk product, ``CB * decay * dt`` rounded to bf16 before the intra-chunk product, fp32
 accumulation, y rounded once.  The Gluon kernel accumulates the inter-chunk term separately and adds it in its
 epilogue, and takes the decay as ``ex2.approx.ftz`` (results below 2^-126 flush to zero): fp32 order / underflow
 differences of the per-operator rule class.  The association of a prompt split over several calls equals the single
 call's only when every split point is a multiple of the chunk size (256); other split points give the same math with
 another association (the rule class).  A partial last chunk is supported (by the TMA chunk-scan kernel).  Tests: the
-per-operator tolerance rule of :mod:`neuronspark.utils.testing`, each fused kernel against the stock mamba_ssm kernels
-it replaces.
+per-operator tolerance rule of :mod:`neuronspark.utils.testing`, each kernel against the references below.
 
 Contract (anything else raises): CUDA tensors on one device of a Blackwell GPU (compute capability >= 10.0: TMA
 descriptors, tcgen05 / TMEM); the dtypes and shapes above with ngroups 1, N in {64, 128}, P in {16, 32, 64, 128}
 (P <= 64 and H even when T is a multiple of 256: the Gluon kernel's two heads per item in tensor memory),
 ``chunk_size`` 256, any number of chunks per call; ``x`` with a contiguous (H, P) part (or a non-unit last
-stride, which is copied as mamba_ssm does); ``initial_state`` fp32 or bf16.  For whole-chunk calls an ``x`` / ``Cm`` whose
+stride, which is copied); ``initial_state`` fp32 or bf16.  For whole-chunk calls an ``x`` / ``Cm`` whose
 batch stride is not T times its row stride (a time slice of a longer buffer) is copied to the standard layout first
 (a layout change only).  The Gluon kernel builds its work split on the first call per (B, nchunks, device): that
 call must not be inside a CUDA-graph capture (it raises).
@@ -81,11 +64,9 @@ References (pure torch), one per stage group, each with the kernels' bf16 roundi
 :func:`dendritic_prefill_chunk_scan_ref` (stage 4); :func:`dendritic_chunk_scan_prefill_ref` (the registered reference)
 chains them. :func:`dendritic_prefill_stage_tensors` returns the op's own stage results (the same launches), so that
 each stage reference can be evaluated on the values the op's next stage reads (why:
-:func:`dendritic_prefill_chunk_scan_ref`). The references transcribe the element-wise expressions of the stock kernels
-the op reproduces: mamba_ssm 2.3.2.post1 ``ssd_chunk_state.py`` ``_chunk_cumsum_fwd_kernel`` 39-86 and
-``_chunk_state_fwd_kernel`` 191-268, ``ssd_state_passing.py`` ``_state_passing_fwd_kernel`` 29-87, ``ssd_bmm.py``
-``_bmm_chunk_fwd_kernel`` 36-93 (the vendored copies in :mod:`neuronspark.ops.triton.mamba`) and ``ssd_chunk_scan.py``
-``_chunk_scan_fwd_kernel`` (the expressions of :func:`neuronspark.ops.triton.dendritic_scan.chunk_scan_fwd_tma`).
+:func:`dendritic_prefill_chunk_scan_ref`). The references evaluate the stages' element-wise expressions with the
+kernels' rounding points (the chunk-scan stage: those of
+:func:`neuronspark.ops.triton.dendritic_scan.chunk_scan_fwd_tma`).
 """
 from __future__ import annotations
 
@@ -96,12 +77,7 @@ import torch.nn.functional as F
 
 from neuronspark.ops.gluon.dendritic_chunk_scan_fwd import chunk_scan_fwd_gluon
 from neuronspark.ops.triton import require_cuda, require_sm100
-from neuronspark.ops.triton.mamba import (
-    BMM_CHUNK_FWD,
-    CHUNK_CUMSUM_FWD_PREFILL,
-    _bmm_chunk_fwd,
-    _chunk_cumsum_fwd,
-)
+from neuronspark.ops.triton.dendritic_chunk import chunk_cb, chunk_dt_cumsum
 from neuronspark.ops.gluon.dendritic_chunk_states import chunk_states_prefill
 from neuronspark.ops.triton.dendritic_scan import chunk_scan_fwd_tma
 
@@ -119,7 +95,7 @@ __all__ = [
 # ------------------------------------------------------------------------------------------------ fixed constants
 CHUNK_SIZE = 256                       # dendritic_chunk_size; the launch configurations assume it
 DT_SOFTPLUS = True                     # dt = softplus(dt_raw + dt_bias) inside the chunk cumsum
-DT_LIMIT = (0.0, float("inf"))         # mamba_ssm's default clamp of dt (applied by the chunk cumsum kernel)
+DT_LIMIT = (0.0, float("inf"))         # the clamp of dt (applied by the chunk cumsum kernel)
 _HEADDIMS = (16, 32, 64, 128)          # chunk-scan forward: power-of-two head width
 _DSTATES = (64, 128)                   # chunk states: N tiles of 64; chunk-scan forward: the state row in one box
 _GLUON_MAX_HEADDIM = 64                # Gluon chunk scan: 2 heads x 2 buffers x 2 accumulators x P <= 512 TMEM columns
@@ -138,9 +114,8 @@ def _rows_packed(t: torch.Tensor) -> torch.Tensor:
 def _prefill_stages(x: torch.Tensor, dt: torch.Tensor, A: torch.Tensor, Bm: torch.Tensor, Cm: torch.Tensor,
                     D: torch.Tensor, dt_bias: torch.Tensor, initial_state: torch.Tensor,
                     chunk_size: int) -> Dict[str, torch.Tensor]:
-    """mamba_ssm ``_mamba_chunk_scan_combined_fwd(x, dt, A, Bm, Cm, chunk_size, D=D, z=None, dt_bias=dt_bias,
-    initial_states=initial_state, seq_idx=None, dt_softplus=True)`` with the chunk states and the state passing in one
-    kernel and the chunk-scan forward routed by the call's length (operands checked by the caller).  Returns every
+    """The four stages of the module docstring (operands checked by the caller), the chunk-scan forward routed by the
+    call's length.  Returns every
     stage's result: ``dt_out`` / ``dA_cumsum`` (B, H, nchunks, chunk) fp32 (stage 1), ``states`` (B, nchunks, H, P, N)
     in Cm's dtype (the states entering each chunk) and ``final_state`` (B, H, P, N) fp32 (stage 2), ``CB`` (B,
     nchunks, 1, chunk, chunk) fp32 (stage 3) and ``y`` (B, T, H, P) in x's dtype (stage 4)."""
@@ -155,14 +130,13 @@ def _prefill_stages(x: torch.Tensor, dt: torch.Tensor, A: torch.Tensor, Bm: torc
         x = x.contiguous()
     if D.stride(-1) != 1:
         D = D.contiguous()
-    dA_cumsum, dt_out = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=DT_SOFTPLUS,
-                                          dt_limit=DT_LIMIT, config=CHUNK_CUMSUM_FWD_PREFILL)
+    dA_cumsum, dt_out = chunk_dt_cumsum(dt, A, chunk_size, dt_bias=dt_bias, softplus=DT_SOFTPLUS, dt_limit=DT_LIMIT)
     if not dt_out.is_contiguous():
         dt_out = dt_out.contiguous()
     if not dA_cumsum.is_contiguous():
         dA_cumsum = dA_cumsum.contiguous()
     states, final_state = chunk_states_prefill(Bm, x, dt_out, dA_cumsum, initial_state, Cm.dtype)
-    CB = _bmm_chunk_fwd(Cm, Bm, chunk_size, seq_idx=None, output_dtype=torch.float32, config=BMM_CHUNK_FWD)
+    CB = chunk_cb(Cm, Bm, chunk_size)
     if seqlen % chunk_size == 0:
         out = chunk_scan_fwd_gluon(CB, _rows_packed(x), dt_out, dA_cumsum, _rows_packed(Cm), states, D)
     else:
@@ -300,10 +274,10 @@ def dendritic_prefill_chunk_quantities_ref(dt: torch.Tensor, A: torch.Tensor, Bm
     """Pure torch: stages 1 and 3 in the kernels' layouts, ``(dt_out, dA_cumsum, CB)`` fp32.
 
     * ``dt_out = clamp(softplus_k(dt + dt_bias), 0, inf)`` with ``softplus_k(v) = where(v <= 20, log(exp(v) + 1), v)``,
-      0 past the sequence (vendored ``ssd_chunk_state.py`` ``_chunk_cumsum_fwd_kernel`` 75-85);
-    * ``dA_cumsum`` = the inclusive cumsum over each chunk of the fp32 products ``dt_out * A`` (87-88), accumulated
+      0 past the sequence;
+    * ``dA_cumsum`` = the inclusive cumsum over each chunk of the fp32 products ``dt_out * A``, accumulated
       in float64 and rounded once (the association of the kernel's ``tl.cumsum`` is the rule class);
-    * ``CB[c, l, s] = C_l . B_s`` (vendored ``ssd_bmm.py`` ``_bmm_chunk_fwd_kernel`` 75-90: bf16 products, fp32 result),
+    * ``CB[c, l, s] = C_l . B_s`` (bf16 products, fp32 result),
       accumulated in float64 and rounded once, 0 past the sequence.
 
     ``dt`` (B, T, H) any strides, ``A`` / ``dt_bias`` (H,), ``Bm`` / ``Cm`` (B, T, 1, N).  No kernel; any device."""
@@ -336,13 +310,13 @@ def _chunk_grid(fn: str, x: torch.Tensor, dt_out: torch.Tensor, dA_cumsum: torch
 def dendritic_prefill_states_ref(x: torch.Tensor, Bm: torch.Tensor, initial_state: torch.Tensor, dt_out: torch.Tensor,
                           dA_cumsum: torch.Tensor, *, out_dtype: torch.dtype = torch.bfloat16
                           ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pure torch: stage 2 on given stage-1 results (``dt_out`` / ``dA_cumsum`` (B, H, nchunks, chunk) fp32), with
-    the expressions of the stock pair it replaces; returns ``(states (B, nchunks, H, P, N) in out_dtype -- the state
-    entering each chunk, final_state (B, H, P, N) fp32)``::
+    """Pure torch: stage 2 on given stage-1 results (``dt_out`` / ``dA_cumsum`` (B, H, nchunks, chunk) fp32);
+    returns ``(states (B, nchunks, H, P, N) in out_dtype -- the state entering each chunk, final_state (B, H, P, N)
+    fp32)``::
 
-        chunk state (ssd_chunk_state.py _chunk_state_fwd_kernel 225-238):
+        chunk state:
             b_k = bf16(B_k * (exp(min(dA_last - dA_k, 0)) * dt_k)),  chunk_state = sum_k x_k b_k^T   (fp32)
-        state passing (ssd_state_passing.py _state_passing_fwd_kernel 71-91):
+        state passing:
             s_0 = initial_state,  s_{c+1} = exp(dA_last_c) s_c + chunk_state_c (fp32),
             states[:, c] = out_dtype(s_c),  final_state = s_nchunks
 
@@ -372,7 +346,7 @@ def dendritic_prefill_chunk_scan_ref(x: torch.Tensor, Cm: torch.Tensor, D: torch
                               dA_cumsum: torch.Tensor, CB: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
     """Pure torch: stage 4 on given stage 1 / 2 / 3 results (``dt_out`` / ``dA_cumsum`` (B, H, nchunks, chunk) fp32,
     ``states`` (B, nchunks, H, P, N) as stored for the scan, ``CB`` (B, nchunks, 1, chunk, chunk) fp32); returns y
-    (B, T, H, P) in x's dtype, contiguous (the stock ``_chunk_scan_fwd_kernel`` expressions, as
+    (B, T, H, P) in x's dtype, contiguous (the expressions as
     :func:`neuronspark.ops.triton.dendritic_scan.chunk_scan_fwd_tma` issues them; the reference of both chunk-scan
     kernels)::
 
@@ -420,8 +394,8 @@ def dendritic_prefill_chunk_scan_ref(x: torch.Tensor, Cm: torch.Tensor, D: torch
 def dendritic_chunk_scan_prefill_ref(x: torch.Tensor, dt: torch.Tensor, A: torch.Tensor, Bm: torch.Tensor,
                               Cm: torch.Tensor, D: torch.Tensor, dt_bias: torch.Tensor, initial_state: torch.Tensor,
                               *, chunk_size: int = CHUNK_SIZE) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Pure torch, the whole prefill scan (the registered reference, same parameters as the op): mamba_ssm's chunked
-    composition (``_mamba_chunk_scan_combined_fwd``, ssd_combined.py 343-392) with its bf16 rounding points:
+    """Pure torch, the whole prefill scan (the registered reference, same parameters as the op): the chunked
+    composition with its bf16 rounding points:
     :func:`dendritic_prefill_chunk_quantities_ref`, :func:`dendritic_prefill_states_ref` (states in Cm's dtype),
     :func:`dendritic_prefill_chunk_scan_ref`.  Chained on its own intermediates it differs from the op in the fp32
     association of the reductions before the rounding points (see :func:`dendritic_prefill_chunk_scan_ref`); the

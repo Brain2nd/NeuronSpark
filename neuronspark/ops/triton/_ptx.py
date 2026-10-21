@@ -344,7 +344,7 @@ def _silu_fast_ftz(v):
 
 @triton.jit
 def _softplus(dt):
-    # the softplus of the SSD kernels (Triton >= 3 form of mamba_ssm/ops/triton/softplus.py)
+    # the write-strength softplus: log(exp(dt) + 1) (callers take dt itself above 20)
     return tl.math.log(tl.math.exp(dt) + 1)
 
 

@@ -25,7 +25,8 @@ import torch.nn.functional as F
 from neuronspark.ops.dendritic_combined import NORM_EPS, dendritic_chunk_scan_soma
 from neuronspark.ops.triton.dendritic_conv import dendritic_conv_silu_ref
 from neuronspark.ops.triton.dendritic_glue import bwd_store_glue, bwd_store_glue_ref
-from neuronspark.ops.triton.dendritic_scan import chunk_cumsum_fwd_ref, chunk_scan_fwd_tma_ref
+from neuronspark.ops.triton.dendritic_chunk import chunk_dt_cumsum_ref
+from neuronspark.ops.triton.dendritic_scan import chunk_scan_fwd_tma_ref
 from neuronspark.ops.triton.dendritic_soma import (
     gated_norm_soma_fwd_ref,
     gated_rmsnorm_bwd,
@@ -110,7 +111,7 @@ def _per_operator(p):
 
     # forward
     stage("conv_out", xbc, dendritic_conv_silu_ref(xBC_in, p["conv_w"], p["conv_b"]))
-    r_dA, r_dt = chunk_cumsum_fwd_ref(dt_raw, A, dt_bias, CHUNK)
+    r_dA, r_dt = chunk_dt_cumsum_ref(dt_raw, A, CHUNK, dt_bias=dt_bias)
     stage("dA_cumsum", dA, r_dA)
     stage("dt", dt, r_dt)
     nc = T // CHUNK

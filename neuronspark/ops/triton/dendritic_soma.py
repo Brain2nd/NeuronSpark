@@ -21,9 +21,9 @@ Pieces:
   the inference read-outs (the prefill one is fused into :mod:`neuronspark.ops.triton.dendritic_gated_norm`, the decode
   one into :mod:`neuronspark.ops.triton.dendritic_step`).
 
-Numerics: the gated norm forward / backward are fp32-reduction-order class vs mamba_ssm's ``layernorm_gated`` (chunk
-lanes instead of one 16384-lane row); the soma forward is the torch chain's arithmetic exactly given n; the soma
-backward is fp32-rounding class (approximate exp2 / division, reordered parameter sums).  Checked with the
+Numerics: the gated norm forward / backward (gated RMSNorm, the gate applied before the norm) are fp32-reduction-order
+class (chunk lanes instead of one 16384-lane row); the soma forward is the torch chain's arithmetic exactly given n; the
+soma backward is fp32-rounding class (approximate exp2 / division, reordered parameter sums).  Checked with the
 per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the references below.
 
 Launch constants: forward R 1 row / program, 16 warps, CH 1024 (NCH 9), n stored for the backward; soma backward ROWS 128, BM 4, BC 1024, 4 warps, STAGES 4 (no masks on whole tiles), sum BR 32 BC 64 4 warps; gated norm backward
@@ -342,9 +342,8 @@ def _soma_bwd(dx, n, theta, gamma, alpha, gn, gtheta, ggamma):
 
 
 def _gated_rmsnorm_bwd(dy, x, weight, rstd, z, dz):
-    """(dx, dz) of mamba_ssm ``_layer_norm_bwd(dy, x, weight, None, eps, None, rstd, z, group_size=N,
-    norm_before_gate=False, is_rms_norm=True, recompute_output=False, dz=dz)`` without the weight gradient; dz is
-    written into the given buffer."""
+    """(dx, dz) of the gated RMSNorm n = g rsqrt(mean(g^2) + eps) w, g = x silu(z) (one group of N columns), given rstd,
+    without the weight gradient; dz is written into the given buffer."""
     M, N = x.shape
     if (x.stride(-1) != 1 or dy.stride(-1) != 1 or tuple(dy.shape) != (M, N) or z is None or z.stride(-1) != 1
             or tuple(z.shape) != (M, N) or tuple(weight.shape) != (N,) or weight.stride(-1) != 1 or dz is None
@@ -434,7 +433,7 @@ def bipolar_release(v: torch.Tensor, theta: torch.Tensor, alpha: float) -> torch
 
 
 def _gated_norm_ref(x, weight, eps, z):
-    """fp32 mamba_ssm layernorm_gated (norm_before_gate False, RMS): g = x silu(z), n = g rsqrt(mean(g^2) + eps) w."""
+    """fp32 gated RMSNorm: g = x silu(z), n = g rsqrt(mean(g^2) + eps) w."""
     zf = z.float()
     g = x.float() * (zf * torch.sigmoid(zf))
     rstd = torch.rsqrt(g.square().mean(dim=-1, keepdim=True) + float(eps))

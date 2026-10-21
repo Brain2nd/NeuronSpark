@@ -27,7 +27,7 @@ segments with carried halos and prefetch, 16 segments per program, 128 channels,
 
 Contract (anything else raises): CUDA bf16 activations whose channel axis has unit stride, a contiguous fp32 (C, 4)
 weight and a contiguous fp32 (C,) bias; ``tail`` fp32 (B, C, 3). The combined dendritic-layer Function passes its
-operands through mamba_ssm's ``ensure_stride`` form (``_ensure_stride``).
+operands through ``_ensure_stride`` (row strides a multiple of 8 elements).
 """
 from __future__ import annotations
 
@@ -505,8 +505,8 @@ def split_dwb(dwb: torch.Tensor, C: int):
 
 
 def _ensure_stride(inp: torch.Tensor) -> torch.Tensor:
-    """mamba_ssm ``ensure_stride`` (ssd_combined.py 59-75): (B, L, C) with C % 8 == 0; a copy only when stride(1) is
-    not a multiple of 8 (never for the projection slice: row stride 18832)."""
+    """(B, L, C) with C % 8 == 0: the tensor itself when its row stride is a multiple of 8 elements, else a contiguous
+    copy (never for the projection slice: row stride 18832)."""
     if inp.shape[2] % 8 != 0:
         raise RuntimeError("neuronspark.dendritic_conv: the number of convolution channels must be a multiple of 8")
     return inp if inp.stride(1) % 8 == 0 else inp.contiguous()

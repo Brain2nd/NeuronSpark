@@ -1,8 +1,8 @@
 """Operators of the NeuronSpark model.
 
-Layout (as in mamba_ssm): ``ops/linear.py`` (fp32-weight-gradient linear), ``ops/dendritic_combined.py`` (training
-dendritic-layer chunk scan + soma Function), ``ops/dendritic_prefill.py`` (prefill dendritic-layer scan),
-``ops/triton/`` (Triton kernels, the vendored mamba SSD kernels under ``ops/triton/mamba/``) and ``ops/gluon/`` (Gluon
+Layout: ``ops/linear.py`` (fp32-weight-gradient linear), ``ops/dendritic_combined.py`` (training dendritic-layer
+chunk scan + soma Function), ``ops/dendritic_prefill.py`` (prefill dendritic-layer scan), ``ops/triton/`` (Triton
+kernels) and ``ops/gluon/`` (Gluon
 kernels for Blackwell). Each family exposes private launchers, an autograd Function where it has a backward, a plain
 public function and a pure-torch ``*_ref``.
 

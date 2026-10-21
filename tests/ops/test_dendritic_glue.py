@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from neuronspark.ops.triton.mamba import BMM_CHUNK_FWD, CHUNK_CUMSUM_FWD_TRAIN, _bmm_chunk_fwd, _chunk_cumsum_fwd
+from neuronspark.ops.triton.dendritic_chunk import chunk_cb, chunk_dt_cumsum
 from neuronspark.ops.triton.dendritic_glue import bwd_store_glue, bwd_store_glue_ref, splits_sum
 from neuronspark.ops.gluon.dendritic_chunk_states import chunk_states_train
 from neuronspark.utils.testing import assert_all_match, rand_tensor
@@ -41,9 +41,8 @@ def operands(B, L, device):
     D = rand_tensor((H,), torch.float32, device) * 0.5
     o = {"proj": proj, "xbc": xbc, "A": A, "dt_bias": dt_bias, "D": D}
     v = views(o)
-    o["dA"], o["dt"] = _chunk_cumsum_fwd(v["dt_raw"], A, CS, dt_bias=dt_bias, dt_softplus=True,
-                                         dt_limit=(0.0, float("inf")), config=CHUNK_CUMSUM_FWD_TRAIN)
-    o["CB"] = _bmm_chunk_fwd(v["C"], v["B"], CS, seq_idx=None, output_dtype=torch.float32, config=BMM_CHUNK_FWD)
+    o["dA"], o["dt"] = chunk_dt_cumsum(v["dt_raw"], A, CS, dt_bias=dt_bias)
+    o["CB"] = chunk_cb(v["C"], v["B"], CS)
     o["states_passed"], _ = chunk_states_train(v["B"], v["x"], o["dt"], o["dA"], torch.bfloat16, passed_fp32=True)
     o["dout"] = (rand_tensor((B, L, H, P), torch.float32, device) * 1e-2).to(torch.bfloat16)
     return o

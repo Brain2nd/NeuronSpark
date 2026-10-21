@@ -15,7 +15,7 @@ import pytest
 import torch
 
 from neuronspark.ops.gluon.dendritic_chunk_scan_dx import chunk_scan_dx_gluon, chunk_scan_dx_gluon_ref
-from neuronspark.ops.triton.mamba import BMM_CHUNK_FWD, CHUNK_CUMSUM_FWD_TRAIN, _bmm_chunk_fwd, _chunk_cumsum_fwd
+from neuronspark.ops.triton.dendritic_chunk import chunk_cb, chunk_dt_cumsum
 from neuronspark.utils.testing import assert_all_match, rand_tensor
 
 pytestmark = [pytest.mark.cuda, pytest.mark.sm100]
@@ -40,9 +40,8 @@ def operands(B, L, device, stress=False):
     x = xbc[..., :DI].unflatten(-1, (H, P))
     Bm = xbc[..., DI:DI + N].unflatten(-1, (1, N))
     Cm = xbc[..., DI + N:].unflatten(-1, (1, N))
-    dA, dt = _chunk_cumsum_fwd(dt_raw, A, CS, dt_bias=dt_bias, dt_softplus=True, dt_limit=(0.0, float("inf")),
-                               config=CHUNK_CUMSUM_FWD_TRAIN)
-    CB = _bmm_chunk_fwd(Cm, Bm, CS, seq_idx=None, output_dtype=torch.float32, config=BMM_CHUNK_FWD)
+    dA, dt = chunk_dt_cumsum(dt_raw, A, CS, dt_bias=dt_bias)
+    CB = chunk_cb(Cm, Bm, CS)
     dout = rand_tensor((B, L, H, P), torch.bfloat16, device)
     dstates = rand_tensor((B, L // CS, H, P, N), torch.bfloat16, device)
     return (x, dt, dA, Bm, CB, dout, dstates, D)

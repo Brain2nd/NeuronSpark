@@ -4,24 +4,32 @@ of the chunk states + state passing (the forward pair runs the Gluon kernels of
 the state gradients run :mod:`neuronspark.ops.gluon.dendritic_dstates`).
 
 Internal pieces (not registry ops); ``db_tma`` and ``dc_tma`` are used by
-:class:`neuronspark.ops.dendritic_combined.DendriticChunkScanSomaFn`:
-* ``db_tma(x, dt, dA_cumsum, dstates, B, ngroups) -> (dB parts, ddA_next workspace, n tiles)`` and
-  ``dc_tma(prev_states, dA_cumsum, dout, C, ngroups) -> (dC parts, ddA_prev workspace, n tiles)``: mamba_ssm
-  ``_chunk_state_bwd_db_kernel`` / ``_chunk_scan_bwd_dc_kernel`` (HAS_DDA_CS, deterministic tile workspaces, ngroups 1)
-  with the per-head tiles loaded by TMA descriptors; the head-split partials (``nheads_per_program =
-  ceil(batch nchunks nheads / #SM)``, SM-count dependent) are summed by
-  :func:`neuronspark.ops.triton.dendritic_glue.splits_sum`.
+:class:`neuronspark.ops.dendritic_combined.DendriticChunkScanSomaFn`.  For chunk c, position m of the chunk and state
+column n (ngroups 1):
 
-Numerics: the stock kernels' per-head expressions and dot shapes in the stock head order.  Checked with the
-per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the stock mamba_ssm kernels they replace and
+* ``db_tma(x, dt, dA_cumsum, dstates, B, ngroups) -> (dB parts, ddA_next workspace, n tiles)``::
+
+      d_h[m, n]  = (x_h[m] . dstates_h[:, n]) exp(min(dA_h[last] - dA_h[m], 0)) dt_h[m]      (dot fp32, then the scale)
+      dB[m, n]   = sum_h d_h[m, n]                     one partial per group of DB_HEADS heads
+      ws_h[m+1]  = sum_n d_h[m, n] B[m, n]             per n tile (m < cs - 1; slot 0 is not written)
+
+* ``dc_tma(prev_states, dA_cumsum, dout, C, ngroups) -> (dC parts, ddA_prev workspace, n tiles)``::
+
+      e_h[m, n]  = (dout_h[m] . prev_states_h[:, n]) exp(dA_h[m])
+      dC[m, n]   = sum_h e_h[m, n]                     one partial per group of DC_HEADS heads
+      ws_h[m]    = sum_n e_h[m, n] C[m, n]             per n tile
+
+  The group partials are summed by :func:`neuronspark.ops.triton.dendritic_glue.splits_sum`, the workspace tiles by
+  :func:`neuronspark.ops.triton.dendritic_glue.ddA_combine` (fixed head groups: the partition does not depend on the
+  device).  x_h / dout_h row blocks and the dstates_h / prev_states_h boxes are loaded through TMA descriptors (rows
+  past the sequence end read as zeros).
+
+Numerics: one bf16 dot per head and tile with fp32 accumulation, the fp32 row scale applied to the dot result, fp32
+sums over heads in head order.  Checked with the per-operator tolerance rule of :mod:`neuronspark.utils.testing`
 against the references below.
 
-Launch constants: db and dc (BM 64, BN 64, 4 warps, 3 stages).  The TMA descriptor kernels need a GPU with TMA
-(sm_90+); the package targets Blackwell (sm_100+).
-
-The kernel bodies are mamba_ssm 2.3.2.post1's (``ssd_chunk_state.py`` ``_chunk_state_bwd_db_kernel``,
-``ssd_chunk_scan.py`` ``_chunk_scan_bwd_dc_kernel``; Apache-2.0, see NOTICE) with the changes stated in each kernel's
-docstring.
+Launch constants: db and dc (BM 64, BN 64, 4 warps), DB_HEADS / DC_HEADS heads per program.  The TMA descriptor kernels
+need a GPU with TMA (sm_90+); the package targets Blackwell (sm_100+).
 """
 from __future__ import annotations
 
@@ -32,8 +40,10 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from neuronspark.ops.triton import num_sms, require_cuda
-from neuronspark.ops.triton.mamba import CHUNK_SCAN_BWD_DC_MIN_BLOCK_N, CHUNK_STATE_BWD_DB_MIN_BLOCK_N
+from neuronspark.ops.triton import require_cuda
+
+#: state columns per slot of the deterministic ddA tile workspaces of db_tma / dc_tma
+WS_TILE_N = 32
 
 __all__ = [
     "DB_CFG", "DC_CFG",
@@ -44,96 +54,85 @@ __all__ = [
 # ------------------------------------------------------------------------------------------------ launch constants
 DB_CFG = (64, 64, 4, 3)        # BM, BN, num_warps, num_stages
 DC_CFG = (64, 64, 4, 3)        # BM, BN, num_warps, num_stages
+DB_HEADS = 32                  # heads per program of db_tma (one dB partial per group)
+DC_HEADS = 32                  # heads per program of dc_tma (one dC partial per group)
 
 
 # ------------------------------------------------------------------------------------------------ kernels
 @triton.jit
-def _db_kernel(XD, DSD, B, DT, DA, DB, WS,
-                chunk_size, dstate, seqlen, batch, nchunks, nheads, nheads_per_program,
-                s_b_b, s_b_l, s_b_n, s_dt_b, s_dt_c, s_dt_h, s_dt_l, s_da_b, s_da_c, s_da_h, s_da_l,
-                s_db_b, s_db_l, s_db_s, s_db_n, s_ws_b, s_ws_c, s_ws_h, s_ws_l, s_ws_t,
-                H: tl.constexpr, P: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
-    """mamba_ssm _chunk_state_bwd_db_kernel (HAS_DDA_CS, no seq_idx, DETERMINISTIC_REDUCTION, ngroups 1, BLOCK_SIZE_K
-    = P) with x_h[m] and dstates_h[:, n] as descriptor boxes (see the module docstring)."""
-    pid_bc = tl.program_id(axis=1)
-    pid_s = tl.program_id(axis=2)
-    num_pid_n = tl.cdiv(dstate, BN)
-    pid_m = tl.program_id(axis=0) // num_pid_n
-    pid_n = tl.program_id(axis=0) % num_pid_n
-    pid_c = pid_bc // batch
-    pid_b = pid_bc - pid_c * batch
-    h0 = pid_s * nheads_per_program
-    offs_m = pid_m * BM + tl.arange(0, BM)
-    offs_n = pid_n * BN + tl.arange(0, BN)
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
-    t0 = pid_c * chunk_size
-    b_ptrs = B + pid_b * s_b_b + (t0 + offs_m[:, None]) * s_b_l + offs_n[None, :] * s_b_n
-    b = tl.load(b_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < dstate), other=0.0).to(tl.float32)
-    dtb = DT + pid_b * s_dt_b + pid_c * s_dt_c + h0 * s_dt_h
-    dab = DA + pid_b * s_da_b + pid_c * s_da_c + h0 * s_da_h
-    wsb = WS + pid_b * s_ws_b + pid_c * s_ws_c + h0 * s_ws_h + pid_n * s_ws_t + offs_m * s_ws_l
+def _db_kernel(XD, SD, B, DT, DA, DB, WS, CS, NS, T, NB, NC, H,
+               s_b_b, s_b_t, s_b_n, s_dt_b, s_dt_h, s_dt_c, s_da_b, s_da_h, s_da_c,
+               s_o_b, s_o_t, s_o_g, s_w_b, s_w_h, s_w_c, s_w_l, s_w_t,
+               P: tl.constexpr, HG: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+    # program: an (m, n) tile of chunk c of batch b over the heads of group grp
+    n_ntile = NS // BN
+    mt = tl.program_id(0) // n_ntile
+    nt = tl.program_id(0) % n_ntile
+    bi = tl.program_id(1) % NB                    # int32 descriptor coordinates; int64 pointer offsets
+    ci = tl.program_id(1) // NB
+    b = bi.to(tl.int64)
+    c = ci.to(tl.int64)
+    grp = tl.program_id(2)
+    t0 = c * CS
+    m = mt * BM + tl.arange(0, BM)
+    n = nt * BN + tl.arange(0, BN)
+    live = m < tl.minimum(CS, T - t0)
+    bv = tl.load(B + b * s_b_b + (t0 + m)[:, None] * s_b_t + n[None, :] * s_b_n, mask=live[:, None],
+                 other=0.0).to(tl.float32)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
-    nheads_iter = min(nheads_per_program, nheads - h0)
-    for h in range(nheads_iter):
-        x = XD.load([pid_b, t0 + pid_m * BM, (h0 + h) * P]).reshape(BM, P)
-        dstates = DSD.load([((pid_b * nchunks + pid_c) * H + h0 + h) * P, pid_n * BN])
-        db = tl.dot(x, dstates)
-        dA_cs_last = tl.load(dab + h * s_da_h + (chunk_size - 1) * s_da_l).to(tl.float32)
-        dA_cs_m = tl.load(dab + h * s_da_h + offs_m * s_da_l, mask=offs_m < chunk_size, other=0.0).to(tl.float32)
-        dt_m = tl.load(dtb + h * s_dt_h + offs_m * s_dt_l, mask=offs_m < chunk_size, other=0.0).to(tl.float32)
-        scale = tl.exp(tl.minimum((dA_cs_last - dA_cs_m), 0.0))
-        db *= (scale * dt_m)[:, None]
-        ddA_cs = tl.sum(db * b, axis=1)
-        tl.store(wsb + h * s_ws_h + s_ws_l, ddA_cs, mask=offs_m < chunk_size - 1)
-        acc += db
-    db_ptrs = DB + pid_b * s_db_b + (t0 + offs_m[:, None]) * s_db_l + pid_s * s_db_s + offs_n[None, :] * s_db_n
-    tl.store(db_ptrs, acc, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < dstate))
+    h_end = tl.minimum(grp * HG + HG, H)
+    for h in range(grp * HG, h_end):
+        xt = XD.load([bi, ci * CS + mt * BM, h * P]).reshape(BM, P)
+        st = SD.load([((bi * NC + ci) * H + h) * P, nt * BN])
+        d = tl.dot(xt, st)
+        hoff = b * s_da_b + h * s_da_h + c * s_da_c
+        last = tl.load(DA + hoff + (CS - 1)).to(tl.float32)
+        da_m = tl.load(DA + hoff + m, mask=m < CS, other=0.0).to(tl.float32)
+        dt_m = tl.load(DT + b * s_dt_b + h * s_dt_h + c * s_dt_c + m, mask=m < CS, other=0.0).to(tl.float32)
+        d = d * (tl.exp(tl.minimum(last - da_m, 0.0)) * dt_m)[:, None]
+        tl.store(WS + b * s_w_b + h * s_w_h + c * s_w_c + nt * s_w_t + (m + 1).to(tl.int64) * s_w_l,
+                 tl.sum(d * bv, axis=1), mask=m < CS - 1)
+        acc += d
+    tl.store(DB + b * s_o_b + (t0 + m)[:, None] * s_o_t + grp * s_o_g + n[None, :], acc, mask=live[:, None])
 
 
 @triton.jit
-def _dc_kernel(DOD, SD, C, DA, DC, WS,
-                chunk_size, dstate, seqlen, batch, nchunks, nheads, nheads_per_program,
-                s_c_b, s_c_l, s_c_n, s_da_b, s_da_c, s_da_h, s_da_l,
-                s_dc_b, s_dc_l, s_dc_s, s_dc_n, s_ws_b, s_ws_c, s_ws_h, s_ws_l, s_ws_t,
-                H: tl.constexpr, P: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
-    """mamba_ssm _chunk_scan_bwd_dc_kernel (HAS_DDA_CS, no seq_idx, DETERMINISTIC_REDUCTION, ngroups 1, BLOCK_SIZE_K
-    = P) with dout_h[m] and prev_states_h[:, n] as descriptor boxes (see the module docstring)."""
-    pid_bc = tl.program_id(axis=1)
-    pid_s = tl.program_id(axis=2)
-    num_pid_n = tl.cdiv(dstate, BN)
-    pid_m = tl.program_id(axis=0) // num_pid_n
-    pid_n = tl.program_id(axis=0) % num_pid_n
-    pid_c = pid_bc // batch
-    pid_b = pid_bc - pid_c * batch
-    h0 = pid_s * nheads_per_program
-    offs_m = pid_m * BM + tl.arange(0, BM)
-    offs_n = pid_n * BN + tl.arange(0, BN)
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
-    t0 = pid_c * chunk_size
-    c_ptrs = C + pid_b * s_c_b + (t0 + offs_m[:, None]) * s_c_l + offs_n[None, :] * s_c_n
-    c = tl.load(c_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < dstate), other=0.0).to(tl.float32)
-    dab = DA + pid_b * s_da_b + pid_c * s_da_c + h0 * s_da_h
-    wsb = WS + pid_b * s_ws_b + pid_c * s_ws_c + h0 * s_ws_h + pid_n * s_ws_t + offs_m * s_ws_l
+def _dc_kernel(OD, SD, C, DA, DC, WS, CS, NS, T, NB, NC, H,
+               s_c_b, s_c_t, s_c_n, s_da_b, s_da_h, s_da_c,
+               s_o_b, s_o_t, s_o_g, s_w_b, s_w_h, s_w_c, s_w_l, s_w_t,
+               P: tl.constexpr, HG: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+    n_ntile = NS // BN
+    mt = tl.program_id(0) // n_ntile
+    nt = tl.program_id(0) % n_ntile
+    bi = tl.program_id(1) % NB                    # int32 descriptor coordinates; int64 pointer offsets
+    ci = tl.program_id(1) // NB
+    b = bi.to(tl.int64)
+    c = ci.to(tl.int64)
+    grp = tl.program_id(2)
+    t0 = c * CS
+    m = mt * BM + tl.arange(0, BM)
+    n = nt * BN + tl.arange(0, BN)
+    live = m < tl.minimum(CS, T - t0)
+    cv = tl.load(C + b * s_c_b + (t0 + m)[:, None] * s_c_t + n[None, :] * s_c_n, mask=live[:, None],
+                 other=0.0).to(tl.float32)
     acc = tl.zeros((BM, BN), dtype=tl.float32)
-    nheads_iter = min(nheads_per_program, nheads - h0)
-    for h in range(nheads_iter):
-        dout = DOD.load([pid_b, t0 + pid_m * BM, (h0 + h) * P]).reshape(BM, P)
-        prev_states = SD.load([((pid_b * nchunks + pid_c) * H + h0 + h) * P, pid_n * BN])
-        dc = tl.dot(dout, prev_states)
-        dA_cs_m = tl.load(dab + h * s_da_h + offs_m * s_da_l, mask=offs_m < chunk_size_limit, other=0.0).to(tl.float32)
-        scale = tl.exp(dA_cs_m)
-        dc *= scale[:, None]
-        ddA_cs = tl.sum(dc * c, axis=1)
-        tl.store(wsb + h * s_ws_h, ddA_cs, mask=offs_m < chunk_size)
-        acc += dc
-    dc_ptrs = DC + pid_b * s_dc_b + (t0 + offs_m[:, None]) * s_dc_l + pid_s * s_dc_s + offs_n[None, :] * s_dc_n
-    tl.store(dc_ptrs, acc, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < dstate))
+    h_end = tl.minimum(grp * HG + HG, H)
+    for h in range(grp * HG, h_end):
+        ot = OD.load([bi, ci * CS + mt * BM, h * P]).reshape(BM, P)
+        st = SD.load([((bi * NC + ci) * H + h) * P, nt * BN])
+        e = tl.dot(ot, st)
+        da_m = tl.load(DA + b * s_da_b + h * s_da_h + c * s_da_c + m, mask=live, other=0.0).to(tl.float32)
+        e = e * tl.exp(da_m)[:, None]
+        tl.store(WS + b * s_w_b + h * s_w_h + c * s_w_c + nt * s_w_t + m.to(tl.int64) * s_w_l,
+                 tl.sum(e * cv, axis=1), mask=m < CS)
+        acc += e
+    tl.store(DC + b * s_o_b + (t0 + m)[:, None] * s_o_t + grp * s_o_g + n[None, :], acc, mask=live[:, None])
 
 
 # ------------------------------------------------------------------------------------------------ launchers
 def _desc3(t4, block_rows):
     """(1, block_rows, P) boxes of a (batch, seqlen, H, P) view whose (H, P) part is contiguous: descriptor over
-    (batch, seqlen, H * P) -- rows t >= seqlen read as zeros (the reference's masks)."""
+    (batch, seqlen, H * P) -- rows t >= seqlen read as zeros."""
     batch, seqlen, nh, p = t4.shape
     if t4.stride(3) != 1 or t4.stride(2) != p:
         raise RuntimeError(f"neuronspark.dendritic_states: (H, P) part of a {tuple(t4.shape)} view with strides "
@@ -141,19 +140,17 @@ def _desc3(t4, block_rows):
     return TensorDescriptor(t4, [batch, seqlen, nh * p], [t4.stride(0), t4.stride(1), 1], [1, block_rows, p])
 
 
-def _split_geometry(x, dstate, BM, BN, min_block_n):
-    tile_count = math.ceil(dstate / min_block_n)
+def _ws_tiles(dstate, BN):
+    tile_count = math.ceil(dstate / WS_TILE_N)
     nvn = triton.cdiv(dstate, BN)
     if nvn > tile_count:
         raise RuntimeError(f"neuronspark.dendritic_states: {nvn} n tiles written, the workspace holds {tile_count}")
-    return tile_count, nvn, num_sms(x.device)
+    return tile_count, nvn
 
 
 def db_tma(x, dt, dA_cumsum, dstates, B, ngroups):
-    """(dB parts (b, l, nsplits, 1, n) fp32, ddA workspace (b, h, c, l, tiles) fp32, n written tiles) of the stock
-    ``_chunk_state_bwd_db_kernel`` (HAS_DDA_CS, no seq_idx, deterministic tile workspaces, ngroups 1, BLOCK_SIZE_K = P)
-    with x_h[m] and dstates_h[:, n] as TMA boxes.  Workspace slot l = 0 of each row is never written (the kernel stores
-    rows m < L - 1 at slot m + 1) and never read."""
+    """(dB parts (b, l, ceil(h / DB_HEADS), 1, n) fp32, ddA workspace (b, h, c, l, tiles) fp32, n written tiles)
+    (module docstring).  Workspace slot l = 0 of each row is never written and never read."""
     require_cuda(x, "db_tma")
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk_size = dt.shape
@@ -167,37 +164,32 @@ def db_tma(x, dt, dA_cumsum, dstates, B, ngroups):
     if dstates.shape != (batch, nchunks, nheads, headdim, dstate) or B.shape != (batch, seqlen, ngroups, dstate):
         raise RuntimeError("neuronspark.db_tma: dstates / B shapes")
     if dstates.dtype != x.dtype:
-        raise RuntimeError(f"neuronspark.db_tma: dstates {dstates.dtype} / x {x.dtype} must agree (the stock kernel "
-                           "casts dstates to x's dtype; the dendritic-layer call passes bf16 both)")
+        raise RuntimeError(f"neuronspark.db_tma: dstates {dstates.dtype} / x {x.dtype} must agree (one bf16 dot)")
     if not dstates.is_contiguous() or B.stride(-1) != 1 or x.stride(-1) != 1 or dt.stride(-1) != 1 \
             or dA_cumsum.stride(-1) != 1 or (chunk_size % BM) or (dstate % BN):
         raise RuntimeError(f"neuronspark.db_tma: operand layouts or chunk {chunk_size} BM {BM} dstate {dstate} BN {BN} "
                            "not supported")
-    tile_count, nvn, sm_count = _split_geometry(x, dstate, BM, BN, CHUNK_STATE_BWD_DB_MIN_BLOCK_N)
+    tile_count, nvn = _ws_tiles(dstate, BN)
     ws = torch.empty(batch, nheads, nchunks, chunk_size, tile_count, device=x.device, dtype=torch.float32)
-    nheads_per_program = max(min(math.ceil(batch * nchunks * nheads / sm_count), nheads), 1)
-    nsplits = triton.cdiv(nheads, nheads_per_program)
-    dB = torch.empty(batch, seqlen, nsplits, ngroups, dstate, device=x.device, dtype=torch.float32)
+    ngrp = triton.cdiv(nheads, DB_HEADS)
+    dB = torch.empty(batch, seqlen, ngrp, ngroups, dstate, device=x.device, dtype=torch.float32)
     xd = _desc3(x, BM)
-    dsd = TensorDescriptor(dstates, [batch * nchunks * nheads * headdim, dstate], [dstate, 1], [headdim, BN])
-    grid = (triton.cdiv(chunk_size, BM) * nvn, batch * nchunks, nsplits)
+    sd = TensorDescriptor(dstates, [batch * nchunks * nheads * headdim, dstate], [dstate, 1], [headdim, BN])
+    grid = (triton.cdiv(chunk_size, BM) * nvn, batch * nchunks, ngrp)
     with torch.cuda.device(x.device.index):
         _db_kernel[grid](
-            xd, dsd, B, dt, dA_cumsum, dB, ws,
-            chunk_size, dstate, seqlen, batch, nchunks, nheads, nheads_per_program,
-            B.stride(0), B.stride(1), B.stride(3),
-            dt.stride(0), dt.stride(2), dt.stride(1), dt.stride(3),
-            dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3),
-            dB.stride(0), dB.stride(1), dB.stride(2), dB.stride(4),
-            ws.stride(0), ws.stride(2), ws.stride(1), ws.stride(3), ws.stride(4),
-            H=nheads, P=headdim, BM=BM, BN=BN, num_warps=nw, num_stages=st)
+            xd, sd, B, dt, dA_cumsum, dB, ws, chunk_size, dstate, seqlen, batch, nchunks, nheads,
+            B.stride(0), B.stride(1), B.stride(3), dt.stride(0), dt.stride(1), dt.stride(2),
+            dA_cumsum.stride(0), dA_cumsum.stride(1), dA_cumsum.stride(2),
+            dB.stride(0), dB.stride(1), dB.stride(2),
+            ws.stride(0), ws.stride(1), ws.stride(2), ws.stride(3), ws.stride(4),
+            P=headdim, HG=DB_HEADS, BM=BM, BN=BN, num_warps=nw, num_stages=st)
     return dB, ws, nvn
 
 
 def dc_tma(prev_states, dA_cumsum, dout, C, ngroups):
-    """(dC parts (b, l, nsplits, 1, n) fp32, ddA_prev workspace (b, h, c, l, tiles) fp32, n written tiles) of the stock
-    ``_chunk_scan_bwd_dc_kernel`` (HAS_DDA_CS, no seq_idx, deterministic tile workspaces, ngroups 1, BLOCK_SIZE_K = P)
-    with dout_h[m] and prev_states_h[:, n] as TMA boxes."""
+    """(dC parts (b, l, ceil(h / DC_HEADS), 1, n) fp32, ddA_prev workspace (b, h, c, l, tiles) fp32, n written tiles)
+    (module docstring)."""
     require_cuda(dout, "dc_tma")
     batch, nchunks, nheads, headdim, dstate = prev_states.shape
     _, seqlen, _, _ = dout.shape
@@ -215,28 +207,25 @@ def dc_tma(prev_states, dA_cumsum, dout, C, ngroups):
             or (chunk_size % BM) or (dstate % BN):
         raise RuntimeError(f"neuronspark.dc_tma: operand layouts or chunk {chunk_size} BM {BM} dstate {dstate} BN {BN} "
                            "not supported")
-    tile_count, nvn, sm_count = _split_geometry(dout, dstate, BM, BN, CHUNK_SCAN_BWD_DC_MIN_BLOCK_N)
+    tile_count, nvn = _ws_tiles(dstate, BN)
     ws = torch.empty(batch, nheads, nchunks, chunk_size, tile_count, device=dout.device, dtype=torch.float32)
-    nheads_per_program = max(min(math.ceil(batch * nchunks * nheads / sm_count), nheads), 1)
-    nsplits = triton.cdiv(nheads, nheads_per_program)
-    dC = torch.empty(batch, seqlen, nsplits, ngroups, dstate, device=dout.device, dtype=torch.float32)
-    dod = _desc3(dout, BM)
+    ngrp = triton.cdiv(nheads, DC_HEADS)
+    dC = torch.empty(batch, seqlen, ngrp, ngroups, dstate, device=dout.device, dtype=torch.float32)
+    od = _desc3(dout, BM)
     sd = TensorDescriptor(prev_states, [batch * nchunks * nheads * headdim, dstate], [dstate, 1], [headdim, BN])
-    grid = (triton.cdiv(chunk_size, BM) * nvn, batch * nchunks, nsplits)
+    grid = (triton.cdiv(chunk_size, BM) * nvn, batch * nchunks, ngrp)
     with torch.cuda.device(dout.device.index):
         _dc_kernel[grid](
-            dod, sd, C, dA_cumsum, dC, ws,
-            chunk_size, dstate, seqlen, batch, nchunks, nheads, nheads_per_program,
-            C.stride(0), C.stride(1), C.stride(3),
-            dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3),
-            dC.stride(0), dC.stride(1), dC.stride(2), dC.stride(4),
-            ws.stride(0), ws.stride(2), ws.stride(1), ws.stride(3), ws.stride(4),
-            H=nheads, P=headdim, BM=BM, BN=BN, num_warps=nw, num_stages=st)
+            od, sd, C, dA_cumsum, dC, ws, chunk_size, dstate, seqlen, batch, nchunks, nheads,
+            C.stride(0), C.stride(1), C.stride(3), dA_cumsum.stride(0), dA_cumsum.stride(1), dA_cumsum.stride(2),
+            dC.stride(0), dC.stride(1), dC.stride(2),
+            ws.stride(0), ws.stride(1), ws.stride(2), ws.stride(3), ws.stride(4),
+            P=headdim, HG=DC_HEADS, BM=BM, BN=BN, num_warps=nw, num_stages=st)
     return dC, ws, nvn
 
 
 # ------------------------------------------------------------------------------------------------ references
-# Pure torch: the stock mamba_ssm math in float64 between the kernels' rounding points, which are reproduced
+# Pure torch: the chunked-scan math in float64 between the kernels' rounding points, which are reproduced
 # (an fp32 operand expression rounded to bf16 before a dot is evaluated in fp32 with the kernel's expression order and
 # then rounded); outputs in the kernels' dtypes.  Partial last chunks are handled by zero padding (x, B, C, dout = 0
 # past seqlen contribute nothing).
@@ -282,8 +271,7 @@ def _forward_states(states_pre: torch.Tensor, dA_last: torch.Tensor) -> torch.Te
 
 
 def csp_fused_ref(B, x, dt, dA_cumsum, out_dtype):
-    """mamba_ssm ``chunk_state_ref`` / ``state_passing_ref`` math (ssd_chunk_state.py 1094-1122, ssd_state_passing.py
-    327-350) with the chunk-state kernel's operand rounding (``chunk_states_train``, as the stock ``_chunk_state_fwd_kernel``:
+    """The chunk states and their passing with the chunk-state kernel's operand rounding (``chunk_states_train``:
     ``scale = exp(min(dA_last - dA_l, 0)) dt_l`` in fp32, ``bf16(B_l scale)`` as the dot operand): states_pre[c] =
     sum_{l in c} x_l bf16(B_l scale_l)^T (float64 sums), then the passing recurrence; returns (states_pre fp32, states in
     out_dtype)."""
@@ -300,14 +288,13 @@ def csp_fused_ref(B, x, dt, dA_cumsum, out_dtype):
 
 
 def csp_prefill_ref(B, x, dt, dA_cumsum, initial_state, out_dtype):
-    """Reference of the prefill chunk states (``ops.gluon.dendritic_chunk_states.chunk_states_prefill``): the replaced
-    pair, mamba_ssm ``_chunk_state_fwd(.., states_in_fp32=True)`` then
-    ``_state_passing_fwd(.., initial_states=initial_state, out_dtype)``, with their expressions and rounding points::
+    """Reference of the prefill chunk states (``ops.gluon.dendritic_chunk_states.chunk_states_prefill``), with the
+    kernel's expressions and rounding points::
 
-        chunk state (_chunk_state_fwd_kernel):  scale_l = exp(min(dA_last - dA_l, 0)) dt_l               fp32
-                                                chunk_state[c] = sum_{l in c} x_l bf16(B_l scale_l)^T      stored fp32
-        state passing (_state_passing_fwd_kernel):  s_0 = initial_state,  states[c] = out_dtype(s_c),
-                                                    s_{c+1} = exp(dA_last[c]) s_c + chunk_state[c]          fp32
+        chunk state:    scale_l = exp(min(dA_last - dA_l, 0)) dt_l                                   fp32
+                        chunk_state[c] = sum_{l in c} x_l bf16(B_l scale_l)^T                          stored fp32
+        state passing:  s_0 = initial_state,  states[c] = out_dtype(s_c),
+                        s_{c+1} = exp(dA_last[c]) s_c + chunk_state[c]                                 fp32
         final_state = s_nchunks (fp32)
 
     ``dA_last[c] = dA_cumsum[:, :, c, -1]``; ``exp`` in the kernels' fp32 form (:func:`_exp_f32`); the sums of the dot
@@ -332,7 +319,7 @@ def csp_prefill_ref(B, x, dt, dA_cumsum, initial_state, out_dtype):
 
 
 def db_tma_ref(x, dt, dA_cumsum, dstates, B, ngroups):
-    """float64 reference of ``db_tma`` after its reductions (mamba_ssm ``_chunk_state_bwd_db`` math): returns
+    """float64 reference of ``db_tma`` after its reductions: returns
     (dB (b, l, 1, n) fp32 = sum over heads, ddA_next (b, h, c, l) fp32 = the workspace summed over its tiles, slot
     l = sum_n db_h[l - 1, n] B[l - 1, n] for l >= 1 and 0 at l = 0)."""
     batch, seqlen, nheads, headdim = x.shape
@@ -350,7 +337,7 @@ def db_tma_ref(x, dt, dA_cumsum, dstates, B, ngroups):
 
 
 def dc_tma_ref(prev_states, dA_cumsum, dout, C, ngroups):
-    """float64 reference of ``dc_tma`` after its reductions (mamba_ssm ``_chunk_scan_bwd_dC`` math): returns
+    """float64 reference of ``dc_tma`` after its reductions: returns
     (dC (b, l, 1, n) fp32 = sum over heads of (dout_h prev_states_h) exp(dA_l), ddA_prev (b, h, c, l) fp32 =
     sum_n dc_h[l, n] C[l, n])."""
     batch, nchunks, nheads, headdim, dstate = prev_states.shape

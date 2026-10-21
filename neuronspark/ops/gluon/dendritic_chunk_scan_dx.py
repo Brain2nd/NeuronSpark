@@ -3,8 +3,8 @@
 rings, asynchronous tcgen05 MMAs into tensor memory), the transposed counterpart of
 :mod:`neuronspark.ops.gluon.dendritic_chunk_scan_fwd`.
 
-``chunk_scan_dx_gluon(x, dt, dA_cumsum, B, CB, dout, dstates, D) -> (dx, ddt, dD)`` computes what mamba_ssm
-``_chunk_scan_chunk_state_bwd_dx`` computes for the dendritic-layer call (D of shape (nheads,), no seq_idx, ngroups 1):
+``chunk_scan_dx_gluon(x, dt, dA_cumsum, B, CB, dout, dstates, D) -> (dx, ddt, dD)`` computes the input backward of the
+chunk scan of the dendritic-layer call (D of shape (nheads,), ngroups 1):
 
     acc[m] = sum_{k >= m} bf16(CB[k, m] exp(min(dA_k - dA_m, 0))) dout_k  +  exp(min(dA_last - dA_m, 0)) (B_m . dstates_c^T)
     dx[m]  = acc[m] dt_m + D dout_m          (rounded once to bf16)

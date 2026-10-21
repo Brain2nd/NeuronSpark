@@ -2,8 +2,8 @@
 for Blackwell GPUs: a persistent, warp-specialised kernel (TMA loads with mbarrier rings, asynchronous tcgen05 MMAs into
 tensor memory).
 
-``chunk_scan_fwd_gluon(cb, x, dt, dA_cumsum, C, states, D) -> out`` computes what mamba_ssm ``_chunk_scan_fwd`` computes
-for the dendritic-layer call (causal, D of shape (nheads,), no z, no seq_idx, ngroups 1):
+``chunk_scan_fwd_gluon(cb, x, dt, dA_cumsum, C, states, D) -> out`` computes the chunk-scan forward of the
+dendritic-layer call (causal, D of shape (nheads,), no gate, ngroups 1):
 
     out[m] = sum_{k <= m} bf16(CB[m, k] exp(min(dA_m - dA_k, 0)) dt_k) x_k  +  exp(dA_m) (C_m . states_c^T)  +  D x_m
 
@@ -20,11 +20,11 @@ DD-deep ring), one MMA warp (the inter-chunk products C . states^T into their ow
 P x products), two compute partitions of NWC warps (one per head: the bf16 P tiles of each K step, the causal mask on
 the diagonal K step), and the default 4-warp epilogue (out = acc_intra + exp(dA_m) acc_inter + x D, bf16 store).
 
-Numerics: the per-element P expression and its bf16 rounding point are the stock kernel's; the decay exponent is
+Numerics: the per-element P expression and its bf16 rounding point are the TMA kernel's; the decay exponent is
 ``ex2.approx.ftz`` of ``min(dA_m - dA_k, 0) log2 e`` (results below 2^-126 flush to zero); the inter-chunk term is
 accumulated separately and added in the epilogue (fp32 order changes).  Checked with the per-operator tolerance rule
 of :mod:`neuronspark.utils.testing` against the TMA chunk-scan forward
-(:func:`neuronspark.ops.triton.dendritic_scan.chunk_scan_fwd_tma`, the stock kernel's arithmetic).  Full chunks only
+(:func:`neuronspark.ops.triton.dendritic_scan.chunk_scan_fwd_tma`, the reference arithmetic).  Full chunks only
 (seqlen % chunk == 0); otherwise it raises.
 
 Launch constants: BM = BK = 64, NH 2 heads per item (one compute partition each), x ring R 2, accumulator buffers NB 2, NWC 4 warps per compute partition, work-split cost W0 3.0, registers 48 (load /
@@ -275,7 +275,7 @@ def _kstep(p_s, p_ready, p_free, tstep, cbv, am, bkv, dtv, offs_m, kt,
     L: gl.constexpr = gl.BlockedLayout([BM // (4 * NWC), CW], [4, 8], [NWC, 1], [1, 0])
     ks = tstep % R
     mbarrier.wait(p_free.index(ks * NH + HH), ((tstep // R) & 1) ^ 1)
-    p = cbv * _ex2ftz(gl.minimum(am - bkv, 0.0) * 1.4426950408889634)       # the stock expression: its bf16 rounding points of P
+    p = cbv * _ex2ftz(gl.minimum(am - bkv, 0.0) * 1.4426950408889634)       # P before its bf16 rounding point
     p = p * dtv
     if MASK:
         offs_k = kt * BK + gl.arange(0, BK, layout=gl.SliceLayout(0, L))
@@ -500,8 +500,7 @@ def chunk_scan_fwd_gluon(cb, x, dt, dA_cumsum, C, states, D):
 
 
 def chunk_scan_fwd_gluon_ref(cb, x, dt, dA_cumsum, C, states, D):
-    """Pure-torch reference: :func:`neuronspark.ops.triton.dendritic_scan.chunk_scan_fwd_tma_ref` (the stock math with
-    its bf16
-    rounding point of the P operand reproduced, float64 sums; the decay without the flush below 2^-126)."""
+    """Pure-torch reference: :func:`neuronspark.ops.triton.dendritic_scan.chunk_scan_fwd_tma_ref` (the math with its
+    bf16 rounding point of the P operand reproduced, float64 sums; the decay without the flush below 2^-126)."""
     from neuronspark.ops.triton.dendritic_scan import chunk_scan_fwd_tma_ref
     return chunk_scan_fwd_tma_ref(cb, x, dt, dA_cumsum, C, states, D)

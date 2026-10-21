@@ -7,21 +7,21 @@ scan's forward and input backward (the training kernels of both are Gluon:
 Internal pieces (not registry ops), all for the dendritic-layer call of the SSD scan (ngroups 1, D of shape (nheads,),
 no z, no seq_idx, dstate <= 128, headdim a power of two):
 
-* ``chunk_scan_fwd_tma(cb, x, dt, dA_cumsum, C, states, D) -> out`` (b, l, h, P) in x's dtype: mamba_ssm
-  ``_chunk_scan_fwd`` with descriptor (TMA) loads of C[m] (1, BM, N), states_h (P, N), CB[m, k] (BM, BK) and x_h[k]
-  (1, BK, P); one K loop with the stock causal mask.  out[m] = exp(dA_m) C_m states^T + sum_{k <= m}
-  bf16(CB[m, k] exp(min(dA_m - dA_k, 0)) dt_k) x_k + D x_m, rounded once to x's dtype.
-* ``dda_asm(v) -> ddA_intra`` (b, h, c, chunk) fp32: ddA[k] = sum_{m >= k} sum_{n < k} T[m, n] from the V grid
-  (mamba_ssm ``_chunk_scan_bwd_ddAcs_stable``'s quantity, summation order changed).
+* ``chunk_scan_fwd_tma(cb, x, dt, dA_cumsum, C, states, D) -> out`` (b, l, h, P) in x's dtype, per chunk::
 
-Numerics vs the stock mamba_ssm kernels: the same per-element expressions, dot shapes and K order (the stock bf16
-rounding points kept); the reduction orders of the ddA partial sums are fp32-rounding class.  Checked with the per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the references below.
+      out[m] = exp(dA_m) C_m states^T + sum_{k <= m} bf16(CB[m, k] exp(min(dA_m - dA_k, 0)) dt_k) x_k + D x_m
 
-Launch constants: forward (BM 64, BK 32, 4 warps, 3 stages; the prefill configuration); the ddA assembly 1 warp over the
-(BS 32, NB 8) V grid.  TMA descriptors: sm_90+.
+  rounded once to x's dtype; C[m] (1, BM, N), states_h (P, N), CB[m, k] (BM, BK) and x_h[k] (1, BK, P) are loaded
+  through TMA descriptors, the k tiles run up to the diagonal under the causal mask.
+* ``dda_asm(v) -> ddA_intra`` (b, h, c, chunk) fp32: ddA[k] = sum_{m >= k} sum_{n < k} T[m, n] from the V grid of the
+  Gluon dda kernel.
 
-The forward kernel is mamba_ssm 2.3.2.post1's ``ssd_chunk_scan.py`` ``_chunk_scan_fwd_kernel`` (Apache-2.0, see
-NOTICE) with the descriptor loads and masks stated in its docstring; the epilogue is the stock code.
+Numerics: one bf16 rounding of the weighted CB tile before its dot (fp32 accumulation), fp32 elementwise; the ddA
+partial sums are fp32-rounding class.  Checked with the per-operator tolerance rule of :mod:`neuronspark.utils.testing`
+against the references below.
+
+Launch constants: forward (BM 64, BK 32, 4 warps, 3 stages); the ddA assembly 1 warp over the (BS 32, NB 8) V grid.
+TMA descriptors: sm_90+.
 """
 from __future__ import annotations
 
@@ -34,13 +34,12 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from neuronspark.ops.triton import require_cuda
-from neuronspark.ops.triton._ptx import _ex2ftz
 from neuronspark.ops.triton.dendritic_states import _chunked, _desc3, _ex2ftz_ref, _exp_f32
 
 __all__ = [
     "FWD_CFG", "DDA_BS", "DDA_NB", "DDA_ASM_WARPS",
     "chunk_scan_fwd_tma", "dda_asm",
-    "chunk_scan_fwd_tma_ref", "chunk_scan_dx_ref", "dda_ref", "ssd_forward_ref", "softplus_ref", "chunk_cumsum_fwd_ref",
+    "chunk_scan_fwd_tma_ref", "chunk_scan_dx_ref", "dda_ref", "ssd_forward_ref", "softplus_ref",
 ]
 
 # ------------------------------------------------------------------------------------------------ launch constants
@@ -84,50 +83,44 @@ def _dda_asm_kernel(V, OUT, svb, svh, svc, sob, soh, soc, BS: tl.constexpr, NB: 
 
 @triton.jit
 def _fwd_kernel(CBD, XD, X, OUT, DT, DA, CD, SD, D,
-                chunk_size, seqlen, batch, nchunks,
+                CS, T, NB, NC,
                 sxb, sxl, sxh, sob, sol, soh, stb, sth, stc, sab, sah, sac,
                 H: tl.constexpr, P: tl.constexpr, N: tl.constexpr, BM: tl.constexpr, BK: tl.constexpr):
-    """mamba_ssm _chunk_scan_fwd_kernel (dendritic-layer call: causal, D (nheads,), no z / seq_idx, dstate <= 128,
-    BLOCK_SIZE_N = headdim) with descriptor loads of C[m] (1, BM, N), states_h (P, N), CB[m, k] (BM, BK) and x_h[k] (1,
-    BK, P); one K
-    loop with the stock causal mask.  The D residual and the output store are the stock code."""
-    pid_bc = tl.program_id(axis=1)
-    pid_c = pid_bc // batch
-    pid_b = pid_bc - pid_c * batch
-    pid_h = tl.program_id(axis=2)
-    pid_m = tl.program_id(axis=0)
-    offs_m = pid_m * BM + tl.arange(0, BM)
-    offs_n = tl.arange(0, P)
-    dab = DA + pid_b * sab + pid_c * sac + pid_h * sah
-    dtb = DT + pid_b * stb + pid_c * stc + pid_h * sth
-    dA_cs_m = tl.load(dab + offs_m, mask=offs_m < chunk_size, other=0.0).to(tl.float32)
-    chunk_size_limit = min(chunk_size, seqlen - pid_c * chunk_size)
-    t0 = pid_c * chunk_size
-    cm = CD.load([pid_b, t0 + pid_m * BM, 0]).reshape(BM, N)
-    stt = SD.load([((pid_b * nchunks + pid_c) * H + pid_h) * P, 0])
-    scale_m = tl.exp(dA_cs_m)
-    acc = tl.dot(cm, tl.trans(stt)) * scale_m[:, None]
-    offs_k = tl.arange(0, BK)
-    row = (pid_b * nchunks + pid_c) * chunk_size + pid_m * BM
-    K_MAX = min((pid_m + 1) * BM, chunk_size_limit)
-    for k in range(0, K_MAX, BK):                             # the reference's causal mask on every k tile
-        cb = CBD.load([row, k])
-        dA_cs_k = tl.load(dab + k + offs_k, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
-        cb *= tl.exp(tl.minimum((dA_cs_m[:, None] - dA_cs_k[None, :]), 0.0))
-        dt_k = tl.load(dtb + k + offs_k, mask=offs_k < chunk_size - k, other=0.0).to(tl.float32)
-        cb *= dt_k
-        cb = tl.where(offs_m[:, None] >= k + offs_k[None, :], cb, 0.0)
-        cb = cb.to(X.dtype.element_ty)
-        xk = XD.load([pid_b, t0 + k, pid_h * P]).reshape(BK, P)
-        acc += tl.dot(cb, xk)
-    Dh = tl.load(D + pid_h).to(tl.float32)
-    xp = X + pid_b * sxb + pid_c * chunk_size * sxl + pid_h * sxh
-    x_residual = tl.load(xp + (offs_m[:, None] * sxl + offs_n[None, :]),
-                         mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < P), other=0.0).to(tl.float32)
-    acc += x_residual * Dh
-    op = OUT + pid_b * sob + pid_c * chunk_size * sol + pid_h * soh
-    tl.store(op + (sol * offs_m[:, None] + offs_n[None, :]), acc,
-             mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < P))
+    # program: rows [r0, r0 + BM) of chunk c of batch b, head h -- the inter-chunk read of the entering state plus the
+    # causal intra-chunk sum, the D skip, one rounding to x's dtype
+    b = tl.program_id(1) % NB
+    c = tl.program_id(1) // NB
+    h = tl.program_id(2)
+    r0 = tl.program_id(0) * BM
+    rows = r0 + tl.arange(0, BM)
+    cols = tl.arange(0, P)
+    t0 = c * CS
+    n_valid = tl.minimum(CS, T - t0)
+    da_base = DA + b * sab + c * sac + h * sah
+    dt_base = DT + b * stb + c * stc + h * sth
+    da_r = tl.load(da_base + rows, mask=rows < CS, other=0.0).to(tl.float32)
+    # inter-chunk: exp(dA_r) C_r . S_h
+    c_rows = CD.load([b, t0 + r0, 0]).reshape(BM, N)
+    s_h = SD.load([((b * NC + c) * H + h) * P, 0])
+    acc = tl.dot(c_rows, tl.trans(s_h)) * tl.exp(da_r)[:, None]
+    # intra-chunk: sum over source positions k <= r of bf16(CB[r, k] exp(min(dA_r - dA_k, 0)) dt_k) x_k
+    kk = tl.arange(0, BK)
+    cb_row = (b * NC + c) * CS + r0
+    k_end = tl.minimum(r0 + BM, n_valid)
+    for k0 in range(0, k_end, BK):
+        w = CBD.load([cb_row, k0])
+        da_k = tl.load(da_base + k0 + kk, mask=kk < CS - k0, other=0.0).to(tl.float32)
+        dt_k = tl.load(dt_base + k0 + kk, mask=kk < CS - k0, other=0.0).to(tl.float32)
+        w = w * tl.exp(tl.minimum(da_r[:, None] - da_k[None, :], 0.0))
+        w = w * dt_k[None, :]
+        w = tl.where(rows[:, None] >= (k0 + kk)[None, :], w, 0.0).to(X.dtype.element_ty)
+        x_k = XD.load([b, t0 + k0, h * P]).reshape(BK, P)
+        acc += tl.dot(w, x_k)
+    live = (rows[:, None] < n_valid) & (cols[None, :] < P)
+    x_r = tl.load(X + b * sxb + (t0 + rows)[:, None] * sxl + h * sxh + cols[None, :], mask=live,
+                  other=0.0).to(tl.float32)
+    acc += x_r * tl.load(D + h).to(tl.float32)
+    tl.store(OUT + b * sob + (t0 + rows)[:, None] * sol + h * soh + cols[None, :], acc, mask=live)
 
 
 # ------------------------------------------------------------------------------------------------ launchers
@@ -144,8 +137,8 @@ def dda_asm(v):
 
 
 def chunk_scan_fwd_tma(cb, x, dt, dA_cumsum, C, states, D):
-    """out (batch, seqlen, nheads, headdim) in x's dtype = mamba_ssm ``_chunk_scan_fwd(cb, x, dt, dA_cumsum, C, states,
-    D=D, z=None, seq_idx=None)[0]`` for the dendritic-layer call (see _fwd_kernel). cb (b, nc, 1, chunk, chunk) fp32
+    """out (batch, seqlen, nheads, headdim) in x's dtype: the chunk-scan forward of the module docstring for the
+    dendritic-layer call (ngroups 1, D (nheads,), no gate). cb (b, nc, 1, chunk, chunk) fp32
     contiguous; x (b, l, h, P) with a contiguous (h, P) part; dt / dA_cumsum (b, h, nc, chunk) with unit last stride; C
     (b, l, 1, N) with unit last stride; states (b, nc, h, P, N) contiguous in C's dtype; D (h,) contiguous. Partial last
     chunks are
@@ -191,12 +184,10 @@ def chunk_scan_fwd_tma(cb, x, dt, dA_cumsum, C, states, D):
 
 
 # ------------------------------------------------------------------------------------------------ references
-# Pure torch.  The piece references (``chunk_scan_fwd_tma_ref``, ``chunk_scan_dx_ref``, ``dda_ref``) are the stock mamba_ssm
-# math in float64 between the kernels' rounding points, which they reproduce: the masked fp32 operand tile
-# that a kernel rounds to bf16 before its dot is evaluated in fp32 with the kernel's expression order (the decay
-# ``tl.exp`` as ``exp2(t * log2 e)``, see ``dendritic_states._exp_f32``) and rounded the same way.  ``ssd_forward_ref``
-# is
-# the
+# Pure torch.  The piece references (``chunk_scan_fwd_tma_ref``, ``chunk_scan_dx_ref``, ``dda_ref``) evaluate the
+# chunked scan in float64 between the kernels' rounding points, which they reproduce: the masked fp32 operand tile that
+# a kernel rounds to bf16 before its dot is evaluated in fp32 with the kernel's expression order (the decay ``tl.exp``
+# as ``exp2(t * log2 e)``, see ``dendritic_states._exp_f32``) and rounded the same way.  ``ssd_forward_ref`` is the
 # float32 differentiable whole-forward math without the kernels' internal roundings.
 def _tril(chunk: int, device) -> torch.Tensor:
     i = torch.arange(chunk, device=device)
@@ -204,8 +195,7 @@ def _tril(chunk: int, device) -> torch.Tensor:
 
 
 def chunk_scan_fwd_tma_ref(cb, x, dt, dA_cumsum, C, states, D):
-    """Reference of ``chunk_scan_fwd_tma`` (mamba_ssm ssd_chunk_scan.py ``_chunk_scan_fwd_kernel``; ``_fwd_kernel``'s
-    expressions): out[m] = exp(dA_m) C_m states_c^T
+    """Reference of ``chunk_scan_fwd_tma`` (``_fwd_kernel``'s expressions): out[m] = exp(dA_m) C_m states_c^T
     + sum_{k <= m} P[m, k] x_k + D x_m with the dot operand P = bf16(where(m >= k, (CB[m, k] exp(min(dA_m - dA_k, 0)))
     dt_k, 0)) formed in fp32 as the kernel forms it (``cb *= exp(..)``, ``cb *= dt_k``, mask, cast to x's dtype);
     float64 sums; the result in x's dtype."""
@@ -225,12 +215,11 @@ def chunk_scan_fwd_tma_ref(cb, x, dt, dA_cumsum, C, states, D):
 
 def chunk_scan_dx_ref(x, dt, dA_cumsum, B, CB, dout, dstates, D, dx):
     """Reference of the chunk-scan input backward
-    (:func:`neuronspark.ops.gluon.dendritic_chunk_scan_dx.chunk_scan_dx_gluon`; mamba_ssm
-    ``_chunk_scan_chunk_state_bwd_dx`` math with the FTZ decay): acc[m] = exp(min(dA_last - dA_m, 0)) B_m dstates^T +
-    sum_{k >= m} K[k, m] dout_k with the dot operand K = bf16(where(k >= m, CB[k, m] ex2ftz(min(dA_k - dA_m, 0) log2 e),
-    0)) formed in fp32 as the kernel forms it (cast to dout's dtype); dx = acc dt_m + D dout_m; ddt[m] = sum_p acc x_m;
-    dD = sum dout x; float64 sums.  Returns (dx in x's dtype, ddt (b, h, c, l) fp32, dD (h,)
-    fp32); ``dx`` (the output buffer argument of the kernel launcher) is ignored."""
+    (:func:`neuronspark.ops.gluon.dendritic_chunk_scan_dx.chunk_scan_dx_gluon`, with the FTZ decay): acc[m] =
+    exp(min(dA_last - dA_m, 0)) B_m dstates^T + sum_{k >= m} K[k, m] dout_k with the dot operand K = bf16(where(k >= m,
+    CB[k, m] ex2ftz(min(dA_k - dA_m, 0) log2 e), 0)) formed in fp32 as the kernel forms it (cast to dout's dtype); dx =
+    acc dt_m + D dout_m; ddt[m] = sum_p acc x_m; dD = sum dout x; float64 sums.  Returns (dx in x's dtype, ddt (b, h, c,
+    l) fp32, dD (h,) fp32); ``dx`` (the output buffer argument of the kernel launcher) is ignored."""
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk = dt.shape
     xc = _chunked(x, nchunks, chunk)
@@ -252,9 +241,9 @@ def chunk_scan_dx_ref(x, dt, dA_cumsum, B, CB, dout, dstates, D, dx):
 
 
 def dda_ref(x, dt, dA_cumsum, dout, cb):
-    """float64 reference of ``gluon.dendritic_dda.dda_gluon`` + ``dda_asm`` (mamba_ssm ``_chunk_scan_bwd_dcb`` and
-    ``_chunk_scan_bwd_ddAcs_stable`` math): g_h[m, n] = (dout_h[m] . x_h[n]) dt_n exp(min(dA_m - dA_n, 0));
-    dCB[m, n] = sum_h g_h[m, n] for n <= m (0 above); ddA_intra[k] = sum_{m >= k} sum_{n < k} g_h[m, n] CB[m, n] (n < m).
+    """float64 reference of ``gluon.dendritic_dda.dda_gluon`` + ``dda_asm``: g_h[m, n] = (dout_h[m] . x_h[n]) dt_n
+    exp(min(dA_m - dA_n, 0)); dCB[m, n] = sum_h g_h[m, n] for n <= m (0 above); ddA_intra[k] = sum_{m >= k} sum_{n <
+    k} g_h[m, n] CB[m, n] (n < m).
     Returns (dCB (b, c, 1, chunk, chunk) fp32, ddA_intra (b, h, c, chunk) fp32)."""
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk = dt.shape
@@ -273,31 +262,14 @@ def dda_ref(x, dt, dA_cumsum, dout, cb):
 
 
 def softplus_ref(v: torch.Tensor) -> torch.Tensor:
-    """The SSD kernels' softplus (Triton >= 3 form of mamba_ssm ops/triton/softplus.py): ``where(v <= 20,
-    log(exp(v) + 1), v)``; the exponential is taken of ``min(v, 20)`` so that the unselected branch stays finite under
-    autograd (the selected values are unchanged)."""
+    """The write-strength softplus of the kernels: ``where(v <= 20, log(exp(v) + 1), v)``; the exponential is taken of
+    ``min(v, 20)`` so that the unselected branch stays finite under autograd (the selected values are unchanged)."""
     return torch.where(v <= 20.0, torch.log(torch.exp(torch.clamp_max(v, 20.0)) + 1.0), v)
 
 
-def chunk_cumsum_fwd_ref(dt_raw, A, dt_bias, chunk_size):
-    """Reference of the vendored ``_chunk_cumsum_fwd`` for the dendritic-layer call (dt_softplus, dt_limit (0, inf);
-    ssd_chunk_state.py ``_chunk_cumsum_fwd_kernel``): dt = max(softplus(dt_raw + dt_bias), 0) in fp32 (0 past seqlen),
-    dA_cumsum = the per-chunk cumulative sum of dt A (float64 sums).  dt_raw (b, l, h), A / dt_bias (h,); returns
-    (dA_cumsum, dt) (b, h, nchunks, chunk) fp32, the kernel's output order."""
-    batch, seqlen, nheads = dt_raw.shape
-    nchunks = math.ceil(seqlen / chunk_size)
-    L = nchunks * chunk_size
-    dt = torch.clamp_min(softplus_ref(dt_raw.float() + dt_bias.float()), 0.0)          # (b, l, h)
-    if L != seqlen:
-        dt = F.pad(dt, (0, 0, 0, L - seqlen))
-    dt = dt.reshape(batch, nchunks, chunk_size, nheads).permute(0, 3, 1, 2).contiguous()   # (b, h, c, chunk)
-    dA_cs = torch.cumsum(dt.double() * A.float().double()[None, :, None, None], dim=-1)
-    return dA_cs.float(), dt
-
-
 def ssd_forward_ref(x, dt_raw, A, B, C, chunk_size, D, dt_bias):
-    """Pure-torch float32 SSD forward of the dendritic-layer call (differentiable; mamba_ssm
-    ``_mamba_chunk_scan_combined_fwd`` math, ssd_combined.py 343-392): dt = softplus(dt_raw + dt_bias) (kernel form), dA
+    """Pure-torch float32 chunked-scan forward of the dendritic-layer call (differentiable): dt = softplus(dt_raw +
+    dt_bias) (kernel form), dA
     = dt A per step, chunked: intra-chunk y_diag[l] = sum_{s <= l} (C_l . B_s) exp(dA_cs[l] - dA_cs[s]) dt_s x_s, chunk
     states and their passing, the inter-chunk term exp(dA_cs[l]) C_l s_c^T, and D x. x (b, l, h, P), dt_raw (b, l, h), A
     / D / dt_bias (h,),

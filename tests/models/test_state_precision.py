@@ -160,7 +160,7 @@ def test_decode_with_either_storage(model, b):
                      teacher_outputs=ref16.sequences)
     graph32 = decode(prompt, model, L, cg=True, output_scores=True, dendritic_state_dtype="float32",
                      teacher_outputs=ref16.sequences)
-    assert model._decoding_cache.inference_params.dendritic_state_dtype == torch.float32
+    assert model._decode_graph.params.dendritic_state_dtype == torch.float32
     for step, (g, e) in enumerate(zip(graph32.scores, eager32.scores)):
         assert_match(g, e, f"b{b} fp32 state step{step}: graph vs eager")
     drift, results = [], []

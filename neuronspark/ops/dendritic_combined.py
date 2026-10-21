@@ -1,6 +1,5 @@
 """The dendritic neuron layer's chunk scan with its soma read-out as one autograd Function (training regime): the
-analogue of mamba_ssm's ``mamba_split_conv1d_scan_combined`` for the dendritic-layer call, store-not-recompute, with the
-gated norm and the soma fused at the end.
+synaptic filter, the chunked scan, the gated norm and the soma in one Function, store-not-recompute.
 
 Registry op ``dendritic_chunk_scan_soma(zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma, *, alpha=8.0,
 chunk_size=256) -> xs``:
@@ -16,10 +15,10 @@ chunk_size=256) -> xs``:
 
 Forward:
   1. causal conv k4 + SiLU on x|B|C (:mod:`neuronspark.ops.triton.dendritic_conv`), output (B, T, C) bf16 kept;
-  2. dt = softplus(dt + dt_bias) and its per-chunk cumsum of dt A (vendored mamba_ssm ``_chunk_cumsum_fwd``);
+  2. dt = softplus(dt + dt_bias) and its per-chunk cumsum of dt A (``dendritic_chunk.chunk_dt_cumsum``);
   3. chunk states + state passing (Gluon ``chunk_states_train``, Blackwell): the passed states (the state entering each
      chunk) kept in fp32 for the backward's state gradients, and in bf16 for the chunk scan;
-  4. CB = C B^T per chunk (vendored ``_bmm_chunk_fwd``, fp32), kept;
+  4. CB = C B^T per chunk (``dendritic_chunk.chunk_cb``, fp32), kept;
   5. the chunk scan (Gluon ``chunk_scan_fwd_gluon``, Blackwell), y bf16 kept;
   6. gated RMSNorm (unit weight, eps 1e-5) + bipolar soma + gamma (``dendritic_soma.gated_norm_soma_fwd``): xs, with the
   norm's
@@ -47,7 +46,7 @@ import torch
 
 from neuronspark.ops.gluon.dendritic_chunk_scan_fwd import chunk_scan_fwd_gluon
 from neuronspark.ops.triton import require_cuda, require_sm100
-from neuronspark.ops.triton.mamba import BMM_CHUNK_FWD, CHUNK_CUMSUM_FWD_TRAIN, _bmm_chunk_fwd, _chunk_cumsum_fwd
+from neuronspark.ops.triton.dendritic_chunk import chunk_cb, chunk_dt_cumsum
 from neuronspark.ops.triton.dendritic_conv import (_conv_bwd, _conv_fwd, _ensure_stride, dendritic_conv_silu_ref,
                                                    split_dwb)
 from neuronspark.ops.gluon.dendritic_chunk_states import chunk_states_train
@@ -112,10 +111,9 @@ def _dendritic_chunk_scan_soma_fwd_op(zxbcdt, conv_w, conv_b, dt_bias, A, D, the
     # tensors are the ones the kernels read
     if B.stride(-1) != 1 or C.stride(-1) != 1 or (x.stride(-1) != 1 and x.stride(1) != 1) or D.stride(-1) != 1:
         raise RuntimeError("neuronspark.dendritic_chunk_scan_soma: x / B / C / D are not in the dendritic-layer layout")
-    dA_cumsum, dt_sp = _chunk_cumsum_fwd(dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=True, dt_limit=_DT_LIMIT,
-                                         config=CHUNK_CUMSUM_FWD_TRAIN)
+    dA_cumsum, dt_sp = chunk_dt_cumsum(dt, A, chunk_size, dt_bias=dt_bias, softplus=True, dt_limit=_DT_LIMIT)
     states_passed, states = chunk_states_train(B, x, dt_sp, dA_cumsum, C.dtype, passed_fp32=True)
-    CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=None, output_dtype=torch.float32, config=BMM_CHUNK_FWD)
+    CB = chunk_cb(C, B, chunk_size)
     out_x = chunk_scan_fwd_gluon(CB, x, dt_sp, dA_cumsum, C, states, D)
     x_rms = out_x.view(batch * seqlen, dim)
     z_rms = z.view(batch * seqlen, dim)

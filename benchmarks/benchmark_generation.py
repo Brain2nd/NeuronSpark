@@ -3,9 +3,9 @@
 
 * **prefill**: one call ``model(ids (b, L), inference_params=cache, num_last_tokens=1)`` on a cache reset to the row
   start (the reset is not timed), CUDA events around the call, at every b of ``--prefill-batches``;
-* **decode step**: one greedy step through the captured single-token step (``update_graph_cache`` /
-  ``capture_graph``: static input copy, graph replay, logits copy) and the argmax of its logits, after a prefill of the
-  prompt, CUDA events around each of ``--decode-steps`` steps, at every b of ``--decode-batches``; with ``--cupti``
+* **decode step**: one greedy step through the captured single-token step (``prepare_decode_graph`` /
+  ``DecodeGraph.step``: static input copy, graph replay, logits copy) and the argmax of its logits, after a prefill of
+  the prompt, CUDA events around each of ``--decode-steps`` steps, at every b of ``--decode-batches``; with ``--cupti``
   also the summed device time of one replay's kernels (CUPTI, L2 flushed before each replay: a cold-cache figure, not
   the steady state);
 * **generate**: ``decode(ids, model, L + steps, cg=True)`` end to end (host clock, device synchronised), giving the
@@ -66,7 +66,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     from neuronspark.models.neuronspark_lm import NeuronSparkLMHeadModel
     from neuronspark.utils.cache import resolve_dendritic_state_dtype
-    from neuronspark.utils.generation import decode, update_graph_cache
+    from neuronspark.utils.generation import decode, prepare_decode_graph
 
     if not torch.cuda.is_available():
         raise SystemExit("needs a CUDA GPU")
@@ -119,9 +119,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # ---- decode steps (CUDA-graph replay) and generate
     for b in _sizes(a.decode_batches):
         ids = prompts[:b]
-        model._decoding_cache = update_graph_cache(model, model._decoding_cache, b, L, W, dendritic_state_dtype=dt)
-        cache = model._decoding_cache
-        ip = cache.inference_params
+        graph = prepare_decode_graph(model, b, W, dendritic_state_dtype=dt)
+        ip = graph.params
         trial_medians, every = [], []
         for _ in range(int(a.trials)):
             ip.reset()
@@ -130,7 +129,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             state = {"tok": tok}
 
             def one_step(state=state):
-                state["tok"] = cache.run(state["tok"])[:, -1].argmax(-1, keepdim=True)
+                state["tok"] = graph.step(state["tok"]).argmax(-1, keepdim=True)
 
             ms, med, times = cuda_event_time_ms(one_step, warmup=0, iters=steps, trials=1, device=dev)
             trial_medians.append(med[0])
@@ -143,7 +142,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             with torch.no_grad():
                 tok = model(ids, inference_params=ip, num_last_tokens=1).logits[:, -1].argmax(-1, keepdim=True)
             iters = max(1, min(50, (W - L) // (a.trials + 1) - 1))
-            k_ms, k_med, names = cupti_time_ms(lambda: cache.run(tok), warmup=1, iters=iters, trials=a.trials,
+            k_ms, k_med, names = cupti_time_ms(lambda: graph.step(tok), warmup=1, iters=iters, trials=a.trials,
                                                device=dev)
             entry.update({"kernel_ms": k_ms, "kernel_trial_medians": k_med, "kernels": len(names)})
             print(f"  kernel time per replay (CUPTI, cold L2): {format_ms(k_ms, k_med)}, {len(names)} distinct "

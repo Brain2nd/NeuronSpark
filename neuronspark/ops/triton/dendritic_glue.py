@@ -1,39 +1,37 @@
 """dendritic-layer SSD backward driver: the store-not-recompute backward of the SSD scan of the dendritic-layer call
 (training).
 
-``bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB, dC, dA_cumsum, dt_sp, CB,
-states_passed) -> (dx, ddt, dA, dB, dC, dD, ddt_bias)`` is mamba_ssm ``_mamba_chunk_scan_combined_bwd`` for the
-dendritic-layer call (z None, no initial / final states, no seq_idx, dt_softplus, dt_limit (0, inf), ngroups 1, D
-(nheads,)) on the tensors the forward kept (dA_cumsum, softplus'd dt, CB, the fp32 passed states) instead of recomputing
-them. Inputs: dout (b, l, h, P) bf16 (the gated norm's input gradient), x (b, l, h, P) bf16 / B, C (b, l, 1, N) bf16
-views of the conv output, dt_raw (b, l, h) bf16 view of the projection, A / D / dt_bias (h,) fp32, dx / ddt / dB / dC
-the output buffers (views of the projection and conv-input gradients, written in place), dA_cumsum / dt_sp (b, h, nc,
-chunk) fp32, CB (b, nc, 1, chunk, chunk) fp32, states_passed (b, nc, h, P, N) fp32 (the state entering each chunk).
-Returns dx, ddt, dB, dC (the given buffers), dA, dD, ddt_bias (h,) fp32. Whole chunks only (l % chunk == 0, the training
-regime; the chunk-scan input backward is a whole-chunk Gluon kernel): otherwise it raises.
+``bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB, dC, dA_cumsum, dt_sp, CB, states_passed)
+-> (dx, ddt, dA, dB, dC, dD, ddt_bias)`` is the backward of the chunked scan of the dendritic-layer call (no gate, no
+initial / final states, dt softplus with limit (0, inf), ngroups 1, D (nheads,)) on the tensors the forward kept
+(dA_cumsum, softplus'd dt, CB, the fp32 passed states) instead of recomputing them. Inputs: dout (b, l, h, P) bf16 (the
+gated norm's input gradient), x (b, l, h, P) bf16 / B, C (b, l, 1, N) bf16 views of the conv output, dt_raw (b, l, h)
+bf16 view of the projection, A / D / dt_bias (h,) fp32, dx / ddt / dB / dC the output buffers (views of the projection
+and conv-input gradients, written in place), dA_cumsum / dt_sp (b, h, nc, chunk) fp32, CB (b, nc, 1, chunk, chunk) fp32,
+states_passed (b, nc, h, P, N) fp32 (the state entering each chunk). Returns dx, ddt, dB, dC (the given buffers), dA,
+dD, ddt_bias (h,) fp32. Whole chunks only (l % chunk == 0, the training regime; the chunk-scan input backward is a
+whole-chunk Gluon kernel): otherwise it raises.
 
 The sequence (each step's order and operands are fixed):
   1. ``gluon.dendritic_dstates.dstates_train``: dstates (bf16), the state-passing ddA workspace, the passed states
   (bf16); 2. ``gluon.dendritic_chunk_scan_dx.chunk_scan_dx_gluon``: dx, ddt (fp32 per position), dD; 3.
   ``dendritic_states.db_tma`` / ``dc_tma``: dB / dC head-split partials and the ddA_next / ddA_prev workspaces; 4.
   ``gluon.dendritic_dda.dda_gluon``: dCB head-split partials and the V grid of the intra-chunk ddA; 5. ``splits_sum``:
-  dB, dC, dCB = sums over the head-split axis (one launch); 6. vendored ``_bmm_chunk_bwd`` twice: dB += C dCB, dC += B
-  dCB^T (dot operands bf16: the fp32 dCB is rounded to bf16
-     for the dot, fp32 accumulation + residual, bf16 store into the given buffers);
+  dB, dC, dCB = sums over the head-split axis (one launch); 6. ``dendritic_chunk.chunk_cb_bwd`` twice: dB += dCB^T C,
+  dC += dCB B (dot operands bf16: the fp32 dCB is rounded to bf16 for the dot, fp32 accumulation + residual, bf16
+  store into the given buffers);
   7. ``dendritic_scan.dda_asm``: the intra-chunk ddA;
   8. ``ddA_combine``: ddA = intra + (cumsum(ddA_next) + reverse_cumsum(ddA_prev + the state-passing block sum at the
      chunk's last position)) per (b, h, c) row;
-  9. ``chunk_cumsum_bwd``: the vendored ``_chunk_cumsum_bwd_kernel`` (deterministic workspaces) + ``_fin_cs_kernel``:
+  9. ``chunk_cumsum_bwd``: ``dendritic_chunk.chunk_dt_cumsum_bwd`` (per-(b, c) workspaces) + ``_fin_cs_kernel``:
      ddt into the given buffer (bf16), dA and ddt_bias fp32 sums over (b, c).
 
-Numerics: every elementwise operation is mamba_ssm's; the ORDER of the fp32 sums changes (register tree sums /
-tl.cumsum instead of ATen's reduce and scan kernels, no zero padding added): fp32 reduction-order class, checked with
-the per-operator tolerance rule of :mod:`neuronspark.utils.testing` against :func:`bwd_store_glue_ref`.
+Numerics: fp32 elementwise; the fp32 sums run as register tree sums / tl.cumsum (fp32 reduction-order class), checked
+with the per-operator tolerance rule of :mod:`neuronspark.utils.testing` against :func:`bwd_store_glue_ref`.
 
 Launch constants: ``_splits_kernel`` BLOCK 1024, 4 warps; ``_ddA_kernel`` BR = min(16, 4096 / pow2(chunk)), 4 warps;
-``_fin_cs_kernel`` BRW 64, BH = min(64, pow2(nheads)), 4 warps; vendored kernels per
-:mod:`neuronspark.ops.triton.mamba` (``CHUNK_CUMSUM_BWD_TRAIN``, ``BMM_CHUNK_BWD_TRAIN``), launched directly with
-these fixed configurations (no autotuner).  The dx finish kernel lives with its only caller in
+``_fin_cs_kernel`` BRW 64, BH = min(64, pow2(nheads)), 4 warps; the per-chunk kernels at the configurations of
+:mod:`neuronspark.ops.triton.dendritic_chunk` (no autotuner).  The dx finish kernel lives with its only caller in
 :mod:`neuronspark.ops.triton.dendritic_scan`.
 """
 from __future__ import annotations
@@ -45,12 +43,7 @@ import triton
 import triton.language as tl
 
 from neuronspark.ops.triton import require_cuda
-from neuronspark.ops.triton.mamba import (
-    BMM_CHUNK_BWD_TRAIN,
-    CHUNK_CUMSUM_BWD_TRAIN,
-    _bmm_chunk_bwd,
-    _chunk_cumsum_bwd_kernel,
-)
+from neuronspark.ops.triton.dendritic_chunk import chunk_cb_bwd, chunk_dt_cumsum_bwd
 from neuronspark.ops.gluon.dendritic_chunk_scan_dx import chunk_scan_dx_gluon
 from neuronspark.ops.gluon.dendritic_dda import dda_gluon
 from neuronspark.ops.triton.dendritic_scan import chunk_scan_dx_ref, dda_asm, dda_ref, softplus_ref
@@ -179,44 +172,22 @@ def ddA_combine(ws_st, nv_st, ws_db, nt_db, ws_dc, nt_dc, ws_sp, nv_sp):
 
 
 def chunk_cumsum_bwd(ddA, ddt_out, dt, A, dt_bias, ddt):
-    """mamba_ssm ``_chunk_cumsum_bwd`` (dt_softplus True, dt_limit (0, inf)) with per-(batch, chunk) workspaces and one
-    finalize launch for dA / ddt_bias: (ddt (written into ``ddt`` when given), dA fp32 (h,), ddt_bias fp32 (h,)).
-    The kernel stores every workspace slot (deterministic reduction), so the workspaces are not zero-filled."""
+    """Backward of the write-strength transform (softplus, limit (0, inf)): (ddt (written into ``ddt`` when given),
+    dA fp32 (h,), ddt_bias fp32 (h,)) -- :func:`neuronspark.ops.triton.dendritic_chunk.chunk_dt_cumsum_bwd` into
+    per-(batch, chunk) workspaces (every slot written) and one finalize launch for dA / ddt_bias."""
     batch, seqlen, nheads = dt.shape
     _, _, nchunks, chunk_size = ddA.shape
     if ddA.shape != (batch, nheads, nchunks, chunk_size) or ddt_out.shape != (batch, nheads, nchunks, chunk_size):
         raise RuntimeError("neuronspark.dendritic_glue.chunk_cumsum_bwd: ddA / ddt_out shapes")
     if A.shape != (nheads,) or dt_bias is None or dt_bias.shape != (nheads,):
         raise RuntimeError("neuronspark.dendritic_glue.chunk_cumsum_bwd: A / dt_bias must be (nheads,)")
-    ws_b = torch.empty(batch, nchunks, nheads, device=dt.device, dtype=torch.float32)
-    ddt_bias = torch.empty_like(dt_bias, dtype=torch.float32)
-    if ddt is not None:
-        if ddt.shape != dt.shape:
-            raise RuntimeError("neuronspark.dendritic_glue.chunk_cumsum_bwd: ddt must have dt's shape")
-    else:
+    if ddt is None:
         ddt = torch.empty_like(dt)
-    dA = torch.empty_like(A, dtype=torch.float32)
     ws_a = torch.empty(batch, nchunks, nheads, device=dt.device, dtype=torch.float32)
-    meta, num_warps, num_stages = CHUNK_CUMSUM_BWD_TRAIN
-    grid = (batch, nchunks, triton.cdiv(nheads, meta["BLOCK_SIZE_H"]))
-    with torch.cuda.device(dt.device.index):
-        _chunk_cumsum_bwd_kernel[grid](
-            ddA, ddt_out, dt, A, dt_bias, ddt, ws_a, ws_b,
-            batch, seqlen, nheads, chunk_size,
-            0.0, float("inf"),
-            ddA.stride(0), ddA.stride(2), ddA.stride(1), ddA.stride(3),
-            ddt_out.stride(0), ddt_out.stride(2), ddt_out.stride(1), ddt_out.stride(3),
-            dt.stride(0), dt.stride(1), dt.stride(2),
-            A.stride(0),
-            dt_bias.stride(0),
-            ddt.stride(0), ddt.stride(1), ddt.stride(2),
-            ws_a.stride(0), ws_a.stride(1), ws_a.stride(-1),
-            ws_b.stride(0), ws_b.stride(1), ws_b.stride(-1),
-            True,
-            HAS_DT_BIAS=True,
-            BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
-            DETERMINISTIC_REDUCTION=True,
-            **meta, num_warps=num_warps, num_stages=num_stages)
+    ws_b = torch.empty(batch, nchunks, nheads, device=dt.device, dtype=torch.float32)
+    chunk_dt_cumsum_bwd(ddA, ddt_out, dt, A, dt_bias, ddt, ws_a, ws_b)
+    dA = torch.empty_like(A, dtype=torch.float32)
+    ddt_bias = torch.empty_like(dt_bias, dtype=torch.float32)
     BH = min(64, _p2(nheads))
     _fin_cs_kernel[(triton.cdiv(nheads, BH),)](ws_a, ws_b, dA, ddt_bias, batch * nchunks, nheads, HAS_B=True,
                                               BRW=64, BH=BH, num_warps=4)
@@ -246,8 +217,8 @@ def bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB
     dcb_p, ddA_v = dda_gluon(x, dt, dA_cumsum, dout, CB)
     dB, dC, dCB = splits_sum((dB_p, 2), (dC_p, 2), (dcb_p, 2))
     dCB = dCB.to(CB.dtype)
-    _bmm_chunk_bwd(C, dCB, residual=dB, out=dB_given, config=BMM_CHUNK_BWD_TRAIN)
-    _bmm_chunk_bwd(B, dCB.transpose(-1, -2), residual=dC, out=dC_given, config=BMM_CHUNK_BWD_TRAIN)
+    chunk_cb_bwd(C, dCB, residual=dB, out=dB_given)
+    chunk_cb_bwd(B, dCB.transpose(-1, -2), residual=dC, out=dC_given)
     # intra-chunk ddA (b, h, c, L) as a one-block workspace
     ws_st, nv_st = dda_asm(ddA_v).unsqueeze(3), 1
     ddA = ddA_combine(ws_st, nv_st, ws_db, nt_db, ws_dc, nt_dc, ws_sp, nv_sp)
@@ -258,20 +229,20 @@ def bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB
 def bwd_store_glue_ref(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB, dC, dA_cumsum, dt_sp, CB,
                        states_passed):
     """Pure torch: the SSD backward of the dendritic-layer call on the kept forward tensors (the sequence of
-    :func:`bwd_store_glue`), each step by its piece reference -- the stock mamba_ssm math in float64 between the
-    kernels' rounding points, which are reproduced:
+    :func:`bwd_store_glue`), each step by its piece reference -- float64 between the kernels' rounding points, which
+    are reproduced:
 
       1. ``dstates_train_ref``: dstates (bf16, from bf16(dout exp(dA)) C sums), the state-passing ddA block sums, the
          passed states (bf16);
       2. ``chunk_scan_dx_ref``: dx, ddt_out, dD (the dot operand bf16(CB[k, m] decay) of the dx kernel);
       3. ``db_tma_ref`` / ``dc_tma_ref``: dB / dC summed over heads, ddA_next / ddA_prev;
       4. ``dda_ref``: dCB and the intra-chunk ddA;
-      5. ``_bmm_chunk_bwd`` (ssd_bmm.py ``_bmm_chunk_bwd_kernel``): dB += sum_l bf16(dCB[l, s]) C_l, dC += sum_s
+      5. the CB backward (the math of ``chunk_cb_bwd_ref``): dB += sum_l bf16(dCB[l, s]) C_l, dC += sum_s
          bf16(dCB[l, s]) B_s (bf16 dot operands, the fp32 head sums as the residual), rounded to B's / C's dtype;
       6. ``ddA_combine``: ddA = intra + cumsum(ddA_next) + reverse_cumsum(ddA_prev + the block sum at l = L - 1);
-      7. ``_chunk_cumsum_bwd_kernel`` (ssd_chunk_state.py): ddt = (ddA A + ddt_out) sigmoid(dt_raw + dt_bias) where
-         dt_raw + dt_bias <= 20 (rounded to dt_raw's dtype), dA = sum ddA softplus(dt_raw + dt_bias), ddt_bias = sum
-         ddt (before the rounding).
+      7. the write-strength backward (the math of ``chunk_dt_cumsum_bwd_ref``): ddt = (ddA A + ddt_out)
+         sigmoid(dt_raw + dt_bias) where dt_raw + dt_bias <= 20 (rounded to dt_raw's dtype), dA = sum ddA
+         softplus(dt_raw + dt_bias), ddt_bias = sum ddt (before the rounding).
 
     The output buffers (dx, ddt, dB, dC) are not used.  Returns (dx, ddt, dA, dB, dC, dD, ddt_bias) in the kernel's
     dtypes (dx / ddt / dB / dC in the input dtypes, dA / dD / ddt_bias fp32)."""

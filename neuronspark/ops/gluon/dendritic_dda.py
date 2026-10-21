@@ -10,11 +10,11 @@ For chunk c of batch row b and head h (chunk length CS 256, ``dA = dA_cumsum[b, 
     T_h[m, n]  = g_h[m, n] CB[m, n]              for n < m                                  (fp32)
     V_h        = per 32 x 32 sub-tile (I, J) of the chunk: rs[m] = sum_n T_h[m, n], cs[n] = sum_m T_h[m, n]
 
--- mamba_ssm ``_chunk_scan_bwd_dcb`` (the dCB of the dendritic-layer call, ngroups 1) and the pieces of
-``_chunk_scan_bwd_ddAcs_stable`` that :func:`neuronspark.ops.triton.dendritic_scan.dda_asm` assembles into the
-intra-chunk ddA. Returns ``(dCB head-split partials (b, nc, NSPLIT, 1, CS, CS) fp32, V (b, h, nc, 8 * 8 * 64) fp32)``:
-the split partials are summed by the caller (``dendritic_glue.splits_sum``), V is read by ``dda_asm`` (the upper
-sub-tiles of V are written as zeros and never read).
+-- the dCB of the dendritic-layer call (ngroups 1) and the pieces that
+:func:`neuronspark.ops.triton.dendritic_scan.dda_asm` assembles into the intra-chunk ddA. Returns ``(dCB head-split
+partials (b, nc, NSPLIT, 1, CS, CS) fp32, V (b, h, nc, 8 * 8 * 64) fp32)``: the split partials are summed by the caller
+(``dendritic_glue.splits_sum``), V is read by ``dda_asm`` (the upper sub-tiles of V are written as zeros and never
+read).
 
 Work items: (b c, head split s of HPS heads, lower tile (I, J) in {(0, 0), (1, 0), (1, 1)} of 128 rows / columns), the
 three tiles of one (b c, s) on consecutive CTAs (their dout / x rows shared through L2).  Per CTA (persistent, items in
@@ -30,10 +30,10 @@ The decay without a per-element exponent: dA is non-increasing along the chunk, 
 (first row r_q) and n <= m, exp(dA_m - dA_n) = R_m C_q[n] with R_m = exp(dA_m - dA[r_q]) <= 1 (one exponent per thread)
 and C_q[n] = exp(min(dA[r_q] - dA_n, 80)), <= 1 below the block and <= exp(D_q) on its diagonal block (D_q = dA[r_q] -
 dA[r_q + 31]); dt_n is folded into the per-head table C (4 x 64 per partition, one exponent per thread, through shared
-memory).  A diagonal tile with some D_q > 80 takes the stock per-element exponent for that head.
+memory).  A diagonal tile with some D_q > 80 takes the per-element exponent for that head.
 
-Numerics: the stock expressions (g dt exp(min(dA_m - dA_n, 0)); dCB summed over the split's heads in head order from
-zero) with the exponent as the product R_m C_q[n] on the factorised path; the dot's fp32 accumulation is the tensor
+Numerics: the reference's expressions (g dt exp(min(dA_m - dA_n, 0)); dCB summed over the split's heads in head order
+from zero) with the exponent as the product R_m C_q[n] on the factorised path; the dot's fp32 accumulation is the tensor
 cores', the V sums are this kernel's order (the per-operator rule class of :mod:`neuronspark.utils.testing` against
 :func:`neuronspark.ops.triton.dendritic_scan.dda_ref`). Full chunks only (seqlen % 256 == 0, the training regime); P 64.
 
@@ -123,9 +123,9 @@ def _compute_body(do_s, x_s, ready, free, g_done, g_free, g_t, cb_t, dcb_t, dcb_
 
     The decay: dA is non-increasing along the chunk, so for rows m of the 32-row block q (first row r_q) and n <= m,
     exp(dA_m - dA_n) = R_m C_q[n] with R_m = exp(dA_m - dA[r_q]) <= 1 and C_q[n] = exp(min(dA[r_q] - dA_n, 80)) (<= 1
-    below the block; <= exp(D_q) on its diagonal block, D_q = dA[r_q] - dA[r_q + 31]).  The products are the stock
-    exponent's while every D_q of a diagonal tile is <= 80; otherwise the head's tile takes the per-element exponent.
-    dt_n is folded into the table C (4 x 64 per head, one exponent per thread, through shared memory)."""
+    below the block; <= exp(D_q) on its diagonal block, D_q = dA[r_q] - dA[r_q + 31]).  The products equal the
+    per-element exponent's while every D_q of a diagonal tile is <= 80; otherwise the head's tile takes the per-element
+    exponent.  dt_n is folded into the table C (4 x 64 per head, one exponent per thread, through shared memory)."""
     W: gl.constexpr = 2 * _SUB                                         # columns of the partition
     L: gl.constexpr = get_tmem_32x32b_reg_layout(_BM, W, [_BM, W], NWG)
     L32: gl.constexpr = get_tmem_32x32b_reg_layout(_BM, _SUB, [_BM, _SUB], NWG)

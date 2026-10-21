@@ -78,8 +78,6 @@ def _epilogue_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, 
         if HAS_INIT:
             mbarrier.wait(init_bar, ni & 1)
             s = init_s.load(AL).to(gl.float32)
-            gl.thread_barrier()
-            mbarrier.arrive(init_free)
         else:
             s = gl.zeros([P, N], gl.float32, layout=AL)
         for c in range(nchunks):
@@ -90,6 +88,11 @@ def _epilogue_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, 
             st_s.index(u).store(s.to(st_s.dtype))                      # the state entering chunk c
             fence_async_shared()
             gl.thread_barrier()
+            if HAS_INIT:
+                if c == 0:
+                    # init_s is released only after every thread's values of it were consumed (the chunk-0 state tile above)
+                    # and the proxy fence: the load warp's TMA write of the next item's initial state must not overtake them
+                    mbarrier.arrive(init_free)
             tma.async_copy_shared_to_global(std, [row, 0], st_s.index(u))
             mbarrier.wait(acc_done.index(u), (cc // 2) & 1)
             _tc_fence(1, 4)

@@ -90,14 +90,15 @@ def _epilogue_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc,
             scale = gl.exp(da_end)
             mbarrier.wait(s_bar, sc_ & 1)
             s = s_s.load(AL)
-            gl.thread_barrier()
-            mbarrier.arrive(s_free)
             sc_ += 1
             u = cc % 2
             tma.store_wait(3)                                          # the buffers' stores of two chunks ago are done
             cv_s.index(u).store(s.to(cv_s.dtype))
             fence_async_shared()
             gl.thread_barrier()
+            # s_s is released only after every thread's values of it were consumed (the conv tile above) and the proxy fence:
+            # the load warp's next TMA write into s_s must not overtake this partition's reads of it
+            mbarrier.arrive(s_free)
             tma.async_copy_shared_to_global(cvd, [row, 0], cv_s.index(u))
             # ws[k, j] = exp(dA_end) sum over block j of s * d (the gradient before this chunk's update)
             rs = gl.convert_layout(gl.sum(s * d, axis=1), gl.SliceLayout(1, LB))

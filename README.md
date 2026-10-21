@@ -7,7 +7,7 @@
 > Paper: https://arxiv.org/abs/2603.16148
 
 > **NeuronSpark: Selective Spiking State Space Models with Adaptive Computation for Language Modeling**\
-> Zhengzheng Tang, Hao Zhu, Dajiang Tao, Yuhui Zhang\
+> Anonymous\
 > NeurIPS 2026 submission: https://openreview.net/forum?id=P7pyNdvnfr
 
 ## About

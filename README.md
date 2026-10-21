@@ -141,7 +141,8 @@ loss.backward()
 
 `model.save_pretrained(path)` writes a checkpoint directory (`config.json` and `model.safetensors`) and
 `NeuronSparkLMHeadModel.from_pretrained(path)` loads one.  To recompute the dendritic neuron layers in the backward
-pass, set `model.gradient_checkpointing = True`.
+pass, set `model.gradient_checkpointing = True`; to recompute the hippocampal layers as well (long rows), also set
+`model.hippocampal_checkpointing = True`.
 
 ### Generation
 

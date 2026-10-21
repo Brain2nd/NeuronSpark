@@ -28,8 +28,12 @@ the passing reads it).  x and B are read through 3-D (batch, seqlen, .) descript
 longer buffer qualifies).
 
 Launch constants: BK 64 tokens per K step, R 4 ring slots, NWC 8 compute warps, registers 40 (load / MMA warps) and 128
-(compute); grid = #SM persistent CTAs.  The epilogue's per-chunk outputs leave through shared-memory staging tiles (two
-per output) and TMA stores; the compute partition reads a chunk's dA / dt once.
+(compute); grid = #SM persistent CTAs.  The epilogue writes the per-chunk outputs from registers by plain stores (the
+TMA store of the bf16 state tile, which the compiler split over the four epilogue warps, faulted with an out-of-range
+address when the GPU was time-sliced with another process; the plain stores do not); the compute partition reads each K
+step's dA / dt in the tile's row layout.  No partition
+uses an operation that needs compiler scratch memory (a layout conversion, a reduction across warps): the allocator
+places such scratch over the warp_specialize capture buffer, which partitions that start later still read.
 """
 from __future__ import annotations
 
@@ -59,15 +63,16 @@ _GL_DT = {torch.bfloat16: gl.bfloat16, torch.float32: gl.float32}
 
 # ------------------------------------------------------------------------------------------------ partitions
 @gluon.jit
-def _epilogue_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, pre_s, st_s, init_s, init_bar, init_free, xd, bd, pred, std, initd, find, DT, DA,
+def _epilogue_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, PRP, FNP,
                         n_items, seqlen, nchunks,
                         H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                         R: gl.constexpr, NWC: gl.constexpr, HAS_INIT: gl.constexpr, STORE_PRE: gl.constexpr,
                         STORE_FIN: gl.constexpr, INIT_BYTES: gl.constexpr, PASSED: gl.constexpr):
-    """Default partition (4 warps): per item the carried state s; per chunk the state entering it and (training) its own
-    state A_c staged in shared memory (two buffers each) and written by TMA stores."""
+    """Default partition (4 warps): per item the carried state s; per chunk the state entering it and (training) the
+    fp32 passed state or the chunk's own state A_c, written from registers by plain stores."""
     AL: gl.constexpr = get_tmem_32x32b_reg_layout(P, N, [P, N], 4)
-    NST: gl.constexpr = 2 if STORE_PRE else 1                          # TMA stores per chunk
+    rows = gl.arange(0, P, layout=gl.SliceLayout(1, AL))
+    cols = gl.arange(0, N, layout=gl.SliceLayout(0, AL))
     G = gl.num_programs(0)
     cc = 0                                                             # chunks consumed by this CTA (accumulator index)
     ni = 0                                                             # items of this CTA
@@ -83,16 +88,13 @@ def _epilogue_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, 
             row = ((b * nchunks + c) * H + h) * P
             da_last = gl.load(DA + ((b * H + h) * nchunks + c) * CS + (CS - 1))
             u = cc % 2
-            tma.store_wait(2 * NST - 1)                                # the buffers' previous stores have read them
-            st_s.index(u).store(s.to(st_s.dtype))                      # the state entering chunk c
-            fence_async_shared()
-            gl.thread_barrier()
+            offs = (row + rows).to(gl.int64)[:, None] * N + cols[None, :]
+            gl.store(STP + offs, s.to(STP.dtype.element_ty))           # the state entering chunk c
             if HAS_INIT:
                 if c == 0:
-                    # init_s is released only after every thread's values of it were consumed (the chunk-0 state tile above)
-                    # and the proxy fence: the load warp's TMA write of the next item's initial state must not overtake them
+                    # init_s is released only after every thread's values of it were consumed (the chunk-0 state above)
+                    gl.thread_barrier()
                     mbarrier.arrive(init_free)
-            tma.async_copy_shared_to_global(std, [row, 0], st_s.index(u))
             mbarrier.wait(acc_done.index(u), (cc // 2) & 1)
             _tc_fence(1, 4)
             ac = acc.index(u).load(AL)
@@ -100,26 +102,16 @@ def _epilogue_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, 
             gl.thread_barrier()
             mbarrier.arrive(acc_free.index(u))
             if STORE_PRE:
-                tma.store_wait(2 * NST - 1)
-                pre_s.index(u).store(s if PASSED else ac)                 # PASSED: the fp32 state entering the chunk
-                fence_async_shared()
-                gl.thread_barrier()
-                tma.async_copy_shared_to_global(pred, [row, 0], pre_s.index(u))
+                gl.store(PRP + offs, s if PASSED else ac)              # PASSED: the fp32 state entering the chunk
             s = gl.exp(da_last) * s + ac                               # the state-passing step
             cc += 1
         if STORE_FIN:
-            tma.store_wait(2 * NST - 1)
-            pre_s.index(0).store(s)                                    # the final state (pre_s is free in this form)
-            fence_async_shared()
-            gl.thread_barrier()
-            tma.async_copy_shared_to_global(find, [(b * H + h) * P, 0], pre_s.index(0))
-            tma.store_wait(0)                                          # the next item's chunk 0 reuses buffer 0
+            gl.store(FNP + ((b * H + h) * P + rows).to(gl.int64)[:, None] * N + cols[None, :], s)
         ni += 1
-    tma.store_wait(0)
 
 
 @gluon.jit
-def _load_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, pre_s, st_s, init_s, init_bar, init_free, xd, bd, pred, std, initd, find, DT, DA,
+def _load_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, PRP, FNP,
                     n_items, seqlen, nchunks,
                     H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                     R: gl.constexpr, NWC: gl.constexpr, HAS_INIT: gl.constexpr, STORE_PRE: gl.constexpr,
@@ -153,7 +145,7 @@ def _load_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, pre_
 
 
 @gluon.jit
-def _compute_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, pre_s, st_s, init_s, init_bar, init_free, xd, bd, pred, std, initd, find, DT, DA,
+def _compute_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, PRP, FNP,
                        n_items, seqlen, nchunks,
                        H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                        R: gl.constexpr, NWC: gl.constexpr, HAS_INIT: gl.constexpr, STORE_PRE: gl.constexpr,
@@ -163,9 +155,6 @@ def _compute_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, p
     L: gl.constexpr = gl.BlockedLayout([1, 8], [2, 16], [NWC, 1], [1, 0])
     LK: gl.constexpr = gl.SliceLayout(1, L)
     offs_kl = gl.arange(0, BK, layout=LK)
-    LC: gl.constexpr = gl.BlockedLayout([NKT, 1], [1, 32], [1, NWC], [0, 1])
-    offs_kc = gl.arange(0, NKT, layout=gl.SliceLayout(1, LC))[:, None] * BK + gl.arange(0, BK, layout=gl.SliceLayout(0, LC))[None, :]
-    sel = gl.arange(0, NKT, layout=gl.SliceLayout(1, LC))[:, None]
     G = gl.num_programs(0)
     t = 0
     for it in range(gl.program_id(0), n_items, G):
@@ -174,16 +163,18 @@ def _compute_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, p
         for c in range(nchunks):
             base = ((b * H + h) * nchunks + c) * CS
             da_last = gl.load(DA + base + (CS - 1))
-            dk = gl.load(DA + base + offs_kc)                          # the chunk's dA / dt, (NKT, BK)
-            tk = gl.load(DT + base + offs_kc)
-            sc = gl.exp(gl.minimum(da_last - dk, 0.0)) * tk            # the scale of every token of the chunk
             lim = seqlen - c * CS                                      # tokens of the chunk inside the sequence
             for kt in gl.static_range(NKT):
                 slot = t % R
-                scale = gl.sum(gl.where(sel == kt, sc, 0.0), axis=0)   # row kt (one nonzero term per sum)
+                # the K step's dA / dt loaded in the tile's row layout: no layout conversion in a worker partition
+                # (its scratch would be placed over the warp_specialize capture buffer, which partitions that start
+                # later still read)
+                dk = gl.load(DA + base + kt * BK + offs_kl)
+                tk = gl.load(DT + base + kt * BK + offs_kl)
+                scale = gl.exp(gl.minimum(da_last - dk, 0.0)) * tk     # the scale of every token of the K step
                 mbarrier.wait(ready.index(slot), (t // R) & 1)
                 bt = b_s.index(slot).load(L).to(gl.float32)
-                bs = bt * gl.convert_layout(scale, LK)[:, None]
+                bs = bt * scale[:, None]
                 if kt * BK + BK > lim:                                 # a partial chunk: rows past the sequence weigh 0
                     bs = gl.where((kt * BK + offs_kl < lim)[:, None], bs, 0.0)
                 b_s.index(slot).store(bs.to(gl.bfloat16))
@@ -194,7 +185,7 @@ def _compute_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, p
 
 
 @gluon.jit
-def _mma_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, pre_s, st_s, init_s, init_bar, init_free, xd, bd, pred, std, initd, find, DT, DA,
+def _mma_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, PRP, FNP,
                    n_items, seqlen, nchunks,
                    H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                    R: gl.constexpr, NWC: gl.constexpr, HAS_INIT: gl.constexpr, STORE_PRE: gl.constexpr,
@@ -222,7 +213,7 @@ def _mma_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, pre_s
 
 # ------------------------------------------------------------------------------------------------ kernel
 @gluon.jit
-def _chunk_states_kernel(xd, bd, pred, std, initd, find, DT, DA, n_items, seqlen, nchunks,
+def _chunk_states_kernel(xd, bd, initd, DT, DA, STP, PRP, FNP, n_items, seqlen, nchunks,
                          H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                          R: gl.constexpr, NWC: gl.constexpr, REGS_W: gl.constexpr, REGS_C: gl.constexpr,
                          HAS_INIT: gl.constexpr, STORE_PRE: gl.constexpr, STORE_FIN: gl.constexpr, INIT_BYTES: gl.constexpr, PASSED: gl.constexpr):
@@ -232,15 +223,10 @@ def _chunk_states_kernel(xd, bd, pred, std, initd, find, DT, DA, n_items, seqlen
     BLY: gl.constexpr = gl.NVMMASharedLayout.get_default_for([BK, N], gl.bfloat16)
     x_s = gl.allocate_shared_memory(gl.bfloat16, [R, BK, P], XL)
     b_s = gl.allocate_shared_memory(gl.bfloat16, [R, BK, N], BLY)
-    st_s = gl.allocate_shared_memory(std.dtype, [2, P, N], std.layout)
-    if STORE_PRE or STORE_FIN:
-        pre_s = gl.allocate_shared_memory(gl.float32, [2, P, N], pred.layout if STORE_PRE else find.layout)
-    else:
-        pre_s = st_s
     if HAS_INIT:
         init_s = gl.allocate_shared_memory(initd.dtype, [P, N], initd.layout)
     else:
-        init_s = st_s.index(0)
+        init_s = b_s.index(0)                                          # placeholder (no initial state)
     init_bar = gl.allocate_shared_memory(gl.int64, [1], BL)
     init_free = gl.allocate_shared_memory(gl.int64, [1], BL)
     ready = gl.allocate_shared_memory(gl.int64, [R, 1], BL)
@@ -260,10 +246,10 @@ def _chunk_states_kernel(xd, bd, pred, std, initd, find, DT, DA, n_items, seqlen
     fence_async_shared()
     acc = allocate_tensor_memory(gl.float32, [2, P, N], TL)
     gl.warp_specialize(
-        (x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, pre_s, st_s, init_s, init_bar, init_free, xd, bd, pred, std, initd, find, DT, DA,
+        (x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, PRP, FNP,
          n_items, seqlen, nchunks, H, P, N, CS, BK, R, NWC, HAS_INIT, STORE_PRE, STORE_FIN, INIT_BYTES, PASSED),
         _epilogue_partition,
-        (x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, pre_s, st_s, init_s, init_bar, init_free, xd, bd, pred, std, initd, find, DT, DA,
+        (x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, PRP, FNP,
          n_items, seqlen, nchunks, H, P, N, CS, BK, R, NWC, HAS_INIT, STORE_PRE, STORE_FIN, INIT_BYTES, PASSED),
         [_load_partition, _compute_partition, _mma_partition],
         [1, NWC, 1],
@@ -302,11 +288,6 @@ def _launch(B, x, dt, dA_cumsum, init, pre, states, fin, dims, passed=False):
                           gl.NVMMASharedLayout.get_default_for([1, BK, headdim], gl.bfloat16))
     bd = TensorDescriptor(B, [batch, seqlen, dstate], [B.stride(0), B.stride(1), 1], [1, BK, dstate],
                           gl.NVMMASharedLayout.get_default_for([1, BK, dstate], gl.bfloat16))
-    rows = batch * nchunks * nheads * headdim
-    std = TensorDescriptor(states, [rows, dstate], [dstate, 1], [headdim, dstate],
-                           gl.NVMMASharedLayout.get_default_for([headdim, dstate], _GL_DT[states.dtype]))
-    pred = (TensorDescriptor(pre, [rows, dstate], [dstate, 1], [headdim, dstate],
-                             gl.NVMMASharedLayout.get_default_for([headdim, dstate], gl.float32)) if pre is not None else std)
     has_init = init is not None
     if has_init:
         s0, s1, s2, s3 = (int(v) for v in init.stride())
@@ -316,14 +297,12 @@ def _launch(B, x, dt, dA_cumsum, init, pre, states, fin, dims, passed=False):
         initd = TensorDescriptor(init, [batch * nheads * headdim, dstate], [dstate, 1], [headdim, dstate],
                                  gl.NVMMASharedLayout.get_default_for([headdim, dstate], _GL_DT[init.dtype]))
     else:
-        initd = std
-    find = (TensorDescriptor(fin, [batch * nheads * headdim, dstate], [dstate, 1], [headdim, dstate],
-                             gl.NVMMASharedLayout.get_default_for([headdim, dstate], gl.float32)) if fin is not None else std)
+        initd = xd                                                     # placeholder (no initial state)
     n_items = batch * nheads
     G = min(CTAS_PER_SM * num_sms(x.device), n_items)
     with torch.cuda.device(x.device.index):
         _chunk_states_kernel[(G,)](
-            xd, bd, pred, std, initd, find, dt, dA_cumsum,
+            xd, bd, initd, dt, dA_cumsum, states, pre if pre is not None else states, fin if fin is not None else states,
             n_items, seqlen, nchunks,
             H=nheads, P=headdim, N=dstate, CS=chunk, BK=BK, R=R, NWC=NWC, REGS_W=REGS_W, REGS_C=REGS_C,
             HAS_INIT=has_init, STORE_PRE=pre is not None, STORE_FIN=fin is not None,

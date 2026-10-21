@@ -126,7 +126,8 @@ def _gfwd_kernel(S, MSK, PP, PR, ss_bh, ss_t, sm_b, sm_t, H, T, scale,
     (columns >= T: -inf), P = exp(x - max) / sum (a row with no finite entry: P = 0, as _safe_softmax), stored as
     NS bf16 pieces PP[b H + h, t, i, :] (PP contiguous (B H, T, NS, TP); columns >= T exact zeros).  The mask row
     block is loaded once for the H heads.  NR (NS = 2): the remainder after the two pieces as bf16 (exact: at most 8
-    significant bits) to PR[b H + h, t, :] (contiguous (B H, T, TP))."""
+    significant bits) to PR[b H + h, t, :] (contiguous (B H, T, TP)).  Head offsets in 64 bits (bh first: T NS TP
+    exceeds 32 bits at T = 32768)."""
     pid = tl.program_id(0)
     b = tl.program_id(1).to(tl.int64)
     rows = pid * R + tl.arange(0, R)
@@ -144,9 +145,9 @@ def _gfwd_kernel(S, MSK, PP, PR, ss_bh, ss_t, sm_b, sm_t, H, T, scale,
         e = _exp(x - m_u[:, None])
         l = tl.sum(e, 1)
         p = tl.div_rn(e, tl.where(l == 0.0, 1.0, l)[:, None])     # IEEE division (div.rn), as the warp softmax
-        rem = _gsplit(PP, bh * (T * NS * TP) + r64 * (NS * TP) + cols[None, :], p, TP, NS, rv[:, None])
+        rem = _gsplit(PP, bh * T * (NS * TP) + r64 * (NS * TP) + cols[None, :], p, TP, NS, rv[:, None])
         if NR:
-            tl.store(PR + bh * (T * TP) + r64 * TP + cols[None, :], rem.to(tl.bfloat16), mask=rv[:, None])
+            tl.store(PR + bh * T * TP + r64 * TP + cols[None, :], rem.to(tl.bfloat16), mask=rv[:, None])
 
 
 @triton.jit
@@ -154,9 +155,9 @@ def _gbwd_head(PP, PR, DPm, DSP, bh, r64, cols, rv, valid, sd_bh, sd_t, T, TP: t
                NR: tl.constexpr):
     """One head of _gbwd_kernel: P = the forward's pieces summed (smallest first, fp32; NR: the remainder PR first,
     then the NS pieces), dP, Dd = sum_j P dP, dS = P (dP - Dd) stored as NS bf16 pieces; returns dS (fp32)."""
-    base = bh * (T * NS * TP) + r64 * (NS * TP) + cols[None, :]
+    base = bh * T * (NS * TP) + r64 * (NS * TP) + cols[None, :]
     if NR:
-        p = tl.load(PR + bh * (T * TP) + r64 * TP + cols[None, :], mask=rv[:, None], other=0.0).to(tl.float32)
+        p = tl.load(PR + bh * T * TP + r64 * TP + cols[None, :], mask=rv[:, None], other=0.0).to(tl.float32)
         for i in tl.static_range(NS):
             p = p + tl.load(PP + base + (NS - 1 - i) * TP, mask=rv[:, None], other=0.0).to(tl.float32)
     else:

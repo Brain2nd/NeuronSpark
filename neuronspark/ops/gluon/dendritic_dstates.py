@@ -18,7 +18,10 @@ Per CTA (persistent, items (b, h) in round-robin): a load warp streams the (BK, 
 through an R-deep mbarrier ring and each chunk's passed-state tile; a compute partition scales each dout tile in place
 (one row factor per token, bf16); an MMA warp issues A_k += dout_tile^T . C_tile (the dout tile as a permuted MN-major
 view) into one of two TMEM accumulators; the default partition (4 warps) carries d and stores the outputs through
-shared tiles and TMA stores (the 16 workspace values per chunk by plain stores).
+shared tiles and TMA stores (the 16 workspace values per chunk by plain stores, each the sum of its 4 row sums read
+back from a shared buffer by one thread).  No partition uses an operation that needs compiler scratch memory (a layout
+conversion, a reduction across warps): the allocator places such scratch over the warp_specialize capture buffer, which
+partitions that start later still read.
 
 Numerics: the reference's expressions and rounding points; the fp32 accumulation order of the tensor cores and of the
 block sums (the per-operator rule class of :mod:`neuronspark.utils.testing` against :func:`dstates_train_ref`).  A
@@ -54,17 +57,17 @@ _GL_DT = {torch.bfloat16: gl.bfloat16, torch.float32: gl.float32}
 
 # ------------------------------------------------------------------------------------------------ partitions
 @gluon.jit
-def _epilogue_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s,
+def _epilogue_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s, ws_s,
                         dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
                         H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                         R: gl.constexpr, NWC: gl.constexpr, NBLK: gl.constexpr, WSR: gl.constexpr):
     """Default partition (4 warps): per item the carried gradient d; per chunk the converted state, the workspace block
     sums, the gradient update and the dstates store."""
     AL: gl.constexpr = get_tmem_32x32b_reg_layout(P, N, [P, N], 4)
-    LB: gl.constexpr = gl.BlockedLayout([1, NBLK], [32, 1], [4, 1], [1, 0])
-    rows = gl.arange(0, P, layout=gl.SliceLayout(1, LB))
-    blk = gl.arange(0, NBLK, layout=gl.SliceLayout(0, LB))
-    sel = (rows // WSR)[:, None] == blk[None, :]                       # (P, NBLK): row p belongs to block j
+    # the block sums read the row sums back from ws_s, each thread one block of WSR rows (no reduction across threads:
+    # no partition uses compiler scratch memory, which the allocator places over the warp_specialize capture buffer)
+    LW: gl.constexpr = gl.BlockedLayout([1, WSR], [32, 1], [4, 1], [1, 0])
+    blk = gl.arange(0, NBLK, layout=gl.SliceLayout(1, LW))
     G = gl.num_programs(0)
     cc = 0                                                             # chunks consumed (accumulator index)
     sc_ = 0                                                            # passed-state tiles consumed
@@ -81,7 +84,7 @@ def _epilogue_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc,
         tma.async_copy_shared_to_global(dstd, [((b * nchunks + nchunks - 1) * H + h) * P, 0], dst_s.index(0))
         tma.async_copy_shared_to_global(cvd, [((b * nchunks) * H + h) * P, 0], cv_s.index(0))
         tma.store_wait(0)
-        gl.store(WS + ((b * H + h) * nchunks) * NBLK + blk, gl.zeros([NBLK], gl.float32, layout=gl.SliceLayout(0, LB)))
+        gl.store(WS + ((b * H + h) * nchunks) * NBLK + blk, gl.zeros([NBLK], gl.float32, layout=gl.SliceLayout(1, LW)))
         for i in range(nchunks - 1):
             k = nchunks - 1 - i
             row = ((b * nchunks + k) * H + h) * P
@@ -100,8 +103,9 @@ def _epilogue_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc,
             mbarrier.arrive(s_free)
             tma.async_copy_shared_to_global(cvd, [row, 0], cv_s.index(u))
             # ws[k, j] = exp(dA_end) sum over block j of s * d (the gradient before this chunk's update)
-            rs = gl.convert_layout(gl.sum(s * d, axis=1), gl.SliceLayout(1, LB))
-            wsv = gl.sum(gl.where(sel, rs[:, None], 0.0), axis=0) * scale
+            ws_s.store(gl.reshape(gl.sum(s * d, axis=1), [NBLK, WSR]))  # the row sums, (NBLK, WSR)
+            gl.thread_barrier()
+            wsv = gl.sum(ws_s.load(LW), axis=1) * scale
             gl.store(WS + ((b * H + h) * nchunks + k) * NBLK + blk, wsv)
             mbarrier.wait(acc_done.index(u), (cc // 2) & 1)
             _tc_fence(1, 4)
@@ -120,7 +124,7 @@ def _epilogue_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc,
 
 
 @gluon.jit
-def _load_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s,
+def _load_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s, ws_s,
                     dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
                     H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                     R: gl.constexpr, NWC: gl.constexpr, NBLK: gl.constexpr, WSR: gl.constexpr):
@@ -150,7 +154,7 @@ def _load_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s
 
 
 @gluon.jit
-def _compute_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s,
+def _compute_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s, ws_s,
                        dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
                        H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                        R: gl.constexpr, NWC: gl.constexpr, NBLK: gl.constexpr, WSR: gl.constexpr):
@@ -158,9 +162,6 @@ def _compute_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, 
     NKT: gl.constexpr = CS // BK
     L: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [NWC, 1], [1, 0])
     LK: gl.constexpr = gl.SliceLayout(1, L)
-    LC: gl.constexpr = gl.BlockedLayout([NKT, 1], [1, 32], [1, NWC], [0, 1])
-    offs_kc = gl.arange(0, NKT, layout=gl.SliceLayout(1, LC))[:, None] * BK + gl.arange(0, BK, layout=gl.SliceLayout(0, LC))[None, :]
-    selk = gl.arange(0, NKT, layout=gl.SliceLayout(1, LC))[:, None]
     offs_kl = gl.arange(0, BK, layout=LK)
     G = gl.num_programs(0)
     t = 0
@@ -170,14 +171,14 @@ def _compute_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, 
         for i in range(nchunks - 1):
             k = nchunks - 1 - i
             base = ((b * H + h) * nchunks + k) * CS
-            sc = gl.exp(gl.load(DA + base + offs_kc))                  # the dout scale of every token of the chunk
             lim = seqlen - k * CS
             for kt in gl.static_range(NKT):
                 slot = t % R
-                scale = gl.sum(gl.where(selk == kt, sc, 0.0), axis=0)  # row kt (one nonzero term per sum)
+                # the K step's dA loaded in the tile's row layout (no layout conversion in a worker partition)
+                scale = gl.exp(gl.load(DA + base + kt * BK + offs_kl))  # the dout scale of every token of the K step
                 mbarrier.wait(ready.index(slot), (t // R) & 1)
                 dv = do_s.index(slot).load(L).to(gl.float32)
-                ds = dv * gl.convert_layout(scale, LK)[:, None]
+                ds = dv * scale[:, None]
                 if kt * BK + BK > lim:                                 # a partial chunk: rows past the sequence weigh 0
                     ds = gl.where((kt * BK + offs_kl < lim)[:, None], ds, 0.0)
                 do_s.index(slot).store(ds.to(gl.bfloat16))
@@ -188,7 +189,7 @@ def _compute_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, 
 
 
 @gluon.jit
-def _mma_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s,
+def _mma_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s, ws_s,
                    dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
                    H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                    R: gl.constexpr, NWC: gl.constexpr, NBLK: gl.constexpr, WSR: gl.constexpr):
@@ -233,6 +234,7 @@ def _dstates_kernel(dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
     acc_free = gl.allocate_shared_memory(gl.int64, [2, 1], BL)
     s_bar = gl.allocate_shared_memory(gl.int64, [1], BL)
     s_free = gl.allocate_shared_memory(gl.int64, [1], BL)
+    ws_s = gl.allocate_shared_memory(gl.float32, [NBLK, WSR], gl.SwizzledSharedLayout(1, 1, 1, [1, 0]))
     for i in gl.static_range(R):
         mbarrier.init(ready.index(i), count=1)
         mbarrier.init(scaled.index(i), count=1)
@@ -245,10 +247,10 @@ def _dstates_kernel(dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
     fence_async_shared()
     acc = allocate_tensor_memory(gl.float32, [2, P, N], TL)
     gl.warp_specialize(
-        (do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s,
+        (do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s, ws_s,
          dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks, H, P, N, CS, BK, R, NWC, NBLK, WSR),
         _epilogue_partition,
-        (do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s,
+        (do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s, ws_s,
          dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks, H, P, N, CS, BK, R, NWC, NBLK, WSR),
         [_load_partition, _compute_partition, _mma_partition],
         [1, NWC, 1],

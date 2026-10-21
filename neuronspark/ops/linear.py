@@ -25,7 +25,10 @@ Numerics contract (training, whole-row regime):
 Inference (no autograd needed): ``F.linear(x.to(bf16), w)`` where ``w`` is the bf16 copy made by :func:`cache_bf16_`
 when one is present and current, else ``weight.to(bf16)``; the two hold the same values while the cache is current.  A
 cache whose weight was modified after caching (a version bump), moved or re-typed raises: call
-``prepare_inference()`` again.  The input's view and strides are kept (no copy), as in the autocast call.
+``prepare_inference()`` again.  The input's view and strides are kept (no copy), as in the autocast call.  A product of
+2 to 32 rows and fewer than 16 output features (the decode step's per-head projections) runs
+:func:`neuronspark.ops.triton.linear_small_n.linear_small_n` instead of cuBLAS's split-K GEMM and reduction: one kernel,
+fp32 accumulation, one bf16 rounding (the same reference).
 
 Pure-torch reference :func:`linear_ref`: the same bf16-rounded operands multiplied in float64, the output rounded
 once to bf16; its gradients are float64 products delivered in the inputs' dtypes.
@@ -188,7 +191,13 @@ def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     w = _cached_bf16(weight)
     if w is None:
         w = weight.to(torch.bfloat16)
-    return F.linear(x.to(torch.bfloat16), w)
+    xb = x.to(torch.bfloat16)
+    if int(w.shape[0]) < 16 and xb.is_cuda and xb.dim() >= 2:
+        from neuronspark.ops.triton.linear_small_n import linear_small_n, takes
+        x2 = xb.reshape(-1, int(xb.shape[-1]))
+        if takes(x2, w):
+            return linear_small_n(x2, w).view(*xb.shape[:-1], int(w.shape[0]))
+    return F.linear(xb, w)
 
 
 def linear_ref(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:

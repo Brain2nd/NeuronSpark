@@ -122,7 +122,7 @@ custom ops.  `neuronspark/ops/registry.py` lists every operator with its signatu
 
 | family | file | used in |
 |---|---|---|
-| linear with fp32 weight gradient | `ops/linear.py` | train, prefill, decode |
+| linear with fp32 weight gradient (few-feature decode products in one kernel) | `ops/linear.py`, `ops/triton/linear_small_n.py` | train, prefill, decode |
 | dendritic integration (chunked scan) + somatic release | `ops/dendritic_combined.py`, `ops/triton/dendritic_{states,scan,glue,soma}.py`, `ops/gluon/dendritic_{chunk_states,dstates,dda,chunk_scan_fwd,chunk_scan_dx}.py` | train |
 | dendritic integration, prefill | `ops/dendritic_prefill.py`, `ops/gluon/dendritic_chunk_states.py` | prefill |
 | synaptic filter (conv), norms, residual | `ops/triton/dendritic_{conv,prenorm,gated_norm,residual}.py` | train, prefill |

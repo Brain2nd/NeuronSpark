@@ -39,13 +39,3 @@ except for the third-party material listed below, which keeps its own license.
      neuronspark/ops/triton/cumsum.py        outer-dimension inclusive scan
      neuronspark/ops/triton/pkm_topk.py      top-k selection (radix select + bitonic sort semantics)
      neuronspark/ops/triton/lm_tail.py       softmax / cross-entropy and reduction sequences
-
------------------------------------------------------------------------------------------------------------------------
-3. mamba_ssm (state-spaces/mamba), version 2.3.2.post1
-   Copyright (c) 2023, 2024, Tri Dao, Albert Gu
-   Licensed under the Apache License, Version 2.0; the full license text is in licenses/mamba_ssm-LICENSE.txt.
-
-   One kernel follows the statement order of a mamba_ssm kernel (written with this repository's names, arguments and
-   launch configuration; the per-(batch, chunk) partial sums are stored instead of accumulated atomically):
-     neuronspark/ops/triton/dendritic_chunk.py   _dt_cumsum_bwd_kernel <- mamba_ssm/ops/triton/ssd_chunk_state.py,
-                                                 _chunk_cumsum_bwd_kernel

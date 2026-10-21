@@ -48,8 +48,7 @@ __all__ = ["CUMSUM_FWD_CFG", "CUMSUM_BWD_CFG", "CB_CFG", "CB_BWD_CFG", "SMALL_CA
 # ================================================================================================ fixed constants
 #: calls with fewer (batch x nchunks) than this take the "small" launch configurations (more, smaller programs)
 SMALL_CALL_CHUNKS = 16
-#: write-strength forward / backward: {"large" / "small": (heads per program, warps)} -- one chunk of a head block per
-#: program ((cs, heads) tile forward, (heads, cs) backward)
+#: write-strength forward / backward: {"large" / "small": (heads per program, warps)} -- a (cs, heads) tile per program
 CUMSUM_FWD_CFG = {"large": (8, 4), "small": (4, 8)}
 CUMSUM_BWD_CFG = {"large": (4, 4), "small": (4, 8)}
 #: overlap forward: {"large" / "small": ((rows, cols, k) tile, warps, pipeline stages)}
@@ -102,44 +101,36 @@ def _dt_cumsum_bwd_kernel(DDA, DDT_OUT, DT, BIAS, A, DDT, WA, WB, T, H, NC, CS,
                           s_ga_b, s_ga_h, s_ga_c, s_ga_t, s_go_b, s_go_h, s_go_c, s_go_t,
                           s_dt_b, s_dt_t, s_dt_h, s_ddt_b, s_ddt_t, s_ddt_h, lo, hi,
                           HAS_BIAS: tl.constexpr, SOFTPLUS: tl.constexpr, BT: tl.constexpr, BH: tl.constexpr):
-    # statement order of mamba_ssm's _chunk_cumsum_bwd_kernel (Apache-2.0, see NOTICE), with this file's arguments and
-    # stored per-(batch, chunk) partials.  A head-major (BH, BT) tile: the program's bases are 64-bit scalar offsets,
-    # every pointer tensor is formed before the first load, and g = ddA A + ddt_out is masked in its own layout before
-    # the clamp mask (formed from dt) is applied, so the loads of ddt_out, A, dt and dt_bias are all in flight together
+    # the forward's time-major (BT, BH) tile, 64-bit scalar base offsets and 32-bit offsets inside the tile
     b = tl.program_id(0).to(tl.int64)
-    c = tl.program_id(1)
-    DDA += b * s_ga_b + c.to(tl.int64) * s_ga_c
-    DDT_OUT += b * s_go_b + c.to(tl.int64) * s_go_c
-    DT += b * s_dt_b + c.to(tl.int64) * CS * s_dt_t
-    DDT += b * s_ddt_b + c.to(tl.int64) * CS * s_ddt_t
+    c = tl.program_id(1).to(tl.int64)
     h = tl.program_id(2) * BH + tl.arange(0, BH)
     t = tl.arange(0, BT)
-    p_ga = DDA + (h[:, None] * s_ga_h + t[None, :] * s_ga_t)
-    p_go = DDT_OUT + (h[:, None] * s_go_h + t[None, :] * s_go_t)
-    p_dt = DT + (h[:, None] * s_dt_h + t[None, :] * s_dt_t)
-    p_ddt = DDT + (h[:, None] * s_ddt_h + t[None, :] * s_ddt_t)
+    hm = h < H
     n_valid = tl.minimum(CS, T - c * CS)
-    dda = tl.load(p_ga, mask=(h[:, None] < H) & (t[None, :] < n_valid), other=0.0).to(tl.float32)
-    g = tl.load(p_go, mask=(h[:, None] < H) & (t[None, :] < n_valid), other=0.0).to(tl.float32)
-    a = tl.load(A + h, mask=h < H, other=0.0).to(tl.float32)
-    g = dda * a[:, None] + g
-    v = tl.load(p_dt, mask=(h[:, None] < H) & (t[None, :] < n_valid), other=0.0).to(tl.float32)
+    live = (t[:, None] < n_valid) & hm[None, :]
+    dda = tl.load(DDA + (b * s_ga_b + c * s_ga_c) + (h[None, :] * s_ga_h + t[:, None] * s_ga_t), mask=live,
+                  other=0.0).to(tl.float32)
+    g = tl.load(DDT_OUT + (b * s_go_b + c * s_go_c) + (h[None, :] * s_go_h + t[:, None] * s_go_t), mask=live,
+                other=0.0).to(tl.float32)
+    a = tl.load(A + h, mask=hm, other=0.0).to(tl.float32)
+    g = g + dda * a[None, :]
+    v = tl.load(DT + (b * s_dt_b + c * CS * s_dt_t) + (t[:, None] * s_dt_t + h[None, :] * s_dt_h), mask=live,
+                other=0.0).to(tl.float32)
     if HAS_BIAS:
-        v += tl.load(BIAS + h, mask=h < H, other=0.0).to(tl.float32)[:, None]
+        v = v + tl.load(BIAS + h, mask=hm, other=0.0).to(tl.float32)[None, :]
+    s = v
     if SOFTPLUS:
-        v_in = v
-        v = tl.where(v <= 20.0, tl.log(tl.exp(v) + 1.0), v)
-    clamped = (v < lo) | (v > hi)
-    v = tl.minimum(tl.maximum(v, lo), hi)
-    v = tl.where((h[:, None] < H) & (t[None, :] < n_valid), v, 0.0)
-    g = tl.where((h[:, None] < H) & (t[None, :] < n_valid), g, 0.0)
-    g = tl.where(clamped, 0.0, g)
+        s = _softplus_f32(v)
+    clamped = (s < lo) | (s > hi)
+    s = tl.where(live, tl.minimum(tl.maximum(s, lo), hi), 0.0)
+    g = tl.where(live & (~clamped), g, 0.0)
     if SOFTPLUS:
-        g = tl.where(v_in <= 20.0, g * tl.sigmoid(v_in), g)
-    tl.store(p_ddt, g, mask=(h[:, None] < H) & (t[None, :] < n_valid))
-    ws = (b * NC + c) * H + h
-    tl.store(WA + ws, tl.sum(dda * v, axis=1), mask=h < H)
-    tl.store(WB + ws, tl.sum(g, axis=1), mask=h < H)
+        g = tl.where(v <= 20.0, g * tl.sigmoid(v), g)
+    tl.store(DDT + (b * s_ddt_b + c * CS * s_ddt_t) + (t[:, None] * s_ddt_t + h[None, :] * s_ddt_h), g, mask=live)
+    ws = (b * NC + c) * H
+    tl.store(WA + ws + h, tl.sum(dda * s, axis=0), mask=hm)
+    tl.store(WB + ws + h, tl.sum(g, axis=0), mask=hm)
 
 
 @triton.jit

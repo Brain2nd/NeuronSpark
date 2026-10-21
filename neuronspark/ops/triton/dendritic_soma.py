@@ -6,10 +6,10 @@ Pieces:
 
 * ``gated_norm_soma_fwd(x, weight, eps, z, theta, gamma) -> (xo, rstd, n)`` (training forward, internal to
   :class:`neuronspark.ops.dendritic_combined.DendriticChunkScanSomaFn`): ``g = x * (z * sigmoid(z))`` (fp32), ``rstd = 1
-  / sqrt(sum_N g^2 / N + eps)`` per row (one row sum of the 9 chunk lanes, left to right), ``n = bf16((g * rstd) * w)``
+  / sqrt(sum_N g^2 / N + eps)`` per row (per-lane sums over the chunks in order, then one row sum), ``n = bf16((g * rstd) * w)``
   (stored), ``S = max(n - theta, 0) - max(-n - theta, 0)`` and ``xo = bf16(S * gamma)`` with IEEE single-rounding PTX
   (sub.rn / max.f32 / mul.rn / cvt.rn.bf16).  x, z (M, N) bf16 rows with unit last stride (z the strided slice of the
-  projection), weight (N,) fp32 (the unit gated-norm weight), theta / gamma (N,) fp32; N = 9 x 1024.
+  projection), weight (N,) fp32 (the unit gated-norm weight), theta / gamma (N,) fp32; N a multiple of 1024.
 * ``gated_norm_soma_bwd(dxs, n, x, weight, rstd, z, dz, theta, gamma, alpha) -> (dy, dz, dtheta, dgamma)`` (training
   backward): the soma backward on the stored n -- ``gp = 1 / (1 + exp2(-(a alpha) log2 e))`` and ``gm`` likewise
   (approximate exp2, div.full, FMA), ``grad_n = bf16(g gamma (gp + gm))``, the theta / gamma gradients as fp32 partial
@@ -26,7 +26,7 @@ class (chunk lanes instead of one 16384-lane row); the soma forward is the torch
 soma backward is fp32-rounding class (approximate exp2 / division, reordered parameter sums).  Checked with the
 per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the references below.
 
-Launch constants: forward R 1 row / program, 16 warps, CH 1024 (NCH 9), n stored for the backward; soma backward ROWS 128, BM 4, BC 1024, 4 warps, STAGES 4 (no masks on whole tiles), sum BR 32 BC 64 4 warps; gated norm backward
+Launch constants: forward R 1 row / program, 16 warps, CH 1024 (two passes, NCH = N / CH), n stored for the backward; soma backward ROWS 128, BM 4, BC 1024, 4 warps, STAGES 4 (no masks on whole tiles), sum BR 32 BC 64 4 warps; gated norm backward
 R 1, 8 warps, CH 1024 (two passes).  The PTX helpers ``_sr_*`` are :mod:`neuronspark.ops.triton._ptx`'s.
 """
 from __future__ import annotations
@@ -47,18 +47,18 @@ __all__ = [
 ]
 
 # ------------------------------------------------------------------------------------------------ launch constants
-SOMA_FWD_CFG = (1, 16, 1024)            # rows / program, num_warps, CH (chunk lanes; N = 9 CH)
-SOMA_FWD_NCH = 9                        # the forward kernel handles rows of 9 chunks
+SOMA_FWD_CFG = (1, 16, 1024)            # rows / program, num_warps, CH (chunk lanes; N = NCH x CH)
 SOMA_BWD_CFG = (128, 4, 1024, 4, 4)     # ROWS / program, BM rows / iteration, BC columns, num_warps, STAGES
 SOMA_SUM_CFG = (32, 64, 4)              # BR, BC, num_warps of the partial-sum reduction
 NORM_BWD_CFG = (1, 8, 1024)             # rows / program, num_warps, CH
 
 
-# ================================================================================================================
-# Forward kernel _gated_norm_soma_fwd_k9: the gated norm + soma forward for rows of NCH = 9 chunk lanes, the chunks written out.
-# ================================================================================================================
+# ------------------------------------------------------------------------------------------------ forward kernel
 @triton.jit
-def _gated_norm_soma_fwd_k9(X, XO, Y, W, Z, TH, GA, Rstd, sx, sxo, sy, sz, M, N, eps, R: tl.constexpr, CH: tl.constexpr, STORE_N: tl.constexpr):
+def _gated_norm_soma_fwd_kernel(X, XO, Y, W, Z, TH, GA, Rstd, sx, sxo, sy, sz, M, N, NCH, eps, R: tl.constexpr,
+                                CH: tl.constexpr, STORE_N: tl.constexpr):
+    """Gated norm + soma forward, R rows per program, two passes over the NCH chunks of CH columns: pass 1 acc += g * g
+    per lane (chunk order), rstd from one row sum / N; pass 2 reloads x / z and stores n (STORE_N) and x_soma."""
     pid = tl.program_id(0)
     rows = pid * R + tl.arange(0, R)
     rv = rows < M
@@ -66,125 +66,29 @@ def _gated_norm_soma_fwd_k9(X, XO, Y, W, Z, TH, GA, Rstd, sx, sxo, sy, sz, M, N,
     cols = tl.arange(0, CH)[None, :]
     px = X + rows[:, None] * sx + cols
     pz = Z + rows[:, None] * sz + cols
-    x0 = tl.load(px, mask=rm, other=0.)
-    x1 = tl.load(px + 1 * CH, mask=rm, other=0.)
-    x2 = tl.load(px + 2 * CH, mask=rm, other=0.)
-    x3 = tl.load(px + 3 * CH, mask=rm, other=0.)
-    x4 = tl.load(px + 4 * CH, mask=rm, other=0.)
-    x5 = tl.load(px + 5 * CH, mask=rm, other=0.)
-    x6 = tl.load(px + 6 * CH, mask=rm, other=0.)
-    x7 = tl.load(px + 7 * CH, mask=rm, other=0.)
-    x8 = tl.load(px + 8 * CH, mask=rm, other=0.)
-    z0 = tl.load(pz, mask=rm, other=0.).to(tl.float32)
-    z1 = tl.load(pz + 1 * CH, mask=rm, other=0.).to(tl.float32)
-    z2 = tl.load(pz + 2 * CH, mask=rm, other=0.).to(tl.float32)
-    z3 = tl.load(pz + 3 * CH, mask=rm, other=0.).to(tl.float32)
-    z4 = tl.load(pz + 4 * CH, mask=rm, other=0.).to(tl.float32)
-    z5 = tl.load(pz + 5 * CH, mask=rm, other=0.).to(tl.float32)
-    z6 = tl.load(pz + 6 * CH, mask=rm, other=0.).to(tl.float32)
-    z7 = tl.load(pz + 7 * CH, mask=rm, other=0.).to(tl.float32)
-    z8 = tl.load(pz + 8 * CH, mask=rm, other=0.).to(tl.float32)
-    w0 = tl.load(W + cols).to(tl.float32)
-    w1 = tl.load(W + 1 * CH + cols).to(tl.float32)
-    w2 = tl.load(W + 2 * CH + cols).to(tl.float32)
-    w3 = tl.load(W + 3 * CH + cols).to(tl.float32)
-    w4 = tl.load(W + 4 * CH + cols).to(tl.float32)
-    w5 = tl.load(W + 5 * CH + cols).to(tl.float32)
-    w6 = tl.load(W + 6 * CH + cols).to(tl.float32)
-    w7 = tl.load(W + 7 * CH + cols).to(tl.float32)
-    w8 = tl.load(W + 8 * CH + cols).to(tl.float32)
-    g0 = x0.to(tl.float32) * (z0 * tl.sigmoid(z0))
-    g1 = x1.to(tl.float32) * (z1 * tl.sigmoid(z1))
-    g2 = x2.to(tl.float32) * (z2 * tl.sigmoid(z2))
-    g3 = x3.to(tl.float32) * (z3 * tl.sigmoid(z3))
-    g4 = x4.to(tl.float32) * (z4 * tl.sigmoid(z4))
-    g5 = x5.to(tl.float32) * (z5 * tl.sigmoid(z5))
-    g6 = x6.to(tl.float32) * (z6 * tl.sigmoid(z6))
-    g7 = x7.to(tl.float32) * (z7 * tl.sigmoid(z7))
-    g8 = x8.to(tl.float32) * (z8 * tl.sigmoid(z8))
-    var = tl.sum(g0 * g0 + g1 * g1 + g2 * g2 + g3 * g3 + g4 * g4 + g5 * g5 + g6 * g6 + g7 * g7 + g8 * g8, axis=1) / N
-    rstd = 1 / tl.sqrt(var + eps)
+    acc = tl.zeros((R, CH), dtype=tl.float32)
+    for c in range(NCH):
+        x = tl.load(px + c * CH, mask=rm, other=0.).to(tl.float32)
+        z = tl.load(pz + c * CH, mask=rm, other=0.).to(tl.float32)
+        g = x * (z * tl.sigmoid(z))
+        acc += g * g
+    rstd = 1 / tl.sqrt(tl.sum(acc, axis=1) / N + eps)
     tl.store(Rstd + rows, rstd, mask=rv)
     r2 = rstd[:, None]
     pxo = XO + rows[:, None] * sxo + cols
     py = Y + rows[:, None] * sy + cols
-    th0 = tl.load(TH + cols)
-    ga0 = tl.load(GA + cols)
-    y0 = (g0 * r2) * w0
-    if STORE_N:
-        tl.store(py, y0, mask=rm)
-    v0 = _sr_bf16_to_f32(_sr_f32_to_bf16(y0))
-    s0, a0, b0 = _sr_release(v0, th0)
-    tl.store(pxo, _sr_f32_to_bf16(_sr_mul_rn(s0, ga0)), mask=rm)
-    th1 = tl.load(TH + 1 * CH + cols)
-    ga1 = tl.load(GA + 1 * CH + cols)
-    y1 = (g1 * r2) * w1
-    if STORE_N:
-        tl.store(py + 1 * CH, y1, mask=rm)
-    v1 = _sr_bf16_to_f32(_sr_f32_to_bf16(y1))
-    s1, a1, b1 = _sr_release(v1, th1)
-    tl.store(pxo + 1 * CH, _sr_f32_to_bf16(_sr_mul_rn(s1, ga1)), mask=rm)
-    th2 = tl.load(TH + 2 * CH + cols)
-    ga2 = tl.load(GA + 2 * CH + cols)
-    y2 = (g2 * r2) * w2
-    if STORE_N:
-        tl.store(py + 2 * CH, y2, mask=rm)
-    v2 = _sr_bf16_to_f32(_sr_f32_to_bf16(y2))
-    s2, a2, b2 = _sr_release(v2, th2)
-    tl.store(pxo + 2 * CH, _sr_f32_to_bf16(_sr_mul_rn(s2, ga2)), mask=rm)
-    th3 = tl.load(TH + 3 * CH + cols)
-    ga3 = tl.load(GA + 3 * CH + cols)
-    y3 = (g3 * r2) * w3
-    if STORE_N:
-        tl.store(py + 3 * CH, y3, mask=rm)
-    v3 = _sr_bf16_to_f32(_sr_f32_to_bf16(y3))
-    s3, a3, b3 = _sr_release(v3, th3)
-    tl.store(pxo + 3 * CH, _sr_f32_to_bf16(_sr_mul_rn(s3, ga3)), mask=rm)
-    th4 = tl.load(TH + 4 * CH + cols)
-    ga4 = tl.load(GA + 4 * CH + cols)
-    y4 = (g4 * r2) * w4
-    if STORE_N:
-        tl.store(py + 4 * CH, y4, mask=rm)
-    v4 = _sr_bf16_to_f32(_sr_f32_to_bf16(y4))
-    s4, a4, b4 = _sr_release(v4, th4)
-    tl.store(pxo + 4 * CH, _sr_f32_to_bf16(_sr_mul_rn(s4, ga4)), mask=rm)
-    th5 = tl.load(TH + 5 * CH + cols)
-    ga5 = tl.load(GA + 5 * CH + cols)
-    y5 = (g5 * r2) * w5
-    if STORE_N:
-        tl.store(py + 5 * CH, y5, mask=rm)
-    v5 = _sr_bf16_to_f32(_sr_f32_to_bf16(y5))
-    s5, a5, b5 = _sr_release(v5, th5)
-    tl.store(pxo + 5 * CH, _sr_f32_to_bf16(_sr_mul_rn(s5, ga5)), mask=rm)
-    th6 = tl.load(TH + 6 * CH + cols)
-    ga6 = tl.load(GA + 6 * CH + cols)
-    y6 = (g6 * r2) * w6
-    if STORE_N:
-        tl.store(py + 6 * CH, y6, mask=rm)
-    v6 = _sr_bf16_to_f32(_sr_f32_to_bf16(y6))
-    s6, a6, b6 = _sr_release(v6, th6)
-    tl.store(pxo + 6 * CH, _sr_f32_to_bf16(_sr_mul_rn(s6, ga6)), mask=rm)
-    th7 = tl.load(TH + 7 * CH + cols)
-    ga7 = tl.load(GA + 7 * CH + cols)
-    y7 = (g7 * r2) * w7
-    if STORE_N:
-        tl.store(py + 7 * CH, y7, mask=rm)
-    v7 = _sr_bf16_to_f32(_sr_f32_to_bf16(y7))
-    s7, a7, b7 = _sr_release(v7, th7)
-    tl.store(pxo + 7 * CH, _sr_f32_to_bf16(_sr_mul_rn(s7, ga7)), mask=rm)
-    th8 = tl.load(TH + 8 * CH + cols)
-    ga8 = tl.load(GA + 8 * CH + cols)
-    y8 = (g8 * r2) * w8
-    if STORE_N:
-        tl.store(py + 8 * CH, y8, mask=rm)
-    v8 = _sr_bf16_to_f32(_sr_f32_to_bf16(y8))
-    s8, a8, b8 = _sr_release(v8, th8)
-    tl.store(pxo + 8 * CH, _sr_f32_to_bf16(_sr_mul_rn(s8, ga8)), mask=rm)
-
-
-# ================================================================================================================
-# end of the forward kernel
-# ================================================================================================================
+    for c in range(NCH):
+        x = tl.load(px + c * CH, mask=rm, other=0.).to(tl.float32)
+        z = tl.load(pz + c * CH, mask=rm, other=0.).to(tl.float32)
+        w = tl.load(W + c * CH + cols).to(tl.float32)
+        th = tl.load(TH + c * CH + cols)
+        ga = tl.load(GA + c * CH + cols)
+        y = ((x * (z * tl.sigmoid(z))) * r2) * w
+        if STORE_N:
+            tl.store(py + c * CH, y, mask=rm)
+        v = _sr_bf16_to_f32(_sr_f32_to_bf16(y))
+        sv, av, bv = _sr_release(v, th)
+        tl.store(pxo + c * CH, _sr_f32_to_bf16(_sr_mul_rn(sv, ga)), mask=rm)
 
 
 # ------------------------------------------------------------------------------------------------ kernels
@@ -312,14 +216,15 @@ def gated_norm_soma_fwd(x, weight, eps, z, theta, gamma):
     require_cuda(x, "gated_norm_soma_fwd")
     M, N = _soma_operands(x, weight, z, theta, gamma, "gated_norm_soma_fwd")
     R, nw, CH = SOMA_FWD_CFG
-    if N != SOMA_FWD_NCH * CH:
-        raise RuntimeError(f"neuronspark.gated_norm_soma_fwd: the row width must be {SOMA_FWD_NCH} x {CH}, got N {N}")
+    nch = N // CH
+    if N != nch * CH or nch < 1:
+        raise RuntimeError(f"neuronspark.gated_norm_soma_fwd: N = {N} is not NCH x CH with CH = {CH}")
     xo = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
     n = torch.empty((M, N), dtype=x.dtype, device=x.device)
     rstd = torch.empty((M,), dtype=torch.float32, device=x.device)
     with torch.cuda.device(x.device.index):
-        _gated_norm_soma_fwd_k9[(triton.cdiv(M, R),)](
-            x, xo, n, weight, z, theta, gamma, rstd, x.stride(0), xo.stride(0), n.stride(0), z.stride(0), M, N,
+        _gated_norm_soma_fwd_kernel[(triton.cdiv(M, R),)](
+            x, xo, n, weight, z, theta, gamma, rstd, x.stride(0), xo.stride(0), n.stride(0), z.stride(0), M, N, nch,
             float(eps), R=R, CH=CH, STORE_N=True, num_warps=nw)
     return xo, rstd, n
 

@@ -12,7 +12,7 @@ Operators (regime: public function -> what runs):
   keys: S <= 32767), segment offsets by searchsorted, then one program per (slot, chunk of 64 occurrences in sorted
   order) that forms both gradients from a single load of the slot's value row: grad_V partial = fma.rn chain of
   w[r, m] * grad_o[r, :] over the chunk's occurrences, and grad_w[r, m] = one tl.sum tree over 256 lanes of the per-lane
-  sums of the three 256-column chunks' fp32 products grad_o[r, d] * V[s, d]; the next occurrence's operands are
+  sums of the D / 256 (at most 4) 256-column chunks' fp32 products grad_o[r, d] * V[s, d]; the next occurrence's operands are
   prefetched.  A second kernel sums each slot's chunk partials in order (add.rn from +0).
   Deterministic and capture-safe (static shapes, no host synchronisation).  Both gradients are always formed (one
   fused kernel); a gradient no input needs is dropped.
@@ -48,8 +48,9 @@ __all__ = [
 
 # ================================================================================================ fixed constants
 # Launch configuration of the training and inference operators.
-#: column chunk of the backward (grad_w dot chunks, grad_V partial rows); D must be a multiple (D <= 3 chunks)
+#: column chunk of the backward (grad_w dot chunks, grad_V partial rows); D must be a multiple, at most MAX_COL_CHUNKS
 COL_CHUNK = 256
+MAX_COL_CHUNKS = 4
 #: training forward: rows per program, columns per program, warps, slots per gather group
 FWD_ROWS = 8
 FWD_COLS = 128
@@ -105,7 +106,8 @@ def _read_bwd(go2: torch.Tensor, w2: torch.Tensor, u2: torch.Tensor,
     """grad_w (R, M) and grad_V (S, D), fp32 contiguous, for the upstream gradient go2 (R, D)."""
     R, M = (int(s) for s in w2.shape)
     S, D = (int(s) for s in V.shape)
-    _need(D % COL_CHUNK == 0 and D // COL_CHUNK <= 3, f"the fused backward covers D = 256, 512 or 768, got {D}")
+    _need(D % COL_CHUNK == 0 and D // COL_CHUNK <= MAX_COL_CHUNKS,
+          f"the fused backward covers D = 256 .. {MAX_COL_CHUNKS * COL_CHUNK} in steps of {COL_CHUNK}, got {D}")
     _need(V.is_contiguous(), "V must be contiguous")
     dev = go2.device
     go2 = go2.contiguous()
@@ -322,6 +324,9 @@ def _pr_dvw1pf_partial_kernel(W, GO, V, PERM, OFFS, CST, SLOT, PART, GW, S, M: t
         if NC > 2:
             v2 = tl.load(vrow + (2 * DB + d))
             a2 = tl.zeros([DB], dtype=tl.float32)
+        if NC > 3:
+            v3 = tl.load(vrow + (3 * DB + d))
+            a3 = tl.zeros([DB], dtype=tl.float32)
         pn = tl.load(PERM + i0)
         pnn = tl.load(PERM + tl.minimum(i0 + 1, il))
         wn = tl.load(W + pn)
@@ -331,6 +336,8 @@ def _pr_dvw1pf_partial_kernel(W, GO, V, PERM, OFFS, CST, SLOT, PART, GW, S, M: t
             gn1 = tl.load(GO + rn * D + (1 * DB + d))
         if NC > 2:
             gn2 = tl.load(GO + rn * D + (2 * DB + d))
+        if NC > 3:
+            gn3 = tl.load(GO + rn * D + (3 * DB + d))
         for i in range(i0, i1):
             p = pn
             w = wn
@@ -339,6 +346,8 @@ def _pr_dvw1pf_partial_kernel(W, GO, V, PERM, OFFS, CST, SLOT, PART, GW, S, M: t
                 g1 = gn1
             if NC > 2:
                 g2 = gn2
+            if NC > 3:
+                g3 = gn3
             pn = pnn
             pnn = tl.load(PERM + tl.minimum(i + 2, il))
             wn = tl.load(W + pn)
@@ -348,6 +357,8 @@ def _pr_dvw1pf_partial_kernel(W, GO, V, PERM, OFFS, CST, SLOT, PART, GW, S, M: t
                 gn1 = tl.load(GO + rn * D + (1 * DB + d))
             if NC > 2:
                 gn2 = tl.load(GO + rn * D + (2 * DB + d))
+            if NC > 3:
+                gn3 = tl.load(GO + rn * D + (3 * DB + d))
             a0 = _pr_fma(w + tl.zeros([DB], dtype=tl.float32), g0, a0)
             pd = g0 * v0
             if NC > 1:
@@ -356,6 +367,9 @@ def _pr_dvw1pf_partial_kernel(W, GO, V, PERM, OFFS, CST, SLOT, PART, GW, S, M: t
             if NC > 2:
                 a2 = _pr_fma(w + tl.zeros([DB], dtype=tl.float32), g2, a2)
                 pd = pd + g2 * v2
+            if NC > 3:
+                a3 = _pr_fma(w + tl.zeros([DB], dtype=tl.float32), g3, a3)
+                pd = pd + g3 * v3
             tl.store(GW + p, tl.sum(pd, axis=0))
         prow = PART + q.to(tl.int64) * D
         tl.store(prow + (0 * DB + d), a0)
@@ -363,6 +377,8 @@ def _pr_dvw1pf_partial_kernel(W, GO, V, PERM, OFFS, CST, SLOT, PART, GW, S, M: t
             tl.store(prow + (1 * DB + d), a1)
         if NC > 2:
             tl.store(prow + (2 * DB + d), a2)
+        if NC > 3:
+            tl.store(prow + (3 * DB + d), a3)
 
 
 @triton.jit

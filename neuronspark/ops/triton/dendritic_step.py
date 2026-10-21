@@ -66,8 +66,7 @@ kernel 2 warps; K2 programs per row 8 (b <= 16) / 4; pre-norm 2 warps.  Supporte
 Contract (anything else raises): CUDA tensors on one device; proj (b, 2 di + 2 N + H) bf16 with unit last stride;
 conv_state (b, conv_dim, 3) fp32; ssm_state (b, H, P, N) bf16 or fp32 (the split route needs contiguous state rows);
 conv_w (conv_dim, 4) fp32 contiguous; conv_b (conv_dim,), A / dt_bias / D (H,), theta / gamma (di,) fp32 contiguous;
-N and P powers of two, P a multiple of the K1 tile; the gated and split routes are built for the default configuration's
-widths (di 9216, H 144, N 128, P 64).  References: :func:`dendritic_prenorm_rows_ref`, :func:`dendritic_step_core_ref`
+N and P powers of two, P a multiple of the K1 tile (default configuration: di 9216, H 144, N 128, P 64).  References: :func:`dendritic_prenorm_rows_ref`, :func:`dendritic_step_core_ref`
 (pure torch, fp32; the reference mutates the states in place like the kernel).  The PTX helpers are
 :mod:`neuronspark.ops.triton._ptx`'s.  The pre-norm and K2 norm lines follow fla-core 0.5.2 kernels (MIT; see NOTICE).
 """
@@ -95,9 +94,10 @@ from neuronspark.ops.triton.dendritic_soma import dendritic_soma_readout_ref
 __all__ = [
     "PRENORM_WARPS", "K1_ROUTE", "K1_TILE_B1", "K1_TILE", "K1_SPLIT_CONV_WARPS", "K1_SPLIT_STATE_TILE",
     "K1_SPLIT_MAXNREG", "K2_PROGRAMS_SMALL", "K2_PROGRAMS_LARGE", "K2_SMALL_MAX_BATCH", "MAX_DECODE_BATCH",
-    "ROUTE_WIDTHS", "k1_route", "k1_tile", "k2_programs",
+    "k1_route", "k1_tile", "k2_programs",
     "DendriticStepCore", "dendritic_prenorm_rows", "dendritic_prenorm_rows_ref", "dendritic_step_core",
-    "dendritic_step_core_ref",
+    "dendritic_step_core_ref", "dendritic_step_k1_ref", "dendritic_step_k2_ref", "dendritic_step_conv_ref",
+    "dendritic_step_state_ref",
 ]
 
 # ------------------------------------------------------------------------------------------------ launch constants
@@ -112,7 +112,6 @@ K2_PROGRAMS_SMALL = 8                  # K2 programs per row for b <= K2_SMALL_M
 K2_PROGRAMS_LARGE = 4                  # K2 programs per row above
 K2_SMALL_MAX_BATCH = 16
 MAX_DECODE_BATCH = 32                  # the decode batches the routes cover: 1 .. 32
-ROUTE_WIDTHS = (9216, 144, 128, 64)    # (di, H, N, P) the gated and split routes are built for
 CONV_WIDTH = 4                         # the conv operators are built for width 4 (a 3-column tail)
 
 
@@ -464,9 +463,9 @@ def _launch_k1_plain(proj, conv_state, ssm_state, conv_w, conv_b, A, dt_bias, D,
 def _launch_k1_gated(proj, conv_state, ssm_state, conv_w, conv_b, A, dt_bias, D, di, H, N, P, bm, nw):
     """gated y (b, di) fp32 (the ``gated`` route; the b == 1 layout only)."""
     b = int(proj.shape[0])
-    if (b, bm, nw, di, H, N, P) != (1, K1_TILE_B1[0], K1_TILE_B1[1]) + ROUTE_WIDTHS:
-        raise RuntimeError(f"neuronspark.dendritic_step_core: the gated K1 route is built for b 1, tile {K1_TILE_B1} "
-                           f"and widths {ROUTE_WIDTHS}; got b {b} tile ({bm}, {nw}) widths {(di, H, N, P)}")
+    if (b, bm, nw) != (1, K1_TILE_B1[0], K1_TILE_B1[1]):
+        raise RuntimeError(f"neuronspark.dendritic_step_core: the gated K1 route is built for b 1, tile {K1_TILE_B1}; "
+                           f"got b {b} tile ({bm}, {nw})")
     y = torch.empty((b, di), dtype=torch.float32, device=proj.device)
     _dendritic_k1_gated_kernel[(P // bm, H, b)](
         proj, conv_state, ssm_state, conv_w, conv_b, A, dt_bias, D, y,
@@ -479,9 +478,8 @@ def _launch_k1_gated(proj, conv_state, ssm_state, conv_w, conv_b, A, dt_bias, D,
 def _launch_k1_split(proj, conv_state, ssm_state, conv_w, conv_b, A, dt_bias, D, di, H, N, P):
     """gated y (b, di) fp32 (the ``split`` route: conv kernel + streaming state kernel)."""
     b = int(proj.shape[0])
-    if b not in (8, 32) or (di, H, N, P) != ROUTE_WIDTHS:
-        raise RuntimeError("neuronspark.dendritic_step_core: the split K1 route is built for b 8 / 32 and widths "
-                           f"{ROUTE_WIDTHS}; got b {b} widths {(di, H, N, P)}")
+    if b not in (8, 32):
+        raise RuntimeError(f"neuronspark.dendritic_step_core: the split K1 route is built for b 8 / 32; got b {b}")
     if int(ssm_state.stride(3)) != 1:
         raise RuntimeError("neuronspark.dendritic_step_core: the split K1 route needs contiguous SSM state rows")
     state_bm, state_warps = K1_SPLIT_STATE_TILE
@@ -728,24 +726,32 @@ def _silu_fast_ref(v: torch.Tensor) -> torch.Tensor:
     return v * (1.0 / (t + 1.0))
 
 
-def dendritic_step_core_ref(proj: torch.Tensor, conv_state: torch.Tensor, ssm_state: torch.Tensor, conv_w: torch.Tensor,
-                     conv_b: torch.Tensor, A: torch.Tensor, dt_bias: torch.Tensor, D: torch.Tensor,
-                     theta: torch.Tensor, gamma: torch.Tensor, eps: float) -> torch.Tensor:
-    """The decode step in pure torch (the chain the kernels replace: ``causal_conv1d_update`` on the bf16 conv input
-    with the fp32 tail, the bf16 rounding of its output, ``selective_state_update`` with dt bias / D / softplus, fla's
-    gated RMSNorm with unit weight on the bf16 y, the soma read-out): returns xs (b, di) bf16; ``conv_state`` and
-    ``ssm_state`` are advanced in place (the state stored in its own dtype), as the kernel does."""
+def dendritic_step_conv_ref(proj: torch.Tensor, conv_state: torch.Tensor, conv_w: torch.Tensor, conv_b: torch.Tensor,
+                            di: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The conv part of K1 (``causal_conv1d_update`` on the bf16 conv input with the fp32 tail, the fast SiLU):
+    returns (xbc (b, conv_dim) fp32 holding the bf16-rounded output, the fp32 output before that rounding); the
+    states are not touched."""
     b = int(proj.shape[0])
-    di, conv_dim, H, N, P = _widths(proj, conv_w, A, theta)
-    z = proj[:, :di].float()
+    conv_dim = int(conv_w.shape[0])
     xBC = proj[:, di:di + conv_dim].float()
-    dt_raw = proj[:, di + conv_dim:di + conv_dim + H].float()
     win = torch.cat([conv_state.float(), xBC[:, :, None]], dim=-1)                 # (b, conv_dim, 4): lags t-3 .. t
     w = conv_w.float()
     pre = conv_b.float()[None, :].expand(b, conv_dim)
     for j in range(CONV_WIDTH):
         pre = pre + w[None, :, j] * win[:, :, j]
-    xbc = _silu_fast_ref(pre).to(torch.bfloat16).float()
+    s32 = _silu_fast_ref(pre)
+    return s32.to(torch.bfloat16).float(), s32
+
+
+def dendritic_step_state_ref(xbc: torch.Tensor, proj: torch.Tensor, ssm_state: torch.Tensor, A: torch.Tensor,
+                             dt_bias: torch.Tensor, D: torch.Tensor, di: int) -> torch.Tensor:
+    """The state part of K1 (``selective_state_update`` with dt bias / D / softplus) on the conv output ``xbc``:
+    returns y (b, di) fp32 before the bf16 rounding of the K1 output; ``ssm_state`` is advanced in place (stored in its
+    own dtype)."""
+    b, H = int(proj.shape[0]), int(A.shape[0])
+    P, N = di // H, int(ssm_state.shape[-1])
+    conv_dim = di + 2 * N
+    dt_raw = proj[:, di + conv_dim:di + conv_dim + H].float()
     x = xbc[:, :di].reshape(b, H, P)
     Bv = xbc[:, di:di + N]
     Cv = xbc[:, di + N:di + 2 * N]
@@ -755,9 +761,43 @@ def dendritic_step_core_ref(proj: torch.Tensor, conv_state: torch.Tensor, ssm_st
     S = ssm_state.float() * dA[:, :, None, None] + dB[:, :, None, :] * x[:, :, :, None]
     y = (S * Cv[:, None, None, :]).sum(dim=-1) + x * D.float()[None, :, None]      # (b, H, P)
     ssm_state.copy_(S)
-    conv_state.copy_(win[:, :, 1:])
-    g = y.reshape(b, di).to(torch.bfloat16).float() * (z * torch.sigmoid(z))
+    return y.reshape(b, di)
+
+
+def dendritic_step_k1_ref(proj: torch.Tensor, conv_state: torch.Tensor, ssm_state: torch.Tensor, conv_w: torch.Tensor,
+                          conv_b: torch.Tensor, A: torch.Tensor, dt_bias: torch.Tensor, D: torch.Tensor,
+                          theta: torch.Tensor) -> torch.Tensor:
+    """The first stage of :func:`dendritic_step_core_ref` (what K1 computes): :func:`dendritic_step_conv_ref` and
+    :func:`dendritic_step_state_ref`; returns y (b, di) fp32 before the bf16 rounding of the K1 output; ``conv_state``
+    and ``ssm_state`` are advanced in place (the state stored in its own dtype)."""
+    di = int(theta.shape[0])
+    conv_dim = int(conv_w.shape[0])
+    xbc, _ = dendritic_step_conv_ref(proj, conv_state, conv_w, conv_b, di)
+    y = dendritic_step_state_ref(xbc, proj, ssm_state, A, dt_bias, D, di)
+    conv_state.copy_(torch.cat([conv_state.float(), proj[:, di:di + conv_dim].float()[:, :, None]], dim=-1)[:, :, 1:])
+    return y
+
+
+def dendritic_step_k2_ref(g: torch.Tensor, theta: torch.Tensor, gamma: torch.Tensor,
+                          eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The second stage of :func:`dendritic_step_core_ref` (what K2 computes) on the gated input ``g`` (b, di) fp32:
+    fla's gated RMSNorm with unit weight, ``n = bf16(g * rstd)``, the soma read-out; returns (xs (b, di) bf16, the
+    fp32 ``g * rstd`` before its bf16 rounding)."""
+    di = int(g.shape[-1])
     var = (g * g).sum(dim=-1, keepdim=True) / di
     rstd = 1.0 / torch.sqrt(var + float(eps))
-    n = (g * rstd).to(torch.bfloat16)
-    return dendritic_soma_readout_ref(n, theta, gamma)
+    n32 = g * rstd
+    return dendritic_soma_readout_ref(n32.to(torch.bfloat16), theta, gamma), n32
+
+
+def dendritic_step_core_ref(proj: torch.Tensor, conv_state: torch.Tensor, ssm_state: torch.Tensor, conv_w: torch.Tensor,
+                     conv_b: torch.Tensor, A: torch.Tensor, dt_bias: torch.Tensor, D: torch.Tensor,
+                     theta: torch.Tensor, gamma: torch.Tensor, eps: float) -> torch.Tensor:
+    """The decode step in pure torch (the chain the kernels replace: :func:`dendritic_step_k1_ref`, the gate
+    ``bf16(y) * silu(z)``, :func:`dendritic_step_k2_ref`): returns xs (b, di) bf16; ``conv_state`` and ``ssm_state``
+    are advanced in place (the state stored in its own dtype), as the kernel does."""
+    di = int(theta.shape[0])
+    y = dendritic_step_k1_ref(proj, conv_state, ssm_state, conv_w, conv_b, A, dt_bias, D, theta)
+    z = proj[:, :di].float()
+    g = y.to(torch.bfloat16).float() * (z * torch.sigmoid(z))
+    return dendritic_step_k2_ref(g, theta, gamma, eps)[0]

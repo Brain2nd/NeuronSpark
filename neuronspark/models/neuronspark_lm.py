@@ -88,6 +88,8 @@ __all__ = [
     "MODEL_INITS",
     "EMBED_INIT_STD",
     "IGNORE_INDEX",
+    "READOUT_MAX_ELEMENTS",
+    "READOUT_ROW_ALIGN",
 ]
 
 MODEL_IMPLS = ("kernel", "ref")
@@ -96,6 +98,11 @@ MODEL_INITS = ("launch", "empty")
 EMBED_INIT_STD = 0.02
 # target id that carries no loss
 IGNORE_INDEX = -100
+# the readout GEMM and the fused readout-balance cross entropy index the (rows, V) logits with 32-bit offsets: a call
+# covers at most READOUT_MAX_ELEMENTS logits; a longer row set is read out in row chunks (a multiple of
+# READOUT_ROW_ALIGN rows each, the last one shorter), each token's logits and loss unchanged
+READOUT_MAX_ELEMENTS = 2 ** 31 - 1
+READOUT_ROW_ALIGN = 1024
 # 2-D parameters that are not projection weights (gathered or consumed in fp32 by their own operators): no bf16 copy
 _NOT_PROJECTION_PREFIXES = ("lexical_memory.tables.",)
 _NOT_PROJECTION_SUFFIXES = (".pkm_values", ".mixer_a.conv_weight")
@@ -395,12 +402,26 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
         return f"impl={self.impl!r}"
 
     # ------------------------------------------------------------------------------------------------ readout
+    def _row_chunks(self, n: int) -> List[Tuple[int, int]]:
+        """(start, stop) row ranges of the readout: one range unless n * V exceeds READOUT_MAX_ELEMENTS."""
+        V = int(self.config.vocab_size)
+        if n * V <= READOUT_MAX_ELEMENTS:
+            return [(0, n)]
+        step = READOUT_MAX_ELEMENTS // V // READOUT_ROW_ALIGN * READOUT_ROW_ALIGN
+        if step < 1:
+            raise RuntimeError(f"NeuronSparkLMHeadModel: a vocabulary of {V} leaves no {READOUT_ROW_ALIGN}-row chunk "
+                               f"within {READOUT_MAX_ELEMENTS} logits")
+        return [(a, min(a + step, n)) for a in range(0, n, step)]
+
     def _readout(self, hidden: torch.Tensor) -> torch.Tensor:
         """hidden (B, R, D) fp32 -> balanced logits (B, R, V) bf16 (the regime is the caller's)."""
         B, R, D = (int(s) for s in hidden.shape)
         rows = hidden.reshape(B * R, D)
-        logits = self._o.linear(rows, self.backbone.embed_tokens.weight)       # (B * R, V) bf16
-        logits = self.backbone.balance_stack.balance(logits, rows)
+        parts = []
+        for a, b in self._row_chunks(B * R):
+            logits = self._o.linear(rows[a:b], self.backbone.embed_tokens.weight)     # (b - a, V) bf16
+            parts.append(self.backbone.balance_stack.balance(logits, rows[a:b]))
+        logits = parts[0] if len(parts) == 1 else torch.cat(parts)
         return logits.view(B, R, int(logits.shape[-1]))
 
     def forward(self, input_ids: torch.Tensor, inference_params: Optional[InferenceParams] = None,
@@ -426,7 +447,8 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
 
         * the backbone's hidden rows (B * T, D), the tied readout ``logits = linear(rows, E)`` (bf16; the fp32 weight
           gradient reaches E together with the embedding lookup's), the per-token cross entropy of the balanced logits
-          by the fused readout-balance + cross-entropy operator (the balanced logits are never stored);
+          by the fused readout-balance + cross-entropy operator (the balanced logits are never stored); in row chunks
+          when B * T * V exceeds ``READOUT_MAX_ELEMENTS`` (each token's loss unchanged);
         * ``ce = sum(per * valid) / max(sum(valid), 1)``;
         * ``aux`` = the copy-switch auxiliary loss on the hippocampal layers' detached operands of this call (weight
           ``hippocampal_copy_novelty_gate_aux``; gradient to each layer's ``copy_novelty_w / _v / _b`` only), computed
@@ -444,9 +466,12 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
             hidden = self.backbone(ids, aux_out=feats)                           # (B, T, D) fp32
             B, T, D = (int(s) for s in hidden.shape)
             rows = hidden.reshape(B * T, D)
-            logits = o.linear(rows, self.backbone.embed_tokens.weight)           # (B * T, V) bf16
             labels = tg.reshape(-1).contiguous()
-            per = self.backbone.balance_stack.ce_per_token(logits, rows, labels)  # (B * T,) fp32
+            parts = []
+            for a, b in self._row_chunks(B * T):
+                logits = o.linear(rows[a:b], self.backbone.embed_tokens.weight)   # (b - a, V) bf16
+                parts.append(self.backbone.balance_stack.ce_per_token(logits, rows[a:b], labels[a:b]))
+            per = parts[0] if len(parts) == 1 else torch.cat(parts)              # (B * T,) fp32
             valid = (labels != IGNORE_INDEX).to(per.dtype)
             n_valid = valid.sum()
             ce = (per * valid).sum() / n_valid.clamp(min=1.0)

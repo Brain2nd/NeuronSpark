@@ -204,7 +204,8 @@ pytest tests
 ```
 
 The model tests build a fresh model of the default configuration and calibrate it on random token rows; no checkpoint
-is needed.
+is needed.  `tests/models/test_widths.py` also runs the model at D = 2048 (training against the references, CUDA-graph
+decoding); the operator tests of the gated-norm soma, product-key read and decode-step kernels cover both widths.
 
 ## Benchmarks
 

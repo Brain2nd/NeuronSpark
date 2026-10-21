@@ -1,7 +1,8 @@
 """ops.triton.dendritic_soma: the gated RMSNorm + soma read-out of the dendritic neuron layer.
 
 * ``gated_norm_soma_fwd`` / ``gated_norm_soma_bwd`` (training: the fused forward storing n, the two-stage backward)
-  on the rows of a training step (8192, 9216) and fewer, with z the strided slice of a projection (row stride 18832);
+  on the rows of a training step (8192, di) and fewer, with z the strided slice of a projection, at the widths of the
+  default configuration (di 9216, projection 18832) and of the D = 2048 configuration (di 12288, projection 25024);
 * each against its pure-torch reference, operator by operator on the same inputs: the gated norm (rstd, n); the
   soma read-out x_soma given the stored n (the read-out is defined on n, which is compared on its own); the soma
   backward (grad_n, dtheta, dgamma) given the stored n; the gated-norm backward (dy, dz) given the first stage's
@@ -30,44 +31,45 @@ from neuronspark.utils.testing import assert_all_match, rand_tensor
 
 pytestmark = pytest.mark.cuda
 
-DI = 9216
-WIDTH = 18832
+WIDTHS = [(9216, 18832), (12288, 25024)]      # (di, projection width) of D = 1536 and D = 2048
 ALPHA = 8.0
 EPS = 1e-5
 ROWS = [8192, 1024, 77]
 
 
-def operands(M, device):
-    """x (M, 9216) bf16 (an SSD output), z the gate slice of a (M, 18832) projection, the unit weight, theta =
+def operands(M, device, di=9216, width=18832):
+    """x (M, di) bf16 (an SSD output), z the gate slice of a (M, width) projection, the unit weight, theta =
     0.02 + softplus(rho) near its launch value, gamma near 1, an incoming gradient dxs and the dz buffer view"""
-    x = rand_tensor((M, DI), torch.bfloat16, device)
-    proj = rand_tensor((M, WIDTH), torch.bfloat16, device)
-    rho = -3.4915204 + 0.5 * rand_tensor((DI,), torch.float32, device)
+    x = rand_tensor((M, di), torch.bfloat16, device)
+    proj = rand_tensor((M, width), torch.bfloat16, device)
+    rho = -3.4915204 + 0.5 * rand_tensor((di,), torch.float32, device)
     theta = (0.02 + F.softplus(rho)).contiguous()
-    gamma = 1.0 + 0.1 * rand_tensor((DI,), torch.float32, device)
-    dxs = rand_tensor((M, DI), torch.bfloat16, device)
-    return {"x": x, "proj": proj, "w": torch.ones(DI, dtype=torch.float32, device=device), "theta": theta,
+    gamma = 1.0 + 0.1 * rand_tensor((di,), torch.float32, device)
+    dxs = rand_tensor((M, di), torch.bfloat16, device)
+    return {"di": di, "x": x, "proj": proj, "w": torch.ones(di, dtype=torch.float32, device=device), "theta": theta,
             "gamma": gamma, "dxs": dxs}
 
 
 def _fwd(o):
-    return gated_norm_soma_fwd(o["x"], o["w"], EPS, o["proj"][:, :DI], o["theta"], o["gamma"])
+    return gated_norm_soma_fwd(o["x"], o["w"], EPS, o["proj"][:, :o["di"]], o["theta"], o["gamma"])
 
 
 def _bwd(o, xo_rstd_n):
     _, rstd, n = xo_rstd_n
+    di = o["di"]
     dproj = torch.empty_like(o["proj"])
-    dz_buf = dproj[:, :DI]
-    dy, dz, gth, gga = gated_norm_soma_bwd(o["dxs"], n, o["x"], o["w"], rstd, o["proj"][:, :DI], dz_buf, o["theta"],
+    dz_buf = dproj[:, :di]
+    dy, dz, gth, gga = gated_norm_soma_bwd(o["dxs"], n, o["x"], o["w"], rstd, o["proj"][:, :di], dz_buf, o["theta"],
                                            o["gamma"], ALPHA)
     assert dz.data_ptr() == dz_buf.data_ptr()
     return {"dy": dy, "dz": dz.contiguous(), "dtheta": gth, "dgamma": gga}
 
 
+@pytest.mark.parametrize("di,width", WIDTHS)
 @pytest.mark.parametrize("M", ROWS)
-def test_gated_norm_soma_vs_reference(device, M):
-    o = operands(M, device)
-    z = o["proj"][:, :DI]
+def test_gated_norm_soma_vs_reference(device, M, di, width):
+    o = operands(M, device, di, width)
+    z = o["proj"][:, :di]
     f = _fwd(o)
     xo, rstd, n = f
     rf = gated_norm_soma_fwd_ref(o["x"], o["w"], EPS, z, o["theta"], o["gamma"])
@@ -86,5 +88,5 @@ def test_gated_norm_soma_vs_reference(device, M):
 def test_refusals(device):
     o = operands(4, device)
     with pytest.raises(RuntimeError):
-        gated_norm_soma_fwd(o["x"][:, :4096], o["w"][:4096], EPS, o["proj"][:, :4096], o["theta"][:4096],
-                            o["gamma"][:4096])                                   # not 9 x 1024 columns
+        gated_norm_soma_fwd(o["x"][:, :4000], o["w"][:4000], EPS, o["proj"][:, :4000], o["theta"][:4000],
+                            o["gamma"][:4000])                                   # not a multiple of 1024 columns

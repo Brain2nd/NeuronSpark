@@ -2,7 +2,7 @@
 
 * training ``pkm_value_read`` (output and the gradients of the slot weights and of the value table) at B 8 x T 256
   against the float64 reference (``F.embedding`` + einsum); slot ids with hot slots (thousands of occurrences, many
-  64-occurrence chunks) and with uniform ids;
+  64-occurrence chunks) and with uniform ids; value widths 768 (D = 1536) and 1024 (D = 2048);
 * gradients of one input only (frozen weights / frozen table) against the both-gradients call;
 * prefill ``pkm_weighted_sum`` at b in {1, 8} and the prefill lengths against the float64 reference;
 * the refusals outside the contract.
@@ -25,6 +25,7 @@ from neuronspark.utils.testing import assert_all_match, rand_tensor
 pytestmark = pytest.mark.cuda
 
 S, D, H, K = 16384, 768, 4, 16
+WIDTHS = (768, 1024)                 # value widths of D = 1536 and D = 2048
 M = H * K
 B_TRAIN = 8
 T_REF = 256
@@ -33,7 +34,7 @@ PREFILL_T = (2, 3, 63, 64, 256, 1024, 2048)
 DISTS = ("hot", "uniform")
 
 
-def _inputs(T, B, dist, device):
+def _inputs(T, B, dist, device, D=D):
     """w: per-head softmax weights (T, B, 64) fp32; u: slot ids (T, B, 64) int64 ("hot": S * U^2, so the low slots
     get thousands of occurrences; "uniform"); V: (S, D) fp32 table N(0, 1/D); go: an upstream gradient (T, B, D)."""
     w = torch.softmax(rand_tensor((T, B, H, K), torch.float32, device) * 2.0, dim=-1).reshape(T, B, M).contiguous()
@@ -59,12 +60,13 @@ def _run(fn, inp, need_w=True, need_v=True):
     return out
 
 
+@pytest.mark.parametrize("width", WIDTHS)
 @pytest.mark.parametrize("dist", DISTS)
-def test_pkm_value_read_vs_reference(device, dist):
-    inp = _inputs(T_REF, B_TRAIN, dist, device)
+def test_pkm_value_read_vs_reference(device, dist, width):
+    inp = _inputs(T_REF, B_TRAIN, dist, device, width)
     new = _run(pkm_value_read, inp)
     ref = _run(pkm_value_read_ref, inp)
-    assert_all_match(new, ref, prefix=f"read_{dist}")
+    assert_all_match(new, ref, prefix=f"read_{dist}_{width}")
 
 
 @pytest.mark.parametrize("need", ("w", "V"))

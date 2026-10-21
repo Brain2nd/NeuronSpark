@@ -24,7 +24,7 @@ import torch
 import neuronspark.modules.pool_attention as PA
 from neuronspark.models.config_neuronspark import NeuronSparkConfig
 from neuronspark.modules.copy_detector import copy_stats_session, copy_stats_whole_row
-from neuronspark.modules.induction import induction_match_matrices, induction_session_match
+from neuronspark.modules.induction import induction_session_match, induction_token_windows
 from neuronspark.modules.hippocampal_layer import HippocampalLayer
 from neuronspark.modules.plif import W_CLAMP_MAX
 from neuronspark.modules.pool_attention import value_residual_anchor
@@ -144,7 +144,7 @@ def _whole_row(layer, ids, lex_table, h, carry, g_out=None, g_carry=None, aux_ou
     hr = h.detach().clone().requires_grad_(g_out is not None)
     cr = None if carry is None else carry.detach().clone().requires_grad_(g_out is not None)
     with regime("train"):
-        ind = induction_match_matrices(ids, CFG.hippocampal_induction_bias_orders, pad=V)
+        ind = induction_token_windows(ids, CFG.hippocampal_induction_bias_orders, pad=V)
         copy = copy_stats_whole_row(lex)
         out, carry_out = layer(hr, lex=lex, ind=ind, copy=copy, carry=cr, aux_out=aux_out, calib=calib)
     outs = {"h": out.detach(), "carry": carry_out.detach()}
@@ -293,7 +293,7 @@ def test_forward_requires_the_regime_autocast(device):
     layer = _loaded(3, _exercised_state(3, device), device)
     ids, table, h, _ = _row_inputs(64, 2, device, 0)
     lex = _lex(table, ids)
-    ind = induction_match_matrices(ids, CFG.hippocampal_induction_bias_orders, pad=V)
+    ind = induction_token_windows(ids, CFG.hippocampal_induction_bias_orders, pad=V)
     copy = copy_stats_whole_row(lex)
     with pytest.raises(RuntimeError), torch.no_grad():
         layer(h, lex=lex, ind=ind, copy=copy, carry=None)
@@ -342,7 +342,7 @@ def test_attention_subblock_vs_reference_operators(device, layer_idx, hippocampa
         hr = h.detach().clone().requires_grad_(True)
         cr = None if carry is None else carry.detach().clone().requires_grad_(True)
         with regime("train"):
-            ind = induction_match_matrices(ids, CFG.hippocampal_induction_bias_orders, pad=V)
+            ind = induction_token_windows(ids, CFG.hippocampal_induction_bias_orders, pad=V)
             h1 = layer._lexical_read_train(hr, lex)
             z = layer._ops.row_rmsnorm(h1, None, layer.norm_eps)
             r, c_out = layer._attention_train(h1, z, ind, cr)

@@ -69,7 +69,7 @@ class NeuronSparkConfig:
       (anchor pairs of hippocampal layers 1..5; hippocampal layer 0 is the value source), ``hippocampal_read_copy_gain``
       (read gain ``1 + 4 pi c``), ``hippocampal_copy_novelty_gate_init`` (init of ``copy_novelty_b``),
       ``hippocampal_copy_novelty_gate_aux`` (weight of the copy-switch auxiliary loss),
-      ``hippocampal_induction_bias_orders`` (n-gram orders of the induction match matrices).
+      ``hippocampal_induction_bias_orders`` (n-gram orders of the induction matches).
     * product-key memory: ``hippocampal_pkm_heads``, ``_subkeys`` (slots = subkeys ** 2), ``_topk``, ``_query_dim``,
       ``_value_dim``, launch calibration ``_launch_ratio`` / ``_kmeans_iters``, ``hippocampal_pkm_copy_gate_strength``
       (``rho = 2 sigmoid(-strength * pi)``).

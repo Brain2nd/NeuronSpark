@@ -184,7 +184,7 @@ custom ops.  `neuronspark/ops/registry.py` lists every operator with its signatu
 | synaptic filter (conv), norms, residual | `ops/triton/dendritic_{conv,prenorm,gated_norm,residual}.py` | train, prefill |
 | dendritic neuron step | `ops/triton/dendritic_step.py` | decode |
 | PLIF neurons | `ops/triton/plif.py`, `ops/gluon/plif_k1_bwd.py` | train, prefill |
-| hippocampal recall (pool attention) | `ops/triton/pool_{attn,bias}.py`, `ops/triton/hippo_{heads,rope,norms,residual}.py` | train |
+| hippocampal recall (pool attention) | `ops/pool_read.py`, `ops/gluon/pool_read_{fwd,bwd,tile}.py`, `ops/triton/hippo_{heads,rope,norms,residual}.py` | train |
 | hippocampal slot rings, extra queries | `ops/triton/pool_ring.py`, `ops/triton/xq_query.py` | prefill, decode |
 | short conv | `ops/triton/short_conv.py` | train, prefill, decode |
 | cumulative sums | `ops/triton/cumsum.py` | train, prefill |

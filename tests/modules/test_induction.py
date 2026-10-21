@@ -1,6 +1,7 @@
-"""Induction match matrices (whole row) and the session match against the keys ring.
+"""Induction matches: the whole-row id windows (as match matrices) and the session match against the keys ring.
 
-* whole row against a direct transcription of the definition (also on rows of 1 .. 5 tokens);
+* the matrices of the whole-row windows against a direct transcription of the definition (also on rows of 1 .. 5
+  tokens);
 * the session form (calls of several lengths from the row start) against the whole-row matrices at the written slots;
 * the ring helpers (slot positions, strict-past mask).
 
@@ -13,8 +14,8 @@ import pytest
 import torch
 
 from neuronspark.models.config_neuronspark import NeuronSparkConfig
-from neuronspark.modules.induction import (INDUCTION_ORDERS, induction_match_matrices, induction_session_match,
-                                           ring_positions, ring_strict_past)
+from neuronspark.modules.induction import (INDUCTION_ORDERS, induction_session_match, induction_token_windows,
+                                           induction_window_matches, ring_positions, ring_strict_past)
 from neuronspark.utils.cache import InductionState
 from neuronspark.utils.testing import assert_all_match, assert_match
 
@@ -30,6 +31,11 @@ def _ids(B: int, T: int, device, vocab: int = 6) -> torch.Tensor:
     """Ids from a small set (n-grams recur often)."""
     g = torch.Generator(device=device).manual_seed(5)
     return torch.randint(0, vocab, (B, T), generator=g, device=device)
+
+
+def _whole(ids: torch.Tensor):
+    """The whole-row matrices: the matches of the id windows."""
+    return induction_window_matches(*induction_token_windows(ids, ORDERS, V), ORDERS)
 
 
 def _definition(ids: torch.Tensor, orders, pad: int):
@@ -68,7 +74,7 @@ def _session(ids: torch.Tensor, chunks, W: int, device) -> dict:
 
 def test_whole_row_definition(device):
     ids = _ids(2, 40, device)
-    new = induction_match_matrices(ids, ORDERS, V)
+    new = _whole(ids)
     ref = _definition(ids, ORDERS, V)
     assert_all_match(list(new), list(ref), prefix="induction_definition")
     m2, m3, m4 = new
@@ -78,7 +84,7 @@ def test_whole_row_definition(device):
 def test_whole_row_short_rows(device):
     for T in (1, 2, 3, 4, 5):
         ids = _ids(1, T, device)
-        new = induction_match_matrices(ids, ORDERS, V)
+        new = _whole(ids)
         assert all(tuple(m.shape) == (1, T, T) and m.dtype == torch.bool for m in new)
         assert_all_match(list(new), list(_definition(ids, ORDERS, V)), prefix=f"induction_T{T}")
 
@@ -88,7 +94,7 @@ def test_session_vs_whole_row(device):
     B = 2
     L = sum(CHUNKS)
     ids = _ids(B, L, device)
-    whole = induction_match_matrices(ids, ORDERS, V)
+    whole = _whole(ids)
     new = _session(ids, CHUNKS, W, device)
     ref, off = {}, 0
     for i, T in enumerate(CHUNKS):

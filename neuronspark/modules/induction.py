@@ -1,14 +1,17 @@
-"""Induction match matrices of the hippocampal layers' pool attention (model level, pure torch, bool).
+"""Induction matches of the hippocampal layers' pool attention (model level, pure torch).
 
-Whole row (:func:`induction_match_matrices`): one (B, T, T) bool matrix per order n in ``orders`` (default
-configuration: (2, 3, 4)),
-ascending::
+The order-n match of query position t and key position j::
 
     m_n[b, t, j] = 1[j <= t - 1] * prod_{i = 0 .. n-1} 1[x_{t-i} == x_{j-1-i}]
 
-with every compared index in range (an index before the row start never matches).  The matrices are nested
-(m_4 is a subset of m_3, of m_2). Each hippocampal layer forms its additive pool term ``sum_n beta[n, h] m_n`` from them
-with its own ``pool_ind_beta``.
+with every compared index in range (an index before the row start never matches); orders ``orders`` (default
+configuration: (2, 3, 4)), nested (m_4 is a subset of m_3, of m_2).  Each hippocampal layer forms its additive pool
+term ``sum_n beta[n, h] m_n`` with its own ``pool_ind_beta``.
+
+Whole row (:func:`induction_token_windows`): the two (B, T, n_max) id windows ``qtok[b, t, i] = x_{t-i}`` and
+``ktok[b, j, i] = x_{j-1-i}`` (pad id ``V`` outside the row), from which the training pool read forms the matches of
+each (t, j) tile in-kernel; :func:`induction_window_matches` materialises the (B, T, T) matrices from them (the
+reference of the pool read and the tests).
 
 Inference (:func:`induction_session_match`): the cache keeps a keys ring
 (:class:`~neuronspark.utils.cache.InductionState`): slot ``w`` holds the ``n_max`` ids preceding the event written
@@ -34,7 +37,8 @@ import torch
 from neuronspark.utils.cache import InductionState
 
 __all__ = [
-    "induction_match_matrices",
+    "induction_token_windows",
+    "induction_window_matches",
     "induction_session_match",
     "ring_positions",
     "ring_strict_past",
@@ -52,32 +56,40 @@ def _orders(orders: Sequence[int]) -> Tuple[int, ...]:
     return out
 
 
-def induction_match_matrices(ids: torch.Tensor, orders: Sequence[int] = INDUCTION_ORDERS,
-                             pad: int = 151669) -> Tuple[torch.Tensor, ...]:
-    """Whole row: ``ids`` (B, T) int -> one (B, T, T) bool match matrix per order (ascending); ``pad`` = the id
-    outside the vocabulary (vocab_size).  Static shapes, no host sync."""
-    x = ids
-    if x.dim() != 2:
-        raise ValueError(f"induction_match_matrices: ids must be (B, T), got {tuple(x.shape)}")
-    B, T = (int(s) for s in x.shape)
+def induction_token_windows(ids: torch.Tensor, orders: Sequence[int] = INDUCTION_ORDERS,
+                            pad: int = 151669) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Whole row: ``ids`` (B, T) int -> (qtok, ktok) (B, T, max(orders)) int32 contiguous, ``qtok[b, t, i] = x_{t-i}``,
+    ``ktok[b, j, i] = x_{j-1-i}``; ``pad`` = the id outside the vocabulary (vocab_size) outside the row.  Static
+    shapes, no host sync."""
+    if ids.dim() != 2:
+        raise ValueError(f"induction_token_windows: ids must be (B, T), got {tuple(ids.shape)}")
+    B, T = (int(s) for s in ids.shape)
+    n_max = max(_orders(orders))
+    x = ids.to(torch.int32)
+    base = n_max + 1
+    padded = torch.cat([x.new_full((B, base), int(pad)), x], dim=1)
+    t = torch.arange(T, device=ids.device)
+    qtok = torch.stack([padded[:, base + t - i] for i in range(n_max)], dim=-1)
+    ktok = torch.stack([padded[:, base + t - 1 - i] for i in range(n_max)], dim=-1)
+    return qtok.contiguous(), ktok.contiguous()
+
+
+def induction_window_matches(qtok: torch.Tensor, ktok: torch.Tensor,
+                             orders: Sequence[int] = INDUCTION_ORDERS) -> Tuple[torch.Tensor, ...]:
+    """Whole row: the (B, T, T) bool match matrix of every order (ascending) from the id windows of
+    :func:`induction_token_windows`."""
     orders = _orders(orders)
-    n_max = max(orders)
-    past = torch.ones(T, T, device=x.device, dtype=torch.bool).tril(-1)                   # [t, j]: j <= t - 1
-    shifted = [x]                                                                          # shifted[k][b, j] = x_{j-k}
-    for k in range(1, n_max + 1):
-        # pad then slice: width exactly T for any T >= 1 (T <= k: all pad, nothing matches)
-        shifted.append(torch.cat([x.new_full((B, k), int(pad)), x], dim=1)[:, :T])
-    _pos = torch.arange(T, device=x.device)
-
-    def pos_ok(k: int) -> torch.Tensor:                                                    # (B, T): j - k in range
-        return (_pos >= k).unsqueeze(0).expand(B, T)
-
-    acc = past.unsqueeze(0).expand(B, T, T)
+    B, T, n_max = (int(s) for s in qtok.shape)
+    if tuple(ktok.shape) != (B, T, n_max) or n_max < max(orders):
+        raise ValueError(f"induction_window_matches: windows {tuple(qtok.shape)} / {tuple(ktok.shape)} for orders "
+                         f"{orders}")
+    pos = torch.arange(T, device=qtok.device)
+    acc = (pos.view(1, T, 1) - 1 >= pos.view(1, 1, T)).expand(B, T, T)                    # [t, j]: j <= t - 1
     out = []
-    for n in range(1, n_max + 1):
-        acc = acc & (shifted[n - 1].unsqueeze(2) == shifted[n].unsqueeze(1))              # x_{t-(n-1)} == x_{j-n}
+    for n in range(1, max(orders) + 1):
+        acc = acc & (qtok[:, :, None, n - 1] == ktok[:, None, :, n - 1])                  # x_{t-n+1} == x_{j-n}
         if n in orders:
-            out.append(acc & pos_ok(n - 1).unsqueeze(2) & pos_ok(n).unsqueeze(1))
+            out.append(acc & (pos.view(1, T, 1) >= n - 1) & (pos.view(1, 1, T) >= n))
     return tuple(out)
 
 

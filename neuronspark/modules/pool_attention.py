@@ -33,7 +33,9 @@ Regime differences kept explicitly in the code paths (each regime has its own nu
 * match gain gq: bf16 in the whole row (q is bf16 when the gain is formed); fp32 for the six heads in prefill and
   decode (the gain multiplies the fp32 unit query); the extra queries form their gain in the bf16 query dtype in every
   regime;
-* whole row: the per-head mask is materialised (``ops.pool_bias_mask``) and read by ``ops.pool_attention``;
+* whole row: one ``ops.pool_read`` per layer reads every head and the extra queries (the bias and the induction
+  matches formed per tile from the clocks and the id windows of ``induction_token_windows``; nothing T x T is
+  materialised);
   prefill and decode write each call's events into per-head rings (unit keys, tagged values, absolute clocks; capacity
   W) and read the rings: prefill by ``ops.ring_write_prefill`` + ``ops.ring_recall_prefill`` (the induction term formed
   in-kernel from the matches), decode by the torch ring write and ``ops.ring_read_t1`` at the decode batch sizes
@@ -323,6 +325,16 @@ class PoolAttentionMixin:
         return self.pool_ind_beta.view(len(self.induction_orders), self.hippocampal_heads)
 
     # ------------------------------------------------------------------------------------------------ shared pieces
+    def _check_windows(self, ind, B: int, T: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        n = max(self.induction_orders)
+        if (not isinstance(ind, (tuple, list)) or len(ind) != 2
+                or any(not isinstance(w, torch.Tensor) or tuple(w.shape) != (B, T, n) or w.dtype != torch.int32
+                       for w in ind)):
+            got = None if not isinstance(ind, (tuple, list)) else [tuple(getattr(w, "shape", ())) for w in ind]
+            raise RuntimeError(f"hippocampal layer: the whole-row induction bias needs the two int32 ({B}, {T}, {n}) id "
+                               f"windows of induction_token_windows, got {got}")
+        return ind[0], ind[1]
+
     def _check_ind(self, ind, shape: Tuple[int, int, int]) -> Tuple[torch.Tensor, ...]:
         if (not isinstance(ind, (tuple, list)) or len(ind) != len(self.induction_orders)
                 or any(not isinstance(m, torch.Tensor) or tuple(m.shape) != tuple(shape) or m.dtype != torch.bool
@@ -446,7 +458,7 @@ class PoolAttentionMixin:
         lin = o.linear
         T, B, D = (int(s) for s in h.shape)
         H, dk, dv = self.hippocampal_heads, self.hippocampal_head_dim, self.hippocampal_value_head_dim
-        ind = self._check_ind(ind, (B, T, T))
+        qtok, ktok = self._check_windows(ind, B, T)
         # qkv projection (on the (T * B, D) view) and the causal short conv
         qkv = lin(z.reshape(T * B, D), self.qkv_proj.weight).view(T, B, -1)
         qkv = o.short_conv_train(qkv, self.qkv_conv.weight)
@@ -483,36 +495,28 @@ class PoolAttentionMixin:
         wbias = self.pool_write_bias_total()
         qn, kn, gn = o.pool_heads(q, k, gate, qgain, wbias, H, dk)
         vs = o.value_split(v, H, dv)
-        beta = self.induction_beta()
-        heads = []
-        for i in range(H):
-            x_i = o.pool_induction_term(beta[:, i], ind)
-            out_i = self._pool_read_train(qn[i], kn[i], vs[i], gn[i], a, gains[i], x_i, T, B)
-            if i == H - 1:
-                out_i = out_i + self._extra_query_read_train(z, kn[i], vs[i], gn[i], a, cos, sin, qgain[i], gains[i],
-                                                             x_i, T, B)
-            heads.append(out_i)
+        # one pool read for the layer: the H heads, then the last head's extra queries (its keys, tagged values,
+        # clock and induction term)
+        xq = self._extra_queries_train(z, cos, sin, qgain[H - 1])
+        q_all = torch.cat([torch.stack(qn, dim=2), xq.to(qn[0].dtype)], dim=2)          # (T, B, H + M, dk)
+        gv = torch.stack([self._tagged_values(gn[i], vs[i]) for i in range(H)], dim=2)  # (T, B, H, dv) bf16
+        cum = torch.stack([o.cumsum0(self._trace_increment(a, T, B, gains[i])) for i in range(H)], dim=2)
+        reads = o.pool_read(q_all, torch.stack(kn, dim=2), gv, cum, self.induction_beta(), qtok, ktok,
+                            self.induction_orders, self.match_scale)                    # (T, B, H + M, dv) bf16
+        heads = [reads[:, :, i].to(torch.float32) for i in range(H)]
+        heads[-1] = heads[-1] + self._extra_query_out_train(reads[:, :, H:])
         attn = torch.cat(heads, dim=-1)
         # zero-centred output norm x sigmoid gate (the gate reads h), output projection, centring
         gate_logits = lin(h.reshape(T * B, D), self.attn_out_gate.weight).view(T, B, -1)
         attn = o.out_norm_gate(attn, self.attn_out_norm.weight, gate_logits, self.attn_out_norm.eps)
         return self._out_proj_centred(attn), carry_out
 
-    def _pool_read_train(self, q_i, k_i, v_i, g_i, a, gain, x_i, T: int, B: int) -> torch.Tensor:
-        """One head's whole-row read (T, B, dv) fp32: tagging, gained clock, mask (with the induction term), softmax
-        attention at scale sqrt(dk)."""
-        o = self._ops
-        gv = self._tagged_values(g_i, v_i)
-        cum = o.cumsum0(self._trace_increment(a, T, B, gain))
-        mask = o.pool_bias_mask(cum, x_i, T, B)
-        return o.pool_attention(q_i, k_i, gv, mask, self.match_scale, False).to(torch.float32)
-
-    def _extra_query_read_train(self, z, k_i, v_i, g_i, a, cos, sin, head_gain, gain, x_i, T: int, B: int):
-        """Whole-row addend (T, B, dv) bf16 of the last head's extra queries (same keys, tagged values, clock and
-        induction term as the head; mask and tagging formed again for this read)."""
+    def _extra_queries_train(self, z, cos, sin, head_gain) -> torch.Tensor:
+        """(T, B, M, dk) the last head's extra queries (whole row): SiLU of the rank-r projections, RoPE on the head's
+        band, normalised, times exp(clamp(psi)) and the head's match gain."""
         o = self._ops
         lin = o.linear
-        M, r, dv = self.xq_count, self.xq_rank, self.hippocampal_value_head_dim
+        M, r = self.xq_count, self.xq_rank
         cos5, sin5 = self._xq_band(cos), self._xq_band(sin)
         zc = z.contiguous()
         u = lin(zc, self.pool_xq_a)
@@ -523,14 +527,14 @@ class PoolAttentionMixin:
             q_m = F.normalize(o.rope_paired(q_m, cos5.to(q_m.dtype), sin5.to(q_m.dtype)), dim=-1)
             g = torch.exp(psi[..., m:m + 1]) * head_gain.to(torch.float32)
             queries.append(q_m * g.to(q_m.dtype))
-        gv = self._tagged_values(g_i, v_i)
-        cum = o.cumsum0(self._trace_increment(a, T, B, gain))
-        mask = o.pool_bias_mask(cum, x_i, T, B)
-        # (T, B, M, dk) view of the (M, T, B, dk) stack: the operand strides the extra-query read expects
-        reads = o.pool_attention(torch.stack(queries, dim=0).permute(1, 2, 0, 3), k_i, gv, mask, self.match_scale,
-                                 True)
-        reads = reads.reshape(T, B, M * dv).to(torch.float32)
-        return lin(lin(reads, self.pool_xq_out_in).contiguous(), self.pool_xq_out)
+        return torch.stack(queries, dim=2)
+
+    def _extra_query_out_train(self, reads: torch.Tensor) -> torch.Tensor:
+        """Whole-row addend (T, B, dv) of the last head from its extra queries' reads (T, B, M, dv) bf16."""
+        lin = self._ops.linear
+        T, B = int(reads.shape[0]), int(reads.shape[1])
+        r = reads.reshape(T, B, self.xq_count * self.hippocampal_value_head_dim).to(torch.float32)
+        return lin(lin(r, self.pool_xq_out_in).contiguous(), self.pool_xq_out)
 
     # ------------------------------------------------------------------------------------------------ prefill
     def _short_conv_two(self, qkv: torch.Tensor, hist: torch.Tensor) -> torch.Tensor:

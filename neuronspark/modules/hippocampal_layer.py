@@ -17,8 +17,8 @@ One call, residual stream h (T, B, D) fp32:
 ``forward(h, *, lex, ind, copy, carry=None, inference_params=None, aux_out=None, calib=None) -> (h_out, carry)``:
 
 * ``lex`` (T, B, 160) fp32: the model-level lexical vector of this call;
-* ``ind``: one bool tensor per induction order, (B, T, T) whole-row match matrices or (B, T, W) ring matches of an
-  inference call;
+* ``ind``: whole row, the two (B, T, max order) int32 id windows of ``induction_token_windows``; an inference call,
+  one bool (B, T, W) ring-match tensor per induction order;
 * ``copy``: the model-level copy-detector statistics ``(maximum, lse)``, each (T, B) fp32;
 * ``carry``: the value stream (T, B, 1536) bf16 of hippocampal layer 0 for this call (None into hippocampal layer 0,
   which returns its own; the later layers return the carry they received);

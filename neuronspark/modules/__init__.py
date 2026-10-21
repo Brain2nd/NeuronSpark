@@ -4,7 +4,7 @@ Building blocks (this package): ``Linear`` / ``ShortConvWeight`` (``linear``), `
 (``norms``), the RoPE tables and reference (``rope``).  Layers (imported on first access): ``DendriticNeuronLayer`` /
 ``DendriticNeurons`` (``dendritic_neuron_layer``), ``HippocampalLayer`` (``hippocampal_layer``), ``PLIFNeuron``
 (``plif``), ``SpikingFFN`` (``spiking_ffn``), ``LexicalMemory`` (``lexical_memory``), ``ReadoutBalance``
-(``readout_balance``), the induction match matrices (``induction``) and the copy-detector statistics
+(``readout_balance``), the induction matches (``induction``) and the copy-detector statistics
 (``copy_detector``).
 
 ``mechanism_init_seed(base, layer_idx)`` is the seed of the forked RNG stream from which a mechanism draws its launch
@@ -23,7 +23,8 @@ __all__ = [
     "rope_head_band_tables", "apply_rope_interleaved_ref", "mechanism_init_seed",
     "DendriticNeuronLayer", "DendriticNeurons", "HippocampalLayer", "PLIFNeuron", "SpikingFFN", "LexicalMemory",
     "ReadoutBalance",
-    "induction_match_matrices", "induction_session_match", "copy_stats_whole_row", "copy_stats_session", "copy_pi",
+    "induction_token_windows", "induction_window_matches", "induction_session_match", "copy_stats_whole_row",
+    "copy_stats_session", "copy_pi",
 ]
 
 
@@ -42,7 +43,8 @@ _LAZY = {
     "SpikingFFN": "neuronspark.modules.spiking_ffn",
     "LexicalMemory": "neuronspark.modules.lexical_memory",
     "ReadoutBalance": "neuronspark.modules.readout_balance",
-    "induction_match_matrices": "neuronspark.modules.induction",
+    "induction_token_windows": "neuronspark.modules.induction",
+    "induction_window_matches": "neuronspark.modules.induction",
     "induction_session_match": "neuronspark.modules.induction",
     "copy_stats_whole_row": "neuronspark.modules.copy_detector",
     "copy_stats_session": "neuronspark.modules.copy_detector",

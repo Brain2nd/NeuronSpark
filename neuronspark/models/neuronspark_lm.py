@@ -5,7 +5,7 @@ Backbone (state-dict prefix ``backbone.``)::
 
     x    = embed_tokens(ids)                                  (T, B, D) fp32 residual stream
     lex  = lexical_memory(ids)                                (T, B, 160) fp32, model level, read by every hippocampal
-    layer ind  = induction match matrices (orders 2, 3, 4)          bool, model level copy = copy-detector statistics
+    layer ind  = induction id windows (orders 2, 3, 4)              int32, model level copy = copy-detector statistics
     (maximum, lse)            (T, B) fp32 each, model level for i in 0 .. 23:   x = DendriticNeuronLayer_i(x)
     18 dendritic neuron layers (i not in 3, 7, 11, 15, 19, 23)
                         x, carry = HippocampalLayer_i(x, lex, ind, copy, carry)     6 hippocampal layers (3:1 layout)
@@ -64,7 +64,7 @@ from torch.utils.checkpoint import checkpoint
 from neuronspark import ops as _ops
 from neuronspark.models.config_neuronspark import NeuronSparkConfig
 from neuronspark.modules.copy_detector import allocate_copy_state, copy_stats_session, copy_stats_whole_row
-from neuronspark.modules.induction import allocate_induction_state, induction_match_matrices, induction_session_match
+from neuronspark.modules.induction import allocate_induction_state, induction_session_match, induction_token_windows
 from neuronspark.modules.lexical_memory import LexicalMemory
 from neuronspark.modules.hippocampal_layer import HippocampalLayer
 from neuronspark.modules.norms import RMSNorm
@@ -248,7 +248,7 @@ class NeuronSparkModel(nn.Module):
         with regime("train"):
             x = self.embed_tokens(ids).transpose(0, 1)                       # (T, B, D) fp32, B-major storage
             lex = self.lexical_memory(ids)                                   # (T, B, 160) fp32
-            ind = induction_match_matrices(ids, cfg.hippocampal_induction_bias_orders, pad=int(cfg.vocab_size))
+            ind = induction_token_windows(ids, cfg.hippocampal_induction_bias_orders, pad=int(cfg.vocab_size))
             copy = copy_stats_whole_row(lex, tuple(cfg.lexical_order1_slice))
             ckpt = bool(self.gradient_checkpointing) and torch.is_grad_enabled()
             ckpt_h = ckpt and bool(self.hippocampal_checkpointing)

@@ -166,16 +166,11 @@ _SPECS: List[OpSpec] = [
         "(B, 4608) bf16", "decode", mutates="hist",
         doc="x (B, 4608) bf16, hist (B, 4608, 3) fp32, weight (4608, 1, 4) fp32"),
     # ---------------------------------------------------------------------------------------------- pool attention (train)
-    _op("pool_induction_term", _T + "pool_bias", "beta ind",
-        "(B, T, T) fp32", "train",
-        doc="beta (3,) fp32 = the head's slice of pool_ind_beta, ind 3 x (B, T, T) bool match matrices"),
-    _op("pool_bias_mask", _T + "pool_bias", "cum X T B",
-        "(B, 1, T, T) bf16 additive mask", "train",
-        doc="cum (T, B) fp32 clocks, X (B, T, T) fp32 induction term"),
-    _op("pool_attention", _T + "pool_attn", "q k v mask scale kshared",
-        "(T, B, [H,] 256) bf16", "train",
-        doc="q, k (T, B, [H,] 256) fp32 unit rows, v bf16, mask (B, 1, T, T) bf16, scale 16.0, kshared: k shared "
-            "across the query group"),
+    _op("pool_read", "neuronspark.ops.pool_read", "q k gv cum beta qtok ktok orders scale",
+        "(T, B, 10, 256) bf16: the 6 heads' reads, then the last head's 4 extra-query reads", "train",
+        doc="q (T, B, 10, 256) fp32 gained unit queries (6 heads, 4 extra queries), k (T, B, 6, 256) fp32 unit keys, "
+            "gv (T, B, 6, 256) bf16 tagged values, cum (T, B, 6) fp32 clocks, beta (3, 6) fp32 = pool_ind_beta, "
+            "qtok / ktok (B, T, 4) int32 id windows, orders (2, 3, 4), scale 16.0"),
     # ---------------------------------------------------------------------------------------------- inference rings
     _op("ring_write_prefill", _T + "pool_ring",
         "k_h q_h g_h v_h qgain wbias sparsity pool_k pool_gv ring_ptr T B H W",

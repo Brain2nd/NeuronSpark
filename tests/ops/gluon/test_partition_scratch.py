@@ -29,6 +29,10 @@ KERNELS = [
     ("_chunk_scan_dx_kernel", "test_dendritic_chunk_scan_dx.py", "test_vs_reference"),
     ("_dda_kernel", "test_dendritic_dda.py", "test_dda_vs_reference"),
     ("_dstates_kernel", "test_dendritic_dstates.py", "test_dstates_vs_reference"),
+    ("_pool_read_fwd_kernel", "../test_pool_read.py", "test_pool_read_vs_reference"),
+    ("_dv_kernel", "../test_pool_read.py", "test_pool_read_vs_reference"),
+    ("_dk_kernel", "../test_pool_read.py", "test_pool_read_vs_reference"),
+    ("_dq_kernel", "../test_pool_read.py", "test_pool_read_vs_reference"),
 ]
 AFTER_ALLOCATION = "IR Dump Before TritonTensorMemoryAllocationPass"
 

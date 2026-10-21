@@ -6,6 +6,9 @@
 > Zhengzheng Tang, Hao Zhu, Zhewei Chen, Dajiang Tao\
 > Paper: https://arxiv.org/abs/2603.16148
 
+Related paper: **NeuronSpark: Selective Spiking State Space Models with Adaptive Computation for Language Modeling**,
+Zhengzheng Tang, Hao Zhu, Dajiang Tao, Yuhui Zhang (https://openreview.net/forum?id=P7pyNdvnfr).
+
 ## About
 
 NeuronSpark is a spiking language model built from neuron models.  Its dendritic neuron layers are populations of
@@ -168,6 +171,14 @@ default configuration (calibrated on random rows); `--ckpt DIR` loads a checkpoi
   author={Tang, Zhengzheng and Zhu, Hao and Chen, Zhewei and Tao, Dajiang},
   journal={arXiv preprint arXiv:2603.16148},
   year={2026}
+}
+
+@misc{tang2026selective,
+  title={NeuronSpark: Selective Spiking State Space Models with Adaptive Computation for Language Modeling},
+  author={Tang, Zhengzheng and Zhu, Hao and Tao, Dajiang and Zhang, Yuhui},
+  year={2026},
+  howpublished={OpenReview},
+  url={https://openreview.net/forum?id=P7pyNdvnfr}
 }
 ```
 

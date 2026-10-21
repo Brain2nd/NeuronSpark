@@ -18,7 +18,8 @@ Checked with the per-operator tolerance rule against :func:`neuronspark.ops.pool
 scratch inside the partitions (every reduction runs along a thread's own row).
 
 Launch constants: BNK 128 key rows, BMQ_V = BMQ_K = 32 query rows per step; BM_Q 128 query rows, BN_Q 32 key rows per
-step; rings R 2; registers 48 for the load / MMA warps.
+step; rings R_V 3 (value gradient; 10 % faster than 2 at 4K) and R 2 (the others: shared memory); registers 48 for
+the load / MMA warps.
 """
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ from neuronspark.ops.gluon._ptx import _tc_fence
 from neuronspark.ops.gluon.pool_read_tile import LOG2E, _row, _window_term
 from neuronspark.ops.triton import require_cuda, require_sm100
 
-__all__ = ["BNK", "BMQ_V", "BMQ_K", "BM_Q", "BN_Q", "R", "REGS_W", "pool_read_dv_gluon", "pool_read_dk_gluon",
+__all__ = ["BNK", "BMQ_V", "BMQ_K", "BM_Q", "BN_Q", "R", "R_V", "REGS_W", "pool_read_dv_gluon", "pool_read_dk_gluon",
            "pool_read_dq_gluon"]
 
 # ------------------------------------------------------------------------------------------------ launch constants
@@ -44,7 +45,8 @@ BMQ_V = 32       # query rows per step of the value-gradient kernel
 BMQ_K = 32       # query rows per step of the key-gradient kernel
 BM_Q = 128       # query rows per CTA of the query-gradient kernel
 BN_Q = 32        # key rows per step of the query-gradient kernel
-R = 2            # ring slots
+R = 2            # ring slots (key-gradient and query-gradient kernels)
+R_V = 3          # ring slots of the value-gradient kernel
 REGS_W = 48      # registers of the load and MMA warps
 
 
@@ -730,7 +732,7 @@ def pool_read_dv_gluon(q16: torch.Tensor, k16: torch.Tensor, do16: torch.Tensor,
     grid = (triton.cdiv(T, BNK) * B * H,)
     with torch.cuda.device(q16.device.index):
         _dv_kernel[grid](kd, qd, dod, ld, cd, td, ktok, cum_t, slots, dgv, T, B, H, HQ, float(scale),
-                         DK=dk, DV=dv, BNK=BNK, BMQ=BMQ_V, R=R, NMAX=NMAX, NBS=int(slots.shape[1]),
+                         DK=dk, DV=dv, BNK=BNK, BMQ=BMQ_V, R=R_V, NMAX=NMAX, NBS=int(slots.shape[1]),
                          ORDMASK=int(ordmask), REGS_W=REGS_W, num_warps=4)
     return dgv
 

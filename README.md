@@ -6,8 +6,9 @@
 > Zhengzheng Tang, Hao Zhu, Zhewei Chen, Dajiang Tao\
 > Paper: https://arxiv.org/abs/2603.16148
 
-Related paper: **NeuronSpark: Selective Spiking State Space Models with Adaptive Computation for Language Modeling**,
-Zhengzheng Tang, Hao Zhu, Dajiang Tao, Yuhui Zhang (https://openreview.net/forum?id=P7pyNdvnfr).
+> **NeuronSpark: Selective Spiking State Space Models with Adaptive Computation for Language Modeling**\
+> Zhengzheng Tang, Hao Zhu, Dajiang Tao, Yuhui Zhang\
+> NeurIPS 2026 submission: https://openreview.net/forum?id=P7pyNdvnfr
 
 ## About
 
@@ -177,7 +178,7 @@ default configuration (calibrated on random rows); `--ckpt DIR` loads a checkpoi
   title={NeuronSpark: Selective Spiking State Space Models with Adaptive Computation for Language Modeling},
   author={Tang, Zhengzheng and Zhu, Hao and Tao, Dajiang and Zhang, Yuhui},
   year={2026},
-  howpublished={OpenReview},
+  note={Submitted to NeurIPS 2026},
   url={https://openreview.net/forum?id=P7pyNdvnfr}
 }
 ```

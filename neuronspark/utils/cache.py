@@ -5,7 +5,7 @@ and updated in place by prefill (T >= 2) and decode (T == 1) calls.  Every write
 ``index_copy_`` / fill into these tensors and the token counters advance on the device, so a CUDA graph captured over a
 decode step stays valid across replays and across :meth:`InferenceParams.reset`.
 
-State per row (W = ``max_seqlen``, the ring capacity shared by every ring; 1.27B shapes):
+State per row (W = ``max_seqlen``, the ring capacity shared by every ring; default-configuration shapes):
 
 * ``DendriticState`` (18 dendritic neuron layers): ``conv`` (9472, 3) fp32, the last three conv inputs (lags t-3, t-2,
   t-1; their values are bf16-exact); ``ssm`` (144, 64, 128) in the cache's dendritic-layer state dtype (bf16 by default,

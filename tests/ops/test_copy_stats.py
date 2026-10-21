@@ -1,11 +1,11 @@
 """ops.triton.copy_stats: the session copy-detector statistics of a prefill call.
 
 ``copy_stats_prefill`` (one kernel: online max / logsumexp over ring tiles) against its torch chain
-``copy_stats_prefill_ref`` under ``regime("infer")`` (IEEE fp32 scores), on rings of the 1.27B shape (B in {1, 8},
-W = 2048, d = 96 fp32 unit rows, zero vectors before a row's first event) and calls of T tokens at several ring
-pointers (wrapped and not), with three row layouts: every row joins at this call (``fresh``), rows that joined at this
-call / at clock 0 / in between (``mixed``), and every row from clock 0 (``origin``).  About a third of the queries are
-copy events (a strictly-past row plus noise), so the confidence covers (0, 1).
+``copy_stats_prefill_ref`` under ``regime("infer")`` (IEEE fp32 scores), on rings of the default configuration's shape
+(B in {1, 8}, W = 2048, d = 96 fp32 unit rows, zero vectors before a row's first event) and calls of T tokens at several
+ring pointers (wrapped and not), with three row layouts: every row joins at this call (``fresh``), rows that joined at
+this call / at clock 0 / in between (``mixed``), and every row from clock 0 (``origin``).  About a third of the queries
+are copy events (a strictly-past row plus noise), so the confidence covers (0, 1).
 
 Compared by the per-operator rule of ``neuronspark.utils.testing`` (matched ratio 1.0): the finite maxima and
 log-sum-exps (the -inf entries, queries without a valid slot, must coincide), and the confidence ``pi`` the memory

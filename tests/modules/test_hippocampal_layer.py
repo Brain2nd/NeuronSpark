@@ -300,10 +300,10 @@ def test_forward_requires_the_regime_autocast(device):
 
 
 # ------------------------------------------------------------------------------------------------ checkpoint
-def _ckpt_layer_state(ckpt_dir, layer_idx):
+def _saved_layer_state(model_dir, layer_idx):
     from safetensors import safe_open
 
-    path = ckpt_dir / "model.safetensors"
+    path = model_dir / "model.safetensors"
     prefix = f"backbone.layers.{layer_idx}."
     with safe_open(str(path), framework="pt", device="cpu") as f:
         out = {k[len(prefix):]: f.get_tensor(k) for k in f.keys() if k.startswith(prefix)}
@@ -312,10 +312,9 @@ def _ckpt_layer_state(ckpt_dir, layer_idx):
     return out
 
 
-@pytest.mark.ckpt
 @pytest.mark.parametrize("layer_idx", CFG.hippocampal_layer_ids)
-def test_checkpoint_layer_loads_strictly(ckpt_dir, device, layer_idx):
-    state = _ckpt_layer_state(ckpt_dir, layer_idx)
+def test_checkpoint_layer_loads_strictly(model_dir, device, layer_idx):
+    state = _saved_layer_state(model_dir, layer_idx)
     layer = _layer(layer_idx, device, init="empty")
     assert set(state) == set(layer.state_dict())
     layer.load_state_dict({k: v.to(device) for k, v in state.items()}, strict=True)

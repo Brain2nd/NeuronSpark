@@ -1,6 +1,7 @@
 """Induction match matrices of the hippocampal layers' pool attention (model level, pure torch, bool).
 
-Whole row (:func:`induction_match_matrices`): one (B, T, T) bool matrix per order n in ``orders`` (1.27B: (2, 3, 4)),
+Whole row (:func:`induction_match_matrices`): one (B, T, T) bool matrix per order n in ``orders`` (default
+configuration: (2, 3, 4)),
 ascending::
 
     m_n[b, t, j] = 1[j <= t - 1] * prod_{i = 0 .. n-1} 1[x_{t-i} == x_{j-1-i}]

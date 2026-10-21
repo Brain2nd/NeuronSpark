@@ -1,4 +1,4 @@
-"""utils.generation and the model's inference regimes, on the NeuronSpark checkpoint (``--ckpt``, GPU).
+"""utils.generation and the model's inference regimes, on a fresh calibrated model of the default configuration (GPU).
 
 * CUDA-graph decode against eager decode: the same tokens fed to both (teacher forcing with the eager run's tokens),
   the per-step logits by the per-operator rule (decode batch sizes 1, 2, 8, 32: the ring-kernel and torch-chain routes
@@ -24,7 +24,7 @@ from neuronspark.models.neuronspark_lm import NeuronSparkLMHeadModel
 from neuronspark.utils.generation import decode, ring_capacity
 from neuronspark.utils.testing import assert_match, match_stats, summarize
 
-pytestmark = [pytest.mark.cuda, pytest.mark.ckpt]
+pytestmark = [pytest.mark.cuda]
 
 SMALL_VOCAB = 256
 
@@ -36,13 +36,8 @@ def _prompts(B: int, T: int, seed: int) -> torch.Tensor:
 
 
 @pytest.fixture(scope="module")
-def model(request):
-    path = request.config.getoption("--ckpt")
-    if not path:
-        pytest.skip("needs --ckpt")
-    if not torch.cuda.is_available():
-        pytest.skip("needs a CUDA GPU")
-    m = NeuronSparkLMHeadModel.from_pretrained(path, device="cuda")
+def model(model_dir):
+    m = NeuronSparkLMHeadModel.from_pretrained(model_dir, device="cuda")
     yield m
     m.release_inference()
     del m

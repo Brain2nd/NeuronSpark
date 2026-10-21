@@ -12,14 +12,14 @@ the tokens per second it gives (rows x tokens / step time), the peak allocated m
 device time of the step's kernels (CUPTI, L2 flushed before each step).  The weights are updated by the timed steps; a
 loaded checkpoint is not written back.
 
-The model is loaded from ``--ckpt`` (a checkpoint directory: ``config.json`` + ``model.safetensors``); without it a
-fresh model is launched from ``configs/neuronspark_1p3b.json`` and calibrated on the first benchmark batches (the launch
-calibration of a new training run).
+By default a fresh model is launched from ``NeuronSparkConfig()`` (the default configuration) and calibrated on the
+first benchmark batches (the launch calibration of a new training run); ``--ckpt`` loads a local checkpoint directory
+(``config.json`` + ``model.safetensors``, as written by ``save_pretrained``) instead.
 
 Example::
 
-    python benchmarks/benchmark_train_step.py --ckpt CHECKPOINT_DIR
-    python benchmarks/benchmark_train_step.py --ckpt CHECKPOINT_DIR --gradient-checkpointing
+    python benchmarks/benchmark_train_step.py
+    python benchmarks/benchmark_train_step.py --gradient-checkpointing
 """
 from __future__ import annotations
 
@@ -159,7 +159,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         from neuronspark.utils.calibration import CALIBRATION_ROWS, calibrate_fresh_model
 
-        config = NeuronSparkConfig.from_json(_HERE.parent / "configs" / "neuronspark_1p3b.json")
+        config = NeuronSparkConfig()
         torch.manual_seed(a.seed)
         model = NeuronSparkLMHeadModel(config, device=dev, init="launch")
         vocab = int(config.vocab_size)

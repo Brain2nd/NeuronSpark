@@ -29,7 +29,7 @@ Op (registry name ``dendritic_chunk_scan_prefill``; inference prefill, no autogr
 * returns ``y`` (B, T, H, P) bf16 contiguous and ``final_state`` (B, H, P, N) fp32 (the caller stores it back in
   the cache's state dtype: one rounding per call for a bf16 state).
 
-1.27B: H 144, P 64, N 128, chunk 256.  The math, per head h, soma p, compartment n and step t (``dt_t =
+Default configuration: H 144, P 64, N 128, chunk 256.  The math, per head h, soma p, compartment n and step t (``dt_t =
 softplus(dt_raw + dt_bias)`` clamped to [0, inf), ``a_t = exp(dt_t A)``)::
 
     S_t = a_t S_{t-1} + dt_t x_t B_t^T          (S_{-1} = initial_state)

@@ -1,16 +1,17 @@
 """Shared pytest configuration.
 
-Command-line options:
+Markers: ``cuda`` (skipped without a GPU), ``sm100`` (skipped below compute capability 10.0).  Every test starts from
+the fixed seed 0.
 
-* ``--ckpt DIR``: a NeuronSpark checkpoint directory (``config.json`` and ``model.safetensors`` as written by
-  ``save_pretrained``).
-
-Markers: ``cuda`` (skipped without a GPU), ``sm100`` (skipped below compute capability 10.0), ``ckpt`` (skipped
-without ``--ckpt``).  Every test starts from the fixed seed 0.
+Fixture ``model_dir`` (session, GPU): a checkpoint directory written by ``save_pretrained`` from a fresh model of the
+default configuration, launched from the fixed seed and calibrated on random token rows (no external checkpoint);
+removed at the end of the session.
 """
 from __future__ import annotations
 
+import gc
 import random
+import shutil
 from pathlib import Path
 
 import pytest
@@ -19,16 +20,10 @@ import torch
 SEED = 0
 
 
-def pytest_addoption(parser):
-    g = parser.getgroup("neuronspark")
-    g.addoption("--ckpt", default=None, help="NeuronSpark checkpoint directory")
-
-
 def pytest_configure(config):
     for line in (
         "cuda: needs a CUDA GPU",
         "sm100: needs a Blackwell GPU (compute capability >= 10.0)",
-        "ckpt: needs the NeuronSpark checkpoint (--ckpt)",
     ):
         config.addinivalue_line("markers", line)
 
@@ -43,14 +38,11 @@ def pytest_collection_modifyitems(config, items):
     cap = _capability()
     skip_cuda = pytest.mark.skip(reason="needs a CUDA GPU")
     skip_sm100 = pytest.mark.skip(reason="needs compute capability >= 10.0")
-    skip_ckpt = pytest.mark.skip(reason="needs --ckpt")
     for item in items:
         if ("cuda" in item.keywords or "sm100" in item.keywords) and cap is None:
             item.add_marker(skip_cuda)
         elif "sm100" in item.keywords and cap < (10, 0):
             item.add_marker(skip_sm100)
-        if "ckpt" in item.keywords and not config.getoption("--ckpt"):
-            item.add_marker(skip_ckpt)
 
 
 @pytest.fixture(autouse=True)
@@ -70,8 +62,23 @@ def device():
 
 
 @pytest.fixture(scope="session")
-def ckpt_dir(request) -> Path:
-    path = request.config.getoption("--ckpt")
-    if not path:
-        pytest.skip("needs --ckpt")
-    return Path(path)
+def model_dir(tmp_path_factory) -> Path:
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA GPU")
+    from neuronspark import NeuronSparkConfig, NeuronSparkLMHeadModel
+    from neuronspark.utils.calibration import CALIBRATION_ROWS, calibrate_fresh_model
+
+    config = NeuronSparkConfig()
+    torch.manual_seed(SEED)
+    model = NeuronSparkLMHeadModel(config, device="cuda", init="launch")
+    g = torch.Generator(device="cpu").manual_seed(SEED + 1)
+    rows = [torch.randint(0, int(config.vocab_size), (8, 1024), generator=g).cuda()
+            for _ in range(CALIBRATION_ROWS // 8)]
+    calibrate_fresh_model(model, rows, rows=CALIBRATION_ROWS)
+    path = tmp_path_factory.mktemp("fresh_model")
+    model.save_pretrained(path)
+    del model, rows
+    gc.collect()
+    torch.cuda.empty_cache()
+    yield path
+    shutil.rmtree(path, ignore_errors=True)

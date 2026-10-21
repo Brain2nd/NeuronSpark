@@ -6,11 +6,11 @@ Registry op ``dendritic_chunk_scan_soma(zxbcdt, conv_w, conv_b, dt_bias, A, D, t
 chunk_size=256) -> xs``:
 
 * ``zxbcdt`` (B, T, 2 d_inner + 2 N + H) bf16 contiguous: the in-projection output, columns z | x B C | dt
-  (1.27B: 9216 | 9472 | 144 = 18832); T % chunk_size == 0 (full chunks); the backward needs at least
+  (default configuration: 9216 | 9472 | 144 = 18832); T % chunk_size == 0 (full chunks); the backward needs at least
   2 chunks (the state gradients ``gluon.dendritic_dstates.dstates_train``; it raises otherwise);
 * ``conv_w`` (d_inner + 2 N, 4) fp32 contiguous (column 3 = lag 0), ``conv_b`` (d_inner + 2 N,) fp32;
 * ``dt_bias``, ``A`` (= -exp(A_log)), ``D`` (H,) fp32; ``theta`` (= floor + softplus(rho)), ``gamma`` (d_inner,) fp32;
-* ``alpha`` the soma surrogate slope (> 0; 8.0 for 1.27B), ``chunk_size`` 256;
+* ``alpha`` the soma surrogate slope (> 0; 8.0 in the default configuration), ``chunk_size`` 256;
 * ``xs`` (B T, d_inner) bf16 contiguous = W_out's input; gradients for zxbcdt (bf16), conv_w / conv_b / dt_bias / A /
   D / theta / gamma (fp32).
 
@@ -36,8 +36,8 @@ Function as a whole is checked against :func:`dendritic_chunk_scan_soma_ref` wit
 (the Gluon chunk scan), the first call eager (the Gluon work split and the dda tile table are built on the first call; a
 capture raises), autocast-agnostic (every dtype is explicit; the training regime runs it under bf16 autocast).
 
-Memory kept from forward to backward per call (1.27B, B 8, T 1024): zxbcdt 309 MB (the input), the conv output 155 MB,
-y and n 151 MB each, the fp32 passed states 151 MB, CB 8.4 MB, dt / dA_cumsum 4.7 MB each.
+Memory kept from forward to backward per call (default configuration, B 8, T 1024): zxbcdt 309 MB (the input), the conv
+output 155 MB, y and n 151 MB each, the fp32 passed states 151 MB, CB 8.4 MB, dt / dA_cumsum 4.7 MB each.
 """
 from __future__ import annotations
 

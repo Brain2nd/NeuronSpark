@@ -4,7 +4,8 @@ Every soma ``(h, p)`` owns ``N`` dendritic compartments.  Their membrane potenti
 input-dependent time constant (``a_t = exp(dt_t A)``) and integrate the token's synaptic input (``dt_t x_t B_t^T``); the
 soma reads its dendrites (``S_t C_t``), and the somatic potential is released through a bipolar soft threshold.  The
 membrane update has the selective state-space form, which the operators evaluate as a chunked scan in training and as
-one step per token in decoding.  Per token ``t`` (1.27B: d_model 1536, d_inner 9216 = 6 * 1536, H = 144 heads of
+one step per token in decoding.  Per token ``t`` (default configuration: d_model 1536, d_inner 9216 = 6 * 1536, H = 144
+heads of
 P = 64 somata, N = 128 compartments, conv width 4)::
 
     hn_t            = RMSNorm(h_t) * pre_norm_gain                       eps 1e-5
@@ -414,8 +415,8 @@ class DendriticNeurons(nn.Module):
 
 
 class DendriticNeuronLayer(nn.Module):
-    """A dendritic neuron layer of the stack (1.27B: 18 instances, ``layers.{i}`` for i not in (3, 7, ..., 23)):
-    ``mixer_a`` and the fp32 residual addition.
+    """A dendritic neuron layer of the stack (default configuration: 18 instances, ``layers.{i}`` for i not in (3, 7,
+    ..., 23)): ``mixer_a`` and the fp32 residual addition.
 
     ``forward(h, inference_params=None, *, hn=None, next_norm_gain=None) -> (h, hn_next | None)``:
 

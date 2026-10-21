@@ -12,9 +12,9 @@ Op (registry name ``dendritic_gated_norm_soma``; no autograd)::
     x    = bf16(S(n, theta) * gamma),  S(v, th) = max(v - th, 0) - max(-v - th, 0)
 
 ``y`` is the scan output (rows of B * T), ``z`` the gate slice of the in-projection read in place (a (M, N) view with
-the projection's row stride and a unit last stride), theta / gamma (N,) fp32.  1.27B: N = 9216, eps 1e-5.  n never
-goes through memory: the soma is applied to the bf16-rounded n in registers with the IEEE single-rounding PTX of the
-training read-out (:mod:`neuronspark.ops.triton.dendritic_soma`), so x equals the read-out of the stored n.
+the projection's row stride and a unit last stride), theta / gamma (N,) fp32.  Default configuration: N = 9216, eps
+1e-5.  n never goes through memory: the soma is applied to the bf16-rounded n in registers with the IEEE single-rounding
+PTX of the training read-out (:mod:`neuronspark.ops.triton.dendritic_soma`), so x equals the read-out of the stored n.
 
 What the kernel reproduces.  The reference implementation of this call is flash-linear-attention's gated layer norm
 (``fla.modules.layernorm_gated.layer_norm_fwd``, ``norm_before_gate=False``, ``is_rms_norm=True``, one group), which

@@ -9,7 +9,8 @@ Ops (registry names; inference, no autograd):
   token of a dendritic neuron population from the in-projection output to W_out's bf16 input; ``conv_state`` and
   ``ssm_state`` are advanced in place.  Decode.
 
-The step, per row (1.27B: di 9216 = H 144 x P 64, N 128, conv_dim 9472 = di + 2 N, proj width 18832 = [z | xBC | dt])::
+The step, per row (default configuration: di 9216 = H 144 x P 64, N 128, conv_dim 9472 = di + 2 N, proj width 18832 =
+[z | xBC | dt])::
 
     win    = [conv_state[c, 0], conv_state[c, 1], conv_state[c, 2], xBC[c]]          lags t-3, t-2, t-1, t
     pre    = fma(w3, win3, fma(w2, win2, fma(w1, win1, fma(w0, win0, bias))))       conv_w[:, j] = tap j, fp32
@@ -65,9 +66,9 @@ kernel 2 warps; K2 programs per row 8 (b <= 16) / 4; pre-norm 2 warps.  Supporte
 Contract (anything else raises): CUDA tensors on one device; proj (b, 2 di + 2 N + H) bf16 with unit last stride;
 conv_state (b, conv_dim, 3) fp32; ssm_state (b, H, P, N) bf16 or fp32 (the split route needs contiguous state rows);
 conv_w (conv_dim, 4) fp32 contiguous; conv_b (conv_dim,), A / dt_bias / D (H,), theta / gamma (di,) fp32 contiguous;
-N and P powers of two, P a multiple of the K1 tile; the gated and split routes are built for the 1.27B widths (di 9216,
-H 144, N 128, P 64).  References: :func:`dendritic_prenorm_rows_ref`, :func:`dendritic_step_core_ref` (pure torch, fp32;
-the reference mutates the states in place like the kernel).  The PTX helpers are
+N and P powers of two, P a multiple of the K1 tile; the gated and split routes are built for the default configuration's
+widths (di 9216, H 144, N 128, P 64).  References: :func:`dendritic_prenorm_rows_ref`, :func:`dendritic_step_core_ref`
+(pure torch, fp32; the reference mutates the states in place like the kernel).  The PTX helpers are
 :mod:`neuronspark.ops.triton._ptx`'s.  The pre-norm and K2 norm lines follow fla-core 0.5.2 kernels (MIT; see NOTICE).
 """
 from __future__ import annotations

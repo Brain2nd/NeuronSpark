@@ -15,9 +15,13 @@ Every figure is the median over the calls of a trial, then the mean over ``--tri
 printed too).  The prompts are uniform random ids (``--seed``); the ring capacity of the caches is ``--ring``; the
 dendritic-layer state storage is ``--dendritic-state-dtype`` (default: the configuration's, bfloat16).
 
+By default a fresh model is launched from ``NeuronSparkConfig()`` (the default configuration) and calibrated on random
+rows (the launch calibration; the timings do not depend on trained weights); ``--ckpt`` loads a local checkpoint
+directory (``config.json`` + ``model.safetensors``, as written by ``save_pretrained``) instead.
+
 Example::
 
-    python benchmarks/benchmark_generation.py --ckpt CHECKPOINT_DIR
+    python benchmarks/benchmark_generation.py
 """
 from __future__ import annotations
 
@@ -44,7 +48,8 @@ def _sizes(text: str) -> List[int]:
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--ckpt", required=True, help="checkpoint directory (config.json + model.safetensors)")
+    p.add_argument("--ckpt", default=None, help="a local checkpoint directory (config.json + model.safetensors); "
+                                                "default: a fresh model of the default configuration")
     p.add_argument("--prompt-len", type=int, default=1024)
     p.add_argument("--prefill-batches", default="1,8")
     p.add_argument("--decode-batches", default="1,8,32")
@@ -69,8 +74,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     L, steps, W = int(a.prompt_len), int(a.decode_steps), int(a.ring)
     if L + steps > W:
         raise SystemExit(f"prompt {L} + {steps} decode steps exceed the ring capacity {W}")
-    model = NeuronSparkLMHeadModel.from_pretrained(a.ckpt, device=dev,
-                                                   inference_dendritic_state_dtype=a.dendritic_state_dtype)
+    if a.ckpt is not None:
+        model = NeuronSparkLMHeadModel.from_pretrained(a.ckpt, device=dev,
+                                                       inference_dendritic_state_dtype=a.dendritic_state_dtype)
+    else:
+        import dataclasses
+
+        from neuronspark.models.config_neuronspark import NeuronSparkConfig
+        from neuronspark.utils.calibration import CALIBRATION_ROWS, calibrate_fresh_model
+
+        config = NeuronSparkConfig()
+        if a.dendritic_state_dtype is not None:
+            config = dataclasses.replace(config, inference_dendritic_state_dtype=a.dendritic_state_dtype)
+        torch.manual_seed(int(a.seed))
+        model = NeuronSparkLMHeadModel(config, device=dev, init="launch")
+        gc = torch.Generator(device="cpu").manual_seed(int(a.seed) + 1)
+        cal = [torch.randint(0, int(config.vocab_size), (8, 1024), generator=gc, dtype=torch.int64).to(dev)
+               for _ in range(CALIBRATION_ROWS // 8)]
+        calibrate_fresh_model(model, cal, rows=CALIBRATION_ROWS)
     dt = resolve_dendritic_state_dtype(model.config.inference_dendritic_state_dtype)
     model.prepare_inference()
     V = int(model.config.vocab_size)

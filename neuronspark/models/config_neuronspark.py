@@ -2,11 +2,11 @@
 
 ``NeuronSparkConfig`` holds only the fields that change the computed function: a parameter shape, a numeric constant
 of the forward math, of the initialisation or of the launch-time calibration.  The architecture itself (layer forms,
-neuron model, mechanisms) is fixed in the code and is therefore not configurable.  The defaults are the 1.27 B
-model; ``configs/neuronspark_1p3b.json`` is the same configuration on disk.
+neuron model, mechanisms) is fixed in the code and is therefore not configurable.  The defaults are one configuration
+of the architecture (the default configuration); a checkpoint directory carries its own ``config.json``.
 
-Layout (24 layers, ratio 3:1): layer ``i`` is a hippocampal layer iff ``(i + 1) % hippocampal_layer_interval == 0``
-(layers 3, 7, 11, 15, 19, 23), every other layer is a dendritic neuron layer.
+Layout (ratio 3:1): layer ``i`` is a hippocampal layer iff ``(i + 1) % hippocampal_layer_interval == 0`` (in the default
+24-layer configuration: layers 3, 7, 11, 15, 19, 23), every other layer is a dendritic neuron layer.
 
 The single numerics option is ``inference_dendritic_state_dtype``: the storage dtype of the dendritic-layer state in the
 inference cache, ``"bfloat16"`` (default: the state is rounded to bf16 once per decode step and once per prefill call)
@@ -53,7 +53,7 @@ _PathLike = Union[str, "os.PathLike[str]"]
 
 @dataclass(frozen=True)
 class NeuronSparkConfig:
-    """Hyper-parameters of the NeuronSpark architecture (defaults = the 1.27 B model).
+    """Hyper-parameters of the NeuronSpark architecture (the defaults are the default configuration).
 
     Groups (consumer in parentheses):
 

@@ -1,4 +1,3 @@
 include README.md LICENSE NOTICE requirements.txt
-recursive-include configs *.json
 include neuronspark/ops/triton/mamba/LICENSE neuronspark/ops/triton/mamba/PROVENANCE.md
 global-exclude __pycache__ *.py[cod]

@@ -70,7 +70,7 @@ __all__ = [
 ]
 
 # ================================================================================================ fixed constants
-# Shapes of the 1.27B configuration and the launch configuration of the training and inference operators.
+# Shapes of the default configuration and the launch configuration of the training and inference operators.
 #: sub-keys per half (n) and slots selected per head (k)
 N_SUB = 128
 TOPK = 16

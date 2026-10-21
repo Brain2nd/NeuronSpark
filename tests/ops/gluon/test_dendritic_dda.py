@@ -2,8 +2,8 @@
 scan's backward.
 
 ``dda_gluon`` -- its dCB split partials summed over the splits and its V grid assembled by ``dda_asm`` -- against the
-float64 reference ``dda_ref``, on the 1.27B operands (B 8, T 1024, H 144, P 64, N 128, chunk 256), smaller shapes and
-stress decays (steep diagonal blocks take the per-element exponent); the call contract.
+float64 reference ``dda_ref``, on the default configuration's operands (B 8, T 1024, H 144, P 64, N 128, chunk 256),
+smaller shapes and stress decays (steep diagonal blocks take the per-element exponent); the call contract.
 
 Every comparison is the per-operator rule of ``neuronspark.utils.testing``.
 """

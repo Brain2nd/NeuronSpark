@@ -3,8 +3,8 @@
 
 * option and cache (no GPU, meta-device build): the config values, the allocation default and override, the one-line
   announcement, the cache's dtype consistency check, the capacity / batch refusals;
-* the decode step operator on the checkpoint's dendritic neuron layer weights (``--ckpt``, GPU) with either state dtype,
-  at every decode batch size (1, 2, 4, 8, 16, 32: every launch route of the step kernels), against its pure-torch
+* the decode step operator on the dendritic neuron layer weights of a fresh calibrated model (GPU) with either state
+  dtype, at every decode batch size (1, 2, 4, 8, 16, 32: every launch route of the step kernels), against its pure-torch
   reference: output and the updated states (the state stays in its storage dtype);
 * model level: one prefill from the zero state gives the same logits with either storage, and the bf16 state is the
   fp32 state rounded once; decode with either dtype (eager and CUDA graph), the graph decode against the eager decode
@@ -95,15 +95,10 @@ def test_cache_allocation(monkeypatch, capsys):
         model.allocate_inference_cache(33, 512)                  # beyond the decode batch tables
 
 
-# ================================================================================================ checkpoint (GPU)
+# ================================================================================================ model (GPU)
 @pytest.fixture(scope="module")
-def model(request):
-    path = request.config.getoption("--ckpt")
-    if not path:
-        pytest.skip("needs --ckpt")
-    if not torch.cuda.is_available():
-        pytest.skip("needs a CUDA GPU")
-    m = NeuronSparkLMHeadModel.from_pretrained(path, device="cuda")
+def model(model_dir):
+    m = NeuronSparkLMHeadModel.from_pretrained(model_dir, device="cuda")
     yield m
     m.release_inference()
     del m
@@ -112,7 +107,6 @@ def model(request):
 
 
 @pytest.mark.cuda
-@pytest.mark.ckpt
 @pytest.mark.parametrize("dtype_name", list(DTYPES))
 @pytest.mark.parametrize("b", DECODE_SIZES)
 def test_dendritic_step_routes_both_state_dtypes(model, b, dtype_name):
@@ -137,7 +131,6 @@ def test_dendritic_step_routes_both_state_dtypes(model, b, dtype_name):
 
 
 @pytest.mark.cuda
-@pytest.mark.ckpt
 @pytest.mark.parametrize("b", [1, 8])
 def test_prefill_stores_the_state_once(model, b):
     """From the zero state a prefill computes the same function with either storage; the bf16 cache holds the fp32
@@ -158,7 +151,6 @@ def test_prefill_stores_the_state_once(model, b):
 
 
 @pytest.mark.cuda
-@pytest.mark.ckpt
 @pytest.mark.parametrize("b", DECODE_SIZES)
 def test_decode_with_either_storage(model, b):
     prompt = _prompts(b, 64, seed=300 + b)
@@ -181,9 +173,8 @@ def test_decode_with_either_storage(model, b):
 
 
 @pytest.mark.cuda
-@pytest.mark.ckpt
-def test_from_pretrained_option(ckpt_dir):
-    m = NeuronSparkLMHeadModel.from_pretrained(ckpt_dir, device="cuda", inference_dendritic_state_dtype="float32")
+def test_from_pretrained_option(model_dir):
+    m = NeuronSparkLMHeadModel.from_pretrained(model_dir, device="cuda", inference_dendritic_state_dtype="float32")
     try:
         assert m.config.inference_dendritic_state_dtype == "float32"
         ip = m.allocate_inference_cache(1, 512)

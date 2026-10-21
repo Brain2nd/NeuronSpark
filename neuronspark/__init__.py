@@ -1,4 +1,4 @@
-"""NeuronSpark: a spiking language model (1.27 B parameters) and its operators.
+"""NeuronSpark: a spiking language model architecture and its GPU operators.
 
 Dendritic neuron layers and hippocampal layers in a fixed 3:1 pattern.  A dendritic neuron layer is a population of
 somata with dendritic compartments (membrane potentials with an input-dependent leak, released through a bipolar soft

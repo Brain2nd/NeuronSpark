@@ -19,7 +19,7 @@ Checkpoint directory format (written by :func:`save_pretrained`, read by :func:`
       backbone.lexical_memory.tables.{k}            (rows, dim) fp32 lexical n-gram tables
       backbone.lexical_memory.hash_{mult,add,wrap}  int64 lexical hash constants
 
-  Non-persistent buffers (RoPE tables, unit norm weights) are not stored.  For the 1.27B configuration the file holds
+  Non-persistent buffers (RoPE tables, unit norm weights) are not stored.  For the default configuration the file holds
   678 tensors: 609 fp32 parameters (1,270,342,292 elements) and 69 persistent buffers (10,908 elements);
 * optionally the tokenizer files :data:`TOKENIZER_FILES`, copied unchanged.
 

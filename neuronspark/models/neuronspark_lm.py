@@ -40,7 +40,7 @@ Inference weights: :meth:`NeuronSparkLMHeadModel.prepare_inference` attaches a b
 (the tied embedding included); inference GEMMs read it (``neuronspark.ops.linear``).  A weight modified after the copy
 was made raises at the next eager use; call ``prepare_inference()`` again.
 
-Checkpoint: the state dict of :class:`NeuronSparkLMHeadModel` (678 tensors for the 1.27B configuration, every key
+Checkpoint: the state dict of :class:`NeuronSparkLMHeadModel` (678 tensors for the default configuration, every key
 under ``backbone.``) is the ``model.safetensors`` of the checkpoint directory format defined in
 :mod:`neuronspark.utils.hf`.  ``init="empty"`` builds without any random draw for a build followed by a checkpoint
 load.

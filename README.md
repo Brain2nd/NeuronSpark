@@ -1,10 +1,9 @@
 # NeuronSpark
 
-![NeuronSpark](https://img.shields.io/badge/parameters-1.27B-blue)
 [![arXiv](https://img.shields.io/badge/arXiv-2603.16148-b31b1b.svg)](https://arxiv.org/abs/2603.16148)
 
 > **NeuronSpark: A Spiking Neural Network Language Model with Selective State Space Dynamics**\
-> Zhengzheng Tang\
+> Zhengzheng Tang, Hao Zhu, Zhewei Chen, Dajiang Tao\
 > Paper: https://arxiv.org/abs/2603.16148
 
 ## About
@@ -18,9 +17,9 @@ memory of past tokens, written through PLIF write-gate neurons and recalled by c
 recall, a spiking feed-forward circuit of PLIF (parametric leaky integrate-and-fire) neurons and a product-key
 associative memory.
 
-This repository contains the NeuronSpark model (1.27B parameters) together with its GPU operators.  The Triton and Gluon
-kernels cover training, prefill and single-token decoding.  The repository also has an inference cache with CUDA-graph
-decoding, plus tests and benchmarks.
+This repository contains the NeuronSpark architecture and its GPU operators: the model code (configuration, layers and
+an inference cache with CUDA-graph decoding), Triton and Gluon kernels for training, prefill and single-token decoding,
+and tests and benchmarks.
 
 ## Architecture
 
@@ -37,8 +36,8 @@ The training loss is the token cross entropy plus a weighted copy-switch auxilia
 
 Sizes and constants (depth, width, somata and compartments, heads, memory slots, n-gram orders, vocabulary, loss
 weights) are configuration, not architecture: they are the fields of `NeuronSparkConfig`
-(`neuronspark/models/config_neuronspark.py`), and `configs/neuronspark_1p3b.json` is the configuration of the released
-1.27B checkpoint.  Each GPU operator states the shapes it supports in its docstring.
+(`neuronspark/models/config_neuronspark.py`), whose defaults are one configuration of the architecture.  Each GPU
+operator states the shapes it supports in its docstring.
 
 ## Installation
 
@@ -62,11 +61,17 @@ GPU architecture (for example `sm_103a`), set `TRITON_PTXAS_PATH` to the one in 
 
 ```python
 import torch
-from neuronspark import NeuronSparkLMHeadModel
+from neuronspark import NeuronSparkConfig, NeuronSparkLMHeadModel
+from neuronspark.utils.calibration import calibrate_fresh_model
 
-model = NeuronSparkLMHeadModel.from_pretrained("path/to/checkpoint", device="cuda")
+config = NeuronSparkConfig()                                      # the default configuration
+model = NeuronSparkLMHeadModel(config, device="cuda")
 
-ids = torch.randint(0, model.config.vocab_size, (8, 1024), device="cuda")  # (B, T); T % dendritic_chunk_size == 0
+# launch calibration of a new model (neuron thresholds, product-key memories) on its first 64 training rows
+first_rows = [torch.randint(0, config.vocab_size, (8, 1024), device="cuda") for _ in range(8)]
+calibrate_fresh_model(model, first_rows)
+
+ids = torch.randint(0, config.vocab_size, (8, 1024), device="cuda")  # (B, T); T % dendritic_chunk_size == 0
 logits = model(ids).logits                                        # (B, T, V)
 
 targets = torch.roll(ids, -1, dims=1)
@@ -75,12 +80,9 @@ loss = model.loss(ids, targets).loss                              # cross entrop
 loss.backward()
 ```
 
-A checkpoint directory holds `config.json` and `model.safetensors`.  `model.save_pretrained(path)` writes one.  To
-recompute the dendritic neuron layers in the backward pass, set `model.gradient_checkpointing = True`.
-
-To train from scratch, build `NeuronSparkLMHeadModel(config)` and calibrate it once on the first training rows with
-`neuronspark.utils.calibration.calibrate_fresh_model(model, batches)`.  This sets the neuron thresholds and the
-product-key memories.
+`model.save_pretrained(path)` writes a checkpoint directory (`config.json` and `model.safetensors`) and
+`NeuronSparkLMHeadModel.from_pretrained(path)` loads one.  To recompute the dendritic neuron layers in the backward
+pass, set `model.gradient_checkpointing = True`.
 
 ### Generation
 
@@ -141,26 +143,29 @@ Kernels are tested against their references with one tolerance rule, the default
 tensor passes when no element fails.
 
 ```bash
-pytest tests/ops tests/modules
-pytest tests/models --ckpt path/to/checkpoint
+pytest tests
 ```
+
+The model tests build a fresh model of the default configuration and calibrate it on random token rows; no checkpoint
+is needed.
 
 ## Benchmarks
 
 ```bash
-python benchmarks/benchmark_train_step.py --ckpt path/to/checkpoint
-python benchmarks/benchmark_generation.py --ckpt path/to/checkpoint
+python benchmarks/benchmark_train_step.py
+python benchmarks/benchmark_generation.py
 ```
 
 The first script times a full training step (8 × 1024 tokens: forward, backward, optimizer).  The second times prefill
-at batch 1 and 8, CUDA-graph decoding at batch 1, 8 and 32, and end-to-end generation.
+at batch 1 and 8, CUDA-graph decoding at batch 1, 8 and 32, and end-to-end generation.  Both run a fresh model of the
+default configuration (calibrated on random rows); `--ckpt DIR` loads a checkpoint directory instead.
 
 ## Citation
 
 ```bibtex
 @article{tang2026neuronspark,
   title={NeuronSpark: A Spiking Neural Network Language Model with Selective State Space Dynamics},
-  author={Tang, Zhengzheng},
+  author={Tang, Zhengzheng and Zhu, Hao and Chen, Zhewei and Tao, Dajiang},
   journal={arXiv preprint arXiv:2603.16148},
   year={2026}
 }

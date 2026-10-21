@@ -1,9 +1,10 @@
 """models: checkpoint layout, loading, verification and saving.
 
-* layout (no GPU, meta-device build): the 678 state tensors of the NeuronSpark model (609 parameters / 1,270,342,292
+* layout (no GPU, meta-device build): the 678 state tensors of the default configuration (609 parameters / 1,270,342,292
   elements, 69 persistent buffers / 10,908 elements), key prefixes, shapes and dtypes; the configuration file round
   trip and the model-type check;
-* checkpoint (``--ckpt``, GPU): a strict load of the 678 tensors; every loaded tensor against the file's tensor (dtype
+* checkpoint directory (GPU; the ``model_dir`` fixture: a fresh calibrated model written by ``save_pretrained``): a
+  strict load of the 678 tensors; every loaded tensor against the file's tensor (dtype
   and shape equal, values by the per-operator rule); the post-load checks (lexical hash constants, value-residual
   anchors, calibrated product-key memories); no parameter is written by inference calls after the load (version
   counters unchanged; the PLIF ``b_eta`` values against the file); the verification refuses incomplete or altered
@@ -129,13 +130,8 @@ def test_config_round_trip(tmp_path):
 
 # ================================================================================================ checkpoint (GPU)
 @pytest.fixture(scope="module")
-def loaded(request):
-    path = request.config.getoption("--ckpt")
-    if not path:
-        pytest.skip("needs --ckpt")
-    if not torch.cuda.is_available():
-        pytest.skip("needs a CUDA GPU")
-    model = NeuronSparkLMHeadModel.from_pretrained(path, device="cuda")
+def loaded(model_dir):
+    model = NeuronSparkLMHeadModel.from_pretrained(model_dir, device="cuda")
     yield model
     del model
     gc.collect()
@@ -143,11 +139,10 @@ def loaded(request):
 
 
 @pytest.mark.cuda
-@pytest.mark.ckpt
-def test_strict_load_matches_file(loaded, ckpt_dir):
+def test_strict_load_matches_file(loaded, model_dir):
     state = loaded.state_dict()
     assert len(state) == 678
-    n = _compare_with_file(state, ckpt_dir, torch.device("cuda"))
+    n = _compare_with_file(state, model_dir, torch.device("cuda"))
     assert n == 678
     n_param = sum(1 for _ in loaded.parameters())
     assert n_param == 609
@@ -156,7 +151,6 @@ def test_strict_load_matches_file(loaded, ckpt_dir):
 
 
 @pytest.mark.cuda
-@pytest.mark.ckpt
 def test_post_load_checks(loaded):
     bb = loaded.backbone
     bb.lexical_memory.check_hash_buffers()
@@ -178,8 +172,7 @@ def test_post_load_checks(loaded):
 
 
 @pytest.mark.cuda
-@pytest.mark.ckpt
-def test_inference_writes_no_parameter(loaded, ckpt_dir):
+def test_inference_writes_no_parameter(loaded, model_dir):
     """Prefill, decode steps and a whole-row call leave every parameter untouched; the 24 PLIF b_eta vectors are the
     file's."""
     model = loaded
@@ -200,7 +193,7 @@ def test_inference_writes_no_parameter(loaded, ckpt_dir):
     assert not changed, f"inference wrote parameters: {changed[:8]}"
     from safetensors import safe_open
 
-    with safe_open(str(ckpt_dir / WEIGHTS_NAME), framework="pt", device="cpu") as f:
+    with safe_open(str(model_dir / WEIGHTS_NAME), framework="pt", device="cpu") as f:
         for n, saved in b_eta.items():
             ref = f.get_tensor(n).to(dev)
             assert_match(dict(model.named_parameters())[n], ref, n)
@@ -208,10 +201,9 @@ def test_inference_writes_no_parameter(loaded, ckpt_dir):
 
 
 @pytest.mark.cuda
-@pytest.mark.ckpt
-def test_verification_refuses_altered_checkpoints(ckpt_dir):
-    config = load_config(ckpt_dir)
-    sd = load_state_dict(ckpt_dir, device="cpu")
+def test_verification_refuses_altered_checkpoints(model_dir):
+    config = load_config(model_dir)
+    sd = load_state_dict(model_dir, device="cpu")
     summary = verify_state_dict(config, sd)
     assert summary["state_tensors"] == 678 and summary["uncalibrated_hippocampal_layers"] == []
 
@@ -236,15 +228,14 @@ def test_verification_refuses_altered_checkpoints(ckpt_dir):
 
 
 @pytest.mark.cuda
-@pytest.mark.ckpt
-def test_save_round_trip(loaded, ckpt_dir, tmp_path):
+def test_save_round_trip(loaded, model_dir, tmp_path):
     dev = torch.device("cuda")
     saved = tmp_path / "saved"
-    summary = loaded.save_pretrained(saved, tokenizer_dir=ckpt_dir)
+    summary = loaded.save_pretrained(saved, tokenizer_dir=model_dir)
     assert summary["state_tensors"] == 678
     assert json.loads((saved / CONFIG_NAME).read_text())["model_type"] == MODEL_TYPE
     assert load_config(saved) == loaded.config
-    present = [n for n in TOKENIZER_FILES if (ckpt_dir / n).is_file()]
+    present = [n for n in TOKENIZER_FILES if (model_dir / n).is_file()]
     assert sorted(summary["tokenizer_files"]) == sorted(present)
     assert all((saved / n).is_file() for n in present)
     assert all(k.startswith(PREFIX) for k in _file_keys(saved))

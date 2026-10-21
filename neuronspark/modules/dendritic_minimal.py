@@ -42,7 +42,7 @@ import torch.nn.functional as F
 
 __all__ = [
     "BipolarReleaseSurrogateFn",
-    "bipolar_release",
+    "bipolar_release_ref",
     "softplus_kernel_form",
     "dendritic_params",
     "dendritic_neuron_layer_ref",
@@ -76,10 +76,10 @@ class BipolarReleaseSurrogateFn(torch.autograd.Function):
         return grad_output * (gate_pos + gate_neg), -grad_output * (gate_pos - gate_neg), None
 
 
-def bipolar_release(v_pre: torch.Tensor, theta: torch.Tensor, alpha: float = 8.0) -> torch.Tensor:
+def bipolar_release_ref(v_pre: torch.Tensor, theta: torch.Tensor, alpha: float = 8.0) -> torch.Tensor:
     """The dendritic-layer soma with its surrogate backward (``alpha`` > 0)."""
     if float(alpha) <= 0.0:
-        raise ValueError(f"bipolar_release: alpha must be positive, got {alpha}")
+        raise ValueError(f"bipolar_release_ref: alpha must be positive, got {alpha}")
     if theta.dtype != v_pre.dtype:
         theta = theta.to(v_pre.dtype)
     return BipolarReleaseSurrogateFn.apply(v_pre, theta, float(alpha))
@@ -139,7 +139,7 @@ def _readout(p: Dict[str, torch.Tensor], y: torch.Tensor, z: torch.Tensor, theta
     g = y * F.silu(z)
     n = bf(g * torch.rsqrt(g.square().mean(dim=-1, keepdim=True) + norm_eps))
     theta = theta_floor + F.softplus(p["rho"].to(cd))
-    s = bipolar_release(n, theta, alpha)
+    s = bipolar_release_ref(n, theta, alpha)
     xs = bf(s * p["gamma"].to(cd))
     return bf(F.linear(xs, bf(p["W_out"].to(cd))))
 

@@ -4,11 +4,11 @@ and backward) and inference prefill.
 Ops:
 
 * training (whole row): ``dendritic_conv_silu(xBC, conv_w, conv_b) -> out`` with ``DendriticConvSiluFn``. ``xBC`` (B, L,
-  C) bf16 with unit channel stride (the strided x|B|C slice of the projection, row stride 18832 for 1.27B), ``conv_w``
-  (C, 4) fp32 contiguous (column 3 = lag 0), ``conv_b`` (C,) fp32; ``out`` (B, L, C) bf16 contiguous. Backward: ``dxBC``
-  (B, L, C) bf16, ``dconv_w`` (C, 4) fp32, ``dconv_b`` (C,) fp32. The combined dendritic-layer Function
-  (:mod:`neuronspark.ops.dendritic_combined`) calls the launchers ``_conv_fwd`` / ``_conv_bwd`` directly (its backward
-  writes dx into the projection gradient).
+  C) bf16 with unit channel stride (the strided x|B|C slice of the projection, row stride 18832 in the default
+  configuration), ``conv_w`` (C, 4) fp32 contiguous (column 3 = lag 0), ``conv_b`` (C,) fp32; ``out`` (B, L, C) bf16
+  contiguous. Backward: ``dxBC`` (B, L, C) bf16, ``dconv_w`` (C, 4) fp32, ``dconv_b`` (C,) fp32. The combined
+  dendritic-layer Function (:mod:`neuronspark.ops.dendritic_combined`) calls the launchers ``_conv_fwd`` / ``_conv_bwd``
+  directly (its backward writes dx into the projection gradient).
 * prefill: ``dendritic_conv_silu_prefill(xBC, conv_w, conv_b, tail) -> (xbc, tail_new)`` with ``tail`` (B, C, 3) fp32 =
   the three previous conv inputs (lags t-3, t-2, t-1; bf16-exact values): ``x_ext = cat([bf16(tail), xBC], time)``, the
   training forward kernel on x_ext, the first three output rows dropped; ``xbc`` (B, T, C) bf16 contiguous, ``tail_new``

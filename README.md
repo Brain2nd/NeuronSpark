@@ -44,6 +44,60 @@ weights) are configuration, not architecture: they are the fields of `NeuronSpar
 (`neuronspark/models/config_neuronspark.py`), whose defaults are one configuration of the architecture.  Each GPU
 operator states the shapes it supports in its docstring.
 
+## Results
+
+### Controlled comparison on BabyLM
+
+NeuronSpark against a Transformer, Mamba-2 and RWKV-7 at three sizes, trained with one recipe in which only the
+architecture differs:
+
+- data: the BabyLM 2026 Strict corpus, tokenized with the Qwen3-VL tokenizer (vocabulary 151,669) and packed into
+  1,024-token rows, in the same order for every model;
+- training: one epoch, 19,904 updates of 8 rows (162.9M training tokens), AdamW (learning rate 3e-4, 1,000 warm-up
+  updates, weight decay 0.1, gradient clipping 1.0), seed 2026;
+- baselines: a Llama-style Transformer decoder and the flash-linear-attention implementations of Mamba-2 and RWKV-7,
+  each with a tied embedding;
+- metric: next-token cross entropy (nats) on a fixed set of 24 batches of the training stream (192 rows, 196,416
+  target tokens; each row is seen once in the single epoch, the set is not a held-out split), perplexity = exp(loss).
+
+| loss / perplexity | ~200M | ~500M | ~1.3B |
+|---|---|---|---|
+| Transformer | 3.0577 / 21.28 | 2.9796 / 19.68 | 2.9145 / 18.44 |
+| Mamba-2 | 3.0513 / 21.14 | 2.9438 / 18.99 | 2.8738 / 17.70 |
+| RWKV-7 | 2.9807 / 19.70 | 2.8877 / 17.95 | 2.8326 / 16.99 |
+| **NeuronSpark** | **2.9420 / 18.95** | **2.8444 / 17.19** | **2.7751 / 16.04** |
+
+Parameters: Transformer 199.6M / 501.4M / 1,312.0M; Mamba-2 199.6M / 501.1M / 1,312.3M; RWKV-7 199.6M / 501.6M /
+1,312.2M; NeuronSpark 217.5M / 508.6M / 1,270.3M.
+
+### Speed
+
+1.3B-parameter models on one NVIDIA GB300.  NeuronSpark is measured with the operators of this repository in our
+training stack and serving engine (the serving engine is not part of this repository).
+
+**Inference.**  Online serving: requests with 1,024-token random prompts and 256 generated tokens, at concurrency 1, 8
+and 32; output tokens per second.  Compared with: the 1.3B Transformer of the table above (a Hugging Face Llama
+checkpoint) served by vLLM 0.30.0 on the same GPU with the same workload.
+
+| output tok/s | concurrency 1 | concurrency 8 | concurrency 32 |
+|---|---|---|---|
+| Transformer 1.3B, served by vLLM | 517 | 3,864 | 10,401 |
+| NeuronSpark 1.3B | 673.5 | 4,069.5 | 9,515.7 |
+| NeuronSpark ÷ Transformer | 1.30× | 1.05× | 0.91× |
+
+**Training.**  One step of 8 × 1,024 tokens (forward, backward, AdamW update), with and without activation
+recomputation; tokens per second and time per step.  Compared with: the 1.3B Transformer with its fastest measured
+stack: Hugging Face Llama, full-graph `torch.compile`, bf16 compute with fp32 master weights, Transformer Engine
+FusedAdam.
+
+| tok/s (ms / step) | with activation recomputation | without |
+|---|---|---|
+| Transformer 1.3B (`torch.compile` + TE FusedAdam) | 79,387 (103.1 ms) | 94,546 (86.6 ms) |
+| NeuronSpark 1.3B | 67,882 (120.6 ms) | 77,164 (106.1 ms) |
+| NeuronSpark ÷ Transformer | 0.86× | 0.82× |
+
+The speed tables are updated with every operator improvement.
+
 ## Installation
 
 Requirements:

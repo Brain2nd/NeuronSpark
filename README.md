@@ -174,11 +174,10 @@ default configuration (calibrated on random rows); `--ckpt DIR` loads a checkpoi
   year={2026}
 }
 
-@misc{tang2026selective,
+@misc{anonymous2026neuronspark,
   title={NeuronSpark: Selective Spiking State Space Models with Adaptive Computation for Language Modeling},
-  author={Tang, Zhengzheng and Zhu, Hao and Tao, Dajiang and Zhang, Yuhui},
+  author={Anonymous},
   year={2026},
-  note={Submitted to NeurIPS 2026},
   url={https://openreview.net/forum?id=P7pyNdvnfr}
 }
 ```

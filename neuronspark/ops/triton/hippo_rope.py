@@ -24,8 +24,9 @@ eager bf16 ops.  The SiLU is ATen's functor ``x / (1 + expf(-x))`` (libdevice ``
 bf16 value, rounded to bf16.  Backward: the slice-buffer sums of autograd's graph (each use rounded to bf16, then the
 "+ 0" of the other slice's zero fill), then ATen's ``silu_backward`` functor ``dy s (1 + x (1 - s))`` with the
 ``1 + x (.)`` contracted to one ``fma.rn`` as nvcc compiles it.  The training kernels read / write channel-contiguous
-(BT, 2 BP) tiles (the even / odd elements split / joined in registers, int32 in-tile offsets); x, y and the gradients
-need channel stride 1 (other layouts raise).  ``rope_interleaved`` forms the same four products and two sums.
+(BT, 2 BP) tiles (the even / odd elements split / joined in registers; a 64-bit base per tile, 32-bit offsets within
+it); x, y and the gradients need channel stride 1 (other layouts raise).  ``rope_interleaved`` forms the same four
+products and two sums.
 
 Launchers are ``torch.library`` custom ops (``neuronspark::hippo_*rope*``) with fake implementations of the same
 layouts.  The references apply :func:`neuronspark.modules.rope.apply_rope_interleaved_ref` (the eager bf16 ops).
@@ -67,14 +68,17 @@ ROPE_CFG = (16, 64, 4)        # rope_paired forward / backward
 def _silu_rope_fwdp_kernel(X, C, S, Y, T, P, xs0, xs1, cs0, cs1, cs2, ss0, ss1, ss2, ys0, ys1,
                      BT: tl.constexpr, BP: tl.constexpr):
     """y = rope(bf16 silu(x)) on a (BT, 2 BP) channel tile of one b (x read and y written as one contiguous tile each,
-    the even / odd elements split / joined in registers; channel stride 1; int32 in-tile offsets)."""
-    t = tl.program_id(0) * BT + tl.arange(0, BT)
+    the even / odd elements split / joined in registers; channel stride 1; 32-bit offsets within the tile)."""
+    i = tl.arange(0, BT)
+    t = tl.program_id(0) * BT + i
     b = tl.program_id(1)
+    tb = (tl.program_id(0) * BT).to(tl.int64)                       # 64-bit tile base, 32-bit offsets in the tile
+    b64 = b.to(tl.int64)
     p = tl.program_id(2) * BP + tl.arange(0, BP)
     c2 = tl.program_id(2) * (2 * BP) + tl.arange(0, 2 * BP)
     m = (t < T)[:, None] & (p < P)[None, :]
     m2 = (t < T)[:, None] & (c2 < 2 * P)[None, :]
-    x2 = tl.load(X + (t[:, None] * xs0 + b * xs1 + c2[None, :]), mask=m2, other=0.0)
+    x2 = tl.load(X + (tb * xs0 + b64 * xs1) + (i[:, None] * xs0 + c2[None, :]), mask=m2, other=0.0)
     xe16, xd16 = tl.split(tl.reshape(x2, [BT, BP, 2]))
     xe = _g_r16(_g_silu(_g_w(xe16)))
     xd = _g_r16(_g_silu(_g_w(xd16)))
@@ -85,20 +89,23 @@ def _silu_rope_fwdp_kernel(X, C, S, Y, T, P, xs0, xs1, cs0, cs1, cs2, ss0, ss1, 
     r = _g_r16(_g_mul(xd, c))
     u = _g_r16(_g_mul(xe, s))
     y2 = tl.reshape(tl.join(_g_n(_g_sub(pp, q)), _g_n(_g_add(r, u))), [BT, 2 * BP])
-    tl.store(Y + (t[:, None] * ys0 + b * ys1 + c2[None, :]), y2, mask=m2)
+    tl.store(Y + (tb * ys0 + b64 * ys1) + (i[:, None] * ys0 + c2[None, :]), y2, mask=m2)
 
 
 @triton.jit
 def _silu_rope_bwdx_kernel(GY, X, C, S, GX, T, P, gs0, gs1, xs0, xs1, cs0, cs1, cs2, ss0, ss1, ss2, os0, os1,
                      BT: tl.constexpr, BP: tl.constexpr):
     """silu_rope backward on a (BT, 2 BP) channel tile: gy, x and gx read / written as contiguous channel tiles."""
-    t = tl.program_id(0) * BT + tl.arange(0, BT)
+    i = tl.arange(0, BT)
+    t = tl.program_id(0) * BT + i
     b = tl.program_id(1)
+    tb = (tl.program_id(0) * BT).to(tl.int64)                       # 64-bit tile base, 32-bit offsets in the tile
+    b64 = b.to(tl.int64)
     p = tl.program_id(2) * BP + tl.arange(0, BP)
     c2 = tl.program_id(2) * (2 * BP) + tl.arange(0, 2 * BP)
     m = (t < T)[:, None] & (p < P)[None, :]
     m2 = (t < T)[:, None] & (c2 < 2 * P)[None, :]
-    g2 = tl.load(GY + (t[:, None] * gs0 + b * gs1 + c2[None, :]), mask=m2, other=0.0)
+    g2 = tl.load(GY + (tb * gs0 + b64 * gs1) + (i[:, None] * gs0 + c2[None, :]), mask=m2, other=0.0)
     ga16, gb16 = tl.split(tl.reshape(g2, [BT, BP, 2]))
     ga = _g_w(ga16)
     gb = _g_w(gb16)
@@ -110,26 +117,29 @@ def _silu_rope_bwdx_kernel(GY, X, C, S, GX, T, P, gs0, gs1, xs0, xs1, cs0, cs1, 
     u = _g_r16(_g_mul(gb, s))
     ge = _g_r16(_g_add(_g_r16(_g_add(pp, u)), 0.0))
     gd = _g_r16(_g_add(_g_r16(_g_add(q, r)), 0.0))
-    x2 = tl.load(X + (t[:, None] * xs0 + b * xs1 + c2[None, :]), mask=m2, other=0.0)
+    x2 = tl.load(X + (tb * xs0 + b64 * xs1) + (i[:, None] * xs0 + c2[None, :]), mask=m2, other=0.0)
     xe16, xd16 = tl.split(tl.reshape(x2, [BT, BP, 2]))
     xe = _g_w(xe16)
     xd = _g_w(xd16)
     o2 = tl.reshape(tl.join(_g_n(_g_silu_bwd(ge, xe)), _g_n(_g_silu_bwd(gd, xd))), [BT, 2 * BP])
-    tl.store(GX + (t[:, None] * os0 + b * os1 + c2[None, :]), o2, mask=m2)
+    tl.store(GX + (tb * os0 + b64 * os1) + (i[:, None] * os0 + c2[None, :]), o2, mask=m2)
 
 
 @triton.jit
 def _rope_fwdp_kernel(X, C, S, Y, T, P, xs0, xs1, cs0, cs1, cs2, ss0, ss1, ss2, ys0, ys1,
                       BT: tl.constexpr, BP: tl.constexpr):
-    """rope(x) with x read and y written as ONE contiguous (BT, 2 BP) channel tile each (channel stride 1, int32
-    in-tile offsets), program (t tile, b, pair tile)."""
-    t = tl.program_id(0) * BT + tl.arange(0, BT)
+    """rope(x) with x read and y written as ONE contiguous (BT, 2 BP) channel tile each (channel stride 1, 32-bit
+    offsets within the tile), program (t tile, b, pair tile)."""
+    i = tl.arange(0, BT)
+    t = tl.program_id(0) * BT + i
     b = tl.program_id(1)
+    tb = (tl.program_id(0) * BT).to(tl.int64)                       # 64-bit tile base, 32-bit offsets in the tile
+    b64 = b.to(tl.int64)
     p = tl.program_id(2) * BP + tl.arange(0, BP)
     c2 = tl.program_id(2) * (2 * BP) + tl.arange(0, 2 * BP)
     m = (t < T)[:, None] & (p < P)[None, :]
     m2 = (t < T)[:, None] & (c2 < 2 * P)[None, :]
-    x2 = tl.load(X + (t[:, None] * xs0 + b * xs1 + c2[None, :]), mask=m2, other=0.0)
+    x2 = tl.load(X + (tb * xs0 + b64 * xs1) + (i[:, None] * xs0 + c2[None, :]), mask=m2, other=0.0)
     xe16, xd16 = tl.split(tl.reshape(x2, [BT, BP, 2]))
     xe = _g_w(xe16)
     xd = _g_w(xd16)
@@ -140,7 +150,7 @@ def _rope_fwdp_kernel(X, C, S, Y, T, P, xs0, xs1, cs0, cs1, cs2, ss0, ss1, ss2, 
     r = _g_r16(_g_mul(xd, c))
     u = _g_r16(_g_mul(xe, s))
     y2 = tl.reshape(tl.join(_g_n(_g_sub(pp, q)), _g_n(_g_add(r, u))), [BT, 2 * BP])
-    tl.store(Y + (t[:, None] * ys0 + b * ys1 + c2[None, :]), y2, mask=m2)
+    tl.store(Y + (tb * ys0 + b64 * ys1) + (i[:, None] * ys0 + c2[None, :]), y2, mask=m2)
 
 
 @triton.jit
@@ -148,13 +158,16 @@ def _rope_bwdp_kernel(GY, C, S, GX, T, P, gs0, gs1, cs0, cs1, cs2, ss0, ss1, ss2
                       BT: tl.constexpr, BP: tl.constexpr):
     """rope backward with gy read and gx written as contiguous (BT, 2 BP) channel tiles: g_e = bf16(bf16(gA c) +
     bf16(gB s)) + 0, g_o = bf16(bf16(-gA s) + bf16(gB c)) + 0."""
-    t = tl.program_id(0) * BT + tl.arange(0, BT)
+    i = tl.arange(0, BT)
+    t = tl.program_id(0) * BT + i
     b = tl.program_id(1)
+    tb = (tl.program_id(0) * BT).to(tl.int64)                       # 64-bit tile base, 32-bit offsets in the tile
+    b64 = b.to(tl.int64)
     p = tl.program_id(2) * BP + tl.arange(0, BP)
     c2 = tl.program_id(2) * (2 * BP) + tl.arange(0, 2 * BP)
     m = (t < T)[:, None] & (p < P)[None, :]
     m2 = (t < T)[:, None] & (c2 < 2 * P)[None, :]
-    g2 = tl.load(GY + (t[:, None] * gs0 + b * gs1 + c2[None, :]), mask=m2, other=0.0)
+    g2 = tl.load(GY + (tb * gs0 + b64 * gs1) + (i[:, None] * gs0 + c2[None, :]), mask=m2, other=0.0)
     ga16, gb16 = tl.split(tl.reshape(g2, [BT, BP, 2]))
     ga = _g_w(ga16)
     gb = _g_w(gb16)
@@ -167,7 +180,7 @@ def _rope_bwdp_kernel(GY, C, S, GX, T, P, gs0, gs1, cs0, cs1, cs2, ss0, ss1, ss2
     ge = _g_r16(_g_add(pp, u))
     gd = _g_r16(_g_add(q, r))
     o2 = tl.reshape(tl.join(_g_n(_g_add(ge, 0.0)), _g_n(_g_add(gd, 0.0))), [BT, 2 * BP])
-    tl.store(GX + (t[:, None] * os0 + b * os1 + c2[None, :]), o2, mask=m2)
+    tl.store(GX + (tb * os0 + b64 * os1) + (i[:, None] * os0 + c2[None, :]), o2, mask=m2)
 
 
 # ================================================================================================ prefill kernel
@@ -179,7 +192,7 @@ def _rope_interleaved_kernel(X, COS, SIN, Y, R, D2, s_x_r, s_c_t, s_c_b, s_s_t, 
     product rounded to bf16 before the difference / sum."""
     pid_r = tl.program_id(axis=0)
     pid_p = tl.program_id(axis=1)
-    offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+    offs_r = (pid_r * BLOCK_R + tl.arange(0, BLOCK_R)).to(tl.int64)
     offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
     offs_e = pid_p * (2 * BLOCK_P) + tl.arange(0, 2 * BLOCK_P)         # the 2 BLOCK_P contiguous elements of the pair block
     mr = offs_r < R
@@ -217,6 +230,8 @@ def _tables(cos: torch.Tensor, sin: torch.Tensor, x: torch.Tensor, what: str) ->
                                f"device, got {t.dtype} {tuple(t.shape)} for x {tuple(x.shape)}")
         if t.requires_grad:
             raise RuntimeError(f"neuronspark.{what}: {n} requires grad (the fused backward gives no table gradient)")
+        if sum((int(a) - 1) * abs(int(st)) for a, st in zip(t.shape, t.stride())) + 1 >= 2 ** 31:
+            raise RuntimeError(f"neuronspark.{what}: {n} spans more than the 32-bit offsets of the table reads")
         out.append(t)
     return out[0], out[1]
 
@@ -226,14 +241,17 @@ def _tab_st(t: torch.Tensor):
     return (int(t.stride(0)) if t.shape[0] != 1 else 0, int(t.stride(1)) if t.shape[1] != 1 else 0, int(t.stride(2)))
 
 
+TILE_T = max(SROPE_FWD_CFG[0], SROPE_BWD_CFG[0], ROPE_CFG[0])
+
+
 def _paired_ok(what: str, **ts) -> None:
     for n, t in ts.items():
         if int(t.stride(2)) != 1:
             raise RuntimeError(f"neuronspark.{what}: {n} needs channel stride 1 for the paired tile, got strides "
                                f"{tuple(t.stride())}")
-        span = sum((int(a) - 1) * abs(int(b)) for a, b in zip(t.shape, t.stride())) + 1
-        if span >= 2 ** 31:
-            raise RuntimeError(f"neuronspark.{what}: {n} offsets beyond the int32 range of the paired kernel")
+        if TILE_T * abs(int(t.stride(0))) + int(t.shape[2]) >= 2 ** 31:
+            raise RuntimeError(f"neuronspark.{what}: {n}'s position stride {int(t.stride(0))} exceeds the 32-bit "
+                               f"offsets within a tile of {TILE_T} positions")
 
 
 def _check_x(x: torch.Tensor, what: str) -> None:

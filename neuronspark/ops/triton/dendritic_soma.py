@@ -60,7 +60,7 @@ def _gated_norm_soma_fwd_kernel(X, XO, Y, W, Z, TH, GA, Rstd, sx, sxo, sy, sz, M
     """Gated norm + soma forward, R rows per program, two passes over the NCH chunks of CH columns: pass 1 acc += g * g
     per lane (chunk order), rstd from one row sum / N; pass 2 reloads x / z and stores n (STORE_N) and x_soma."""
     pid = tl.program_id(0)
-    rows = pid * R + tl.arange(0, R)
+    rows = (pid * R + tl.arange(0, R)).to(tl.int64)            # int64: M rows x row stride may exceed 2^31
     rv = rows < M
     rm = rv[:, None]
     cols = tl.arange(0, CH)[None, :]
@@ -162,7 +162,7 @@ def _gated_norm_bwd_kernel(X, W, Z, DY, DX, DZ, Rstd, sx, sz, sdy, sdx, sdz, M, 
     passes over the NCH chunks of CH columns: pass 1 acc += h * wdy (per lane, chunk order), c1 = one row sum / N;
     pass 2 reloads x / z / dy and stores dz and dx."""
     pid = tl.program_id(0)
-    rows = pid * R + tl.arange(0, R)
+    rows = (pid * R + tl.arange(0, R)).to(tl.int64)            # int64: M rows x row stride may exceed 2^31
     rv = rows < M
     rm = rv[:, None]
     cols = tl.arange(0, CH)[None, :]

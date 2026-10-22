@@ -69,8 +69,8 @@ def _conv_silu_fwd_ls16(X, W, Bias, OUT, sxb, sxl, sob, sol, L, nseg, nprog_l, C
     w2 = tl.load(W + c * 4 + 2, mask=cm, other=0.)
     w3 = tl.load(W + c * 4 + 3, mask=cm, other=0.)
     bias = tl.load(Bias + c, mask=cm, other=0.)
-    xb = X + b * sxb + c
-    ob = OUT + b * sob + c
+    xb = X + b.to(tl.int64) * sxb + c        # batch-row offsets in 64 bits; offsets within a row in 32 bits
+    ob = OUT + b.to(tl.int64) * sob + c
     seg0 = q * SPP
     seg1 = tl.minimum(seg0 + SPP, nseg)
     for seg in range(seg0, seg1):
@@ -209,9 +209,9 @@ def _conv_silu_bwd_ls8(X, W, Bias, DOUT, DX, PART, sxb, sxl, sob, sol, sdb, sdl,
     w2 = tl.load(W + c * 4 + 2, mask=cm, other=0.)
     w3 = tl.load(W + c * 4 + 3, mask=cm, other=0.)
     bias = tl.load(Bias + c, mask=cm, other=0.)
-    xb = X + b * sxb + c
-    ob = DOUT + b * sob + c
-    db_ = DX + b * sdb + c
+    xb = X + b.to(tl.int64) * sxb + c        # batch-row offsets in 64 bits; offsets within a row in 32 bits
+    ob = DOUT + b.to(tl.int64) * sob + c
+    db_ = DX + b.to(tl.int64) * sdb + c
     aw0 = tl.zeros((BC,), dtype=tl.float32)
     aw1 = tl.zeros((BC,), dtype=tl.float32)
     aw2 = tl.zeros((BC,), dtype=tl.float32)
@@ -462,6 +462,9 @@ def _conv_check(x, weight, bias, *others):
         if tuple(t.shape) != (B, C, L) or t.stride(1) != 1 or t.dtype != x.dtype:
             raise RuntimeError("neuronspark.dendritic_conv: every (B, C, L) operand must be channel-last with x's "
                                "dtype")
+    if (L - 1) * max(int(t.stride(2)) for t in (x,) + others) + C >= 2 ** 31:
+        raise RuntimeError(f"neuronspark.dendritic_conv: a row of {L} positions with row stride "
+                           f"{max(int(t.stride(2)) for t in (x,) + others)} exceeds 32-bit offsets within a row")
     return B, C, L
 
 

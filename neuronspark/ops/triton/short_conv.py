@@ -49,6 +49,7 @@ K = 4
 TRAIN_FWD_CFG = (64, 128, 4)     # training forward (BT positions, BC channels, warps), output layout T-major
 TRAIN_BWD_CFG = (64, 64, 2)      # training backward (input gradient + weight-gradient partials)
 WFIN_CFG = (16, 128, 4)          # weight-gradient finish (PB partial rows per step, BJ (c, k) entries, warps)
+TILE_ROWS = max(TRAIN_FWD_CFG[0], TRAIN_BWD_CFG[0]) + 3            # the rows a training tile addresses (3 of halo)
 PREFILL_BT, PREFILL_BC, PREFILL_WARPS = 32, 256, 4
 STEP_BLOCK, STEP_WARPS = 1024, 4
 
@@ -57,9 +58,11 @@ STEP_BLOCK, STEP_WARPS = 1024, 4
 @triton.jit
 def _sc_fwd_kernel(X, W, OUT, T, C, sxt, sxb, sot, sob, soc, BT: tl.constexpr, BC: tl.constexpr):
     pt = tl.program_id(0)
-    b = tl.program_id(1)
+    b = tl.program_id(1).to(tl.int64)
     pc = tl.program_id(2)
-    t = pt * BT + tl.arange(0, BT)
+    i = tl.arange(0, BT)                                             # positions within the tile
+    t = pt * BT + i
+    t0 = (pt * BT).to(tl.int64)                                      # 64-bit tile base, 32-bit offsets in the tile
     c = pc * BC + tl.arange(0, BC)
     cm = c < C
     tm = t < T
@@ -67,29 +70,29 @@ def _sc_fwd_kernel(X, W, OUT, T, C, sxt, sxb, sot, sob, soc, BT: tl.constexpr, B
     w1 = tl.broadcast_to(_scw(tl.load(W + c * 4 + 1, mask=cm, other=0.0))[None, :], (BT, BC))
     w2 = tl.broadcast_to(_scw(tl.load(W + c * 4 + 2, mask=cm, other=0.0))[None, :], (BT, BC))
     w3 = tl.broadcast_to(_scw(tl.load(W + c * 4 + 3, mask=cm, other=0.0))[None, :], (BT, BC))
-    xb = X + b * sxb + c[None, :]
-    r0 = t - 3
-    r1 = t - 2
-    r2 = t - 1
-    x0 = _scw(tl.load(xb + r0[:, None] * sxt, mask=((r0 >= 0) & tm)[:, None] & cm[None, :], other=0.0))
-    x1 = _scw(tl.load(xb + r1[:, None] * sxt, mask=((r1 >= 0) & tm)[:, None] & cm[None, :], other=0.0))
-    x2 = _scw(tl.load(xb + r2[:, None] * sxt, mask=((r2 >= 0) & tm)[:, None] & cm[None, :], other=0.0))
-    x3 = _scw(tl.load(xb + t[:, None] * sxt, mask=tm[:, None] & cm[None, :], other=0.0))
+    xb = X + (b * sxb + t0 * sxt) + c[None, :]
+    x0 = _scw(tl.load(xb + (i - 3)[:, None] * sxt, mask=((t >= 3) & tm)[:, None] & cm[None, :], other=0.0))
+    x1 = _scw(tl.load(xb + (i - 2)[:, None] * sxt, mask=((t >= 2) & tm)[:, None] & cm[None, :], other=0.0))
+    x2 = _scw(tl.load(xb + (i - 1)[:, None] * sxt, mask=((t >= 1) & tm)[:, None] & cm[None, :], other=0.0))
+    x3 = _scw(tl.load(xb + i[:, None] * sxt, mask=tm[:, None] & cm[None, :], other=0.0))
     acc = tl.zeros((BT, BC), dtype=tl.float32)
     acc = _scfma(w0, x0, acc)
     acc = _scfma(w1, x1, acc)
     acc = _scfma(w2, x2, acc)
     acc = _scfma(w3, x3, acc)
-    tl.store(OUT + b * sob + t[:, None] * sot + c[None, :] * soc, _scn(acc), mask=tm[:, None] & cm[None, :])
+    tl.store(OUT + (b * sob + t0 * sot) + (i[:, None] * sot + c[None, :] * soc), _scn(acc),
+             mask=tm[:, None] & cm[None, :])
 
 
 @triton.jit
 def _sc_bwd_kernel(X, W, DY, DX, PART, T, C, NTB, sxt, sxb, sdt, sdb, sdc, sgt, sgb,
                    BT: tl.constexpr, BC: tl.constexpr):
     pt = tl.program_id(0)
-    b = tl.program_id(1)
+    b = tl.program_id(1).to(tl.int64)
     pc = tl.program_id(2)
-    t = pt * BT + tl.arange(0, BT)
+    i = tl.arange(0, BT)                                             # positions within the tile
+    t = pt * BT + i
+    t0 = (pt * BT).to(tl.int64)                                      # 64-bit tile base, 32-bit offsets in the tile
     c = pc * BC + tl.arange(0, BC)
     cm = c < C
     tm = t < T
@@ -98,30 +101,24 @@ def _sc_bwd_kernel(X, W, DY, DX, PART, T, C, NTB, sxt, sxb, sdt, sdb, sdc, sgt, 
     w2 = tl.broadcast_to(_scw(tl.load(W + c * 4 + 2, mask=cm, other=0.0))[None, :], (BT, BC))
     w3 = tl.broadcast_to(_scw(tl.load(W + c * 4 + 3, mask=cm, other=0.0))[None, :], (BT, BC))
     # upstream gradient rows t .. t + 3 (index >= T masked to 0)
-    db = DY + b * sdb + c[None, :] * sdc
-    s1 = t + 1
-    s2 = t + 2
-    s3 = t + 3
-    d0 = _scw(tl.load(db + t[:, None] * sdt, mask=tm[:, None] & cm[None, :], other=0.0))
-    d1 = _scw(tl.load(db + s1[:, None] * sdt, mask=(s1 < T)[:, None] & cm[None, :], other=0.0))
-    d2 = _scw(tl.load(db + s2[:, None] * sdt, mask=(s2 < T)[:, None] & cm[None, :], other=0.0))
-    d3 = _scw(tl.load(db + s3[:, None] * sdt, mask=(s3 < T)[:, None] & cm[None, :], other=0.0))
+    db = DY + (b * sdb + t0 * sdt) + c[None, :] * sdc
+    d0 = _scw(tl.load(db + i[:, None] * sdt, mask=tm[:, None] & cm[None, :], other=0.0))
+    d1 = _scw(tl.load(db + (i + 1)[:, None] * sdt, mask=(t + 1 < T)[:, None] & cm[None, :], other=0.0))
+    d2 = _scw(tl.load(db + (i + 2)[:, None] * sdt, mask=(t + 2 < T)[:, None] & cm[None, :], other=0.0))
+    d3 = _scw(tl.load(db + (i + 3)[:, None] * sdt, mask=(t + 3 < T)[:, None] & cm[None, :], other=0.0))
     # input gradient: the reference tap order (kw = 0 first: w0 * dy[t + 3])
     acc = tl.zeros((BT, BC), dtype=tl.float32)
     acc = _scfma(w0, d3, acc)
     acc = _scfma(w1, d2, acc)
     acc = _scfma(w2, d1, acc)
     acc = _scfma(w3, d0, acc)
-    tl.store(DX + b * sgb + t[:, None] * sgt + c[None, :], _scn(acc), mask=tm[:, None] & cm[None, :])
+    tl.store(DX + (b * sgb + t0 * sgt) + (i[:, None] * sgt + c[None, :]), _scn(acc), mask=tm[:, None] & cm[None, :])
     # weight-gradient partials of this tile: sum over its rows t < T of x[t - 3 + k] * dy[t] (d0 is 0 for t >= T)
-    xb = X + b * sxb + c[None, :]
-    r0 = t - 3
-    r1 = t - 2
-    r2 = t - 1
-    x0 = _scw(tl.load(xb + r0[:, None] * sxt, mask=((r0 >= 0) & tm)[:, None] & cm[None, :], other=0.0))
-    x1 = _scw(tl.load(xb + r1[:, None] * sxt, mask=((r1 >= 0) & tm)[:, None] & cm[None, :], other=0.0))
-    x2 = _scw(tl.load(xb + r2[:, None] * sxt, mask=((r2 >= 0) & tm)[:, None] & cm[None, :], other=0.0))
-    x3 = _scw(tl.load(xb + t[:, None] * sxt, mask=tm[:, None] & cm[None, :], other=0.0))
+    xb = X + (b * sxb + t0 * sxt) + c[None, :]
+    x0 = _scw(tl.load(xb + (i - 3)[:, None] * sxt, mask=((t >= 3) & tm)[:, None] & cm[None, :], other=0.0))
+    x1 = _scw(tl.load(xb + (i - 2)[:, None] * sxt, mask=((t >= 2) & tm)[:, None] & cm[None, :], other=0.0))
+    x2 = _scw(tl.load(xb + (i - 1)[:, None] * sxt, mask=((t >= 1) & tm)[:, None] & cm[None, :], other=0.0))
+    x3 = _scw(tl.load(xb + i[:, None] * sxt, mask=tm[:, None] & cm[None, :], other=0.0))
     a0 = tl.sum(x0 * d0, axis=0)
     a1 = tl.sum(x1 * d0, axis=0)
     a2 = tl.sum(x2 * d0, axis=0)
@@ -255,9 +252,9 @@ def _check_train_x(x: torch.Tensor, wb: torch.Tensor):
     if tuple(wb.shape) != (C, 1, K) or wb.dtype != torch.bfloat16 or not wb.is_contiguous():
         raise RuntimeError(f"neuronspark.short_conv_train: the bf16 weight must be a contiguous ({C}, 1, {K}) tensor, "
                            f"got {tuple(wb.shape)} {wb.dtype}")
-    span = (T - 1) * abs(x.stride(0)) + (B - 1) * abs(x.stride(1)) + C
-    if T * B * C >= 2 ** 31 or span >= 2 ** 31:
-        raise RuntimeError("neuronspark.short_conv_train: offsets beyond the kernels' int32 range")
+    if TILE_ROWS * max(abs(int(x.stride(0))), B * C) >= 2 ** 31:
+        raise RuntimeError(f"neuronspark.short_conv_train: the position stride of {tuple(x.shape)} exceeds the 32-bit "
+                           f"offsets within a tile of {TILE_ROWS} positions")
     return T, B, C
 
 
@@ -289,9 +286,9 @@ def _sc_bwd(x, wb, dy):
     if dy.dtype != torch.bfloat16 or tuple(dy.shape) != (T, B, C):
         raise RuntimeError(f"neuronspark.short_conv_train backward: the upstream gradient must be bf16 {(T, B, C)}, got "
                            f"{dy.dtype} {tuple(dy.shape)}")
-    dspan = sum((n - 1) * abs(s) for n, s in zip(dy.shape, dy.stride())) + 1
-    if dspan >= 2 ** 31:
-        raise RuntimeError("neuronspark.short_conv_train backward: gradient offsets beyond the kernels' int32 range")
+    if TILE_ROWS * abs(int(dy.stride(0))) >= 2 ** 31:
+        raise RuntimeError(f"neuronspark.short_conv_train backward: the gradient's position stride {int(dy.stride(0))} "
+                           f"exceeds the 32-bit offsets within a tile of {TILE_ROWS} positions")
     BT, BC, nw = TRAIN_BWD_CFG
     PB, BJ, nwf = WFIN_CFG
     ntb = triton.cdiv(T, BT)

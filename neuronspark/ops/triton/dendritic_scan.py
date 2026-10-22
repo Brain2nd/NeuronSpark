@@ -60,7 +60,7 @@ def _dda_asm_kernel(V, OUT, svb, svh, svc, sob, soh, soc, BS: tl.constexpr, NB: 
     = sum_{m >= k} sum_{n < k} T[m, n] (the intra-chunk ddA)."""
     h = tl.program_id(0)
     c = tl.program_id(1)
-    b = tl.program_id(2)
+    b = tl.program_id(2).to(tl.int64)
     r = tl.arange(0, BS)
     kb = tl.arange(0, NB)
     i3 = kb[:, None, None]
@@ -96,8 +96,9 @@ def _fwd_kernel(CBD, XD, X, OUT, DT, DA, CD, SD, D,
     cols = tl.arange(0, P)
     t0 = c * CS
     n_valid = tl.minimum(CS, T - t0)
-    da_base = DA + b * sab + c * sac + h * sah
-    dt_base = DT + b * stb + c * stc + h * sth
+    b64 = b.to(tl.int64)                          # int32 descriptor coordinates; int64 pointer offsets
+    da_base = DA + b64 * sab + c * sac + h * sah
+    dt_base = DT + b64 * stb + c * stc + h * sth
     da_r = tl.load(da_base + rows, mask=rows < CS, other=0.0).to(tl.float32)
     # inter-chunk: exp(dA_r) C_r . S_h
     c_rows = CD.load([b, t0 + r0, 0]).reshape(BM, N)
@@ -117,10 +118,10 @@ def _fwd_kernel(CBD, XD, X, OUT, DT, DA, CD, SD, D,
         x_k = XD.load([b, t0 + k0, h * P]).reshape(BK, P)
         acc += tl.dot(w, x_k)
     live = (rows[:, None] < n_valid) & (cols[None, :] < P)
-    x_r = tl.load(X + b * sxb + (t0 + rows)[:, None] * sxl + h * sxh + cols[None, :], mask=live,
+    x_r = tl.load(X + b64 * sxb + (t0 + rows)[:, None] * sxl + h * sxh + cols[None, :], mask=live,
                   other=0.0).to(tl.float32)
     acc += x_r * tl.load(D + h).to(tl.float32)
-    tl.store(OUT + b * sob + (t0 + rows)[:, None] * sol + h * soh + cols[None, :], acc, mask=live)
+    tl.store(OUT + b64 * sob + (t0 + rows)[:, None] * sol + h * soh + cols[None, :], acc, mask=live)
 
 
 # ------------------------------------------------------------------------------------------------ launchers

@@ -193,7 +193,7 @@ def _compute_body(do_s, x_s, ready, free, g_done, g_free, g_t, cb_t, dcb_t, dcb_
                 acc = dcb_t.slice(J0 * _SUB, W).load(L) + f
             dcb_t.slice(J0 * _SUB, W).store(acc)
             tt = f * cb_t.slice(J0 * _SUB, W).load(L)
-            vb = V + ((b * H + h) * nchunks + c) * (8 * 8 * 2 * _SUB)
+            vb = V + ((b * H + h) * nchunks + c).to(gl.int64) * (8 * 8 * 2 * _SUB)
             rsum = gl.sum(gl.reshape(tt, [_BM, 2, _SUB]), axis=2)            # (BM, 2): per half, in thread
             ro = gl.arange(0, _BM, layout=gl.SliceLayout(1, rsum.type.layout))[:, None]
             ho = gl.arange(0, 2, layout=gl.SliceLayout(0, rsum.type.layout))[None, :]

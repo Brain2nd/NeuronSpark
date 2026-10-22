@@ -355,10 +355,10 @@ class PoolAttentionMixin:
         return a.to(torch.float32).unsqueeze(-1)
 
     @staticmethod
-    def _trace_increment(a: torch.Tensor, T: int, B: int, gain: torch.Tensor) -> torch.Tensor:
-        """(T, B) fp32 gained clock increment gamma_h mean_c log(max(a, 1e-6)) of one head (whole row)."""
+    def _trace_increments(a: torch.Tensor, T: int, B: int, gains: torch.Tensor) -> torch.Tensor:
+        """(T, B, H) fp32 gained clock increments gamma_h mean_c log(max(a, 1e-6)) of the H heads (whole row)."""
         _a = a.reshape(T, B, -1).float().clamp_min(DECAY_FLOOR)
-        return _a.log().mean(dim=-1) * gain
+        return _a.log().mean(dim=-1).unsqueeze(-1) * gains
 
     def _clock_increments(self, a: torch.Tensor, T: int, B: int) -> torch.Tensor:
         """(T, B, H) fp32 gained clock increments of every head (inference): the shared mean log decay times gamma_h."""
@@ -500,7 +500,7 @@ class PoolAttentionMixin:
         xq = self._extra_queries_train(z, cos, sin, qgain[H - 1])
         q_all = torch.cat([torch.stack(qn, dim=2), xq.to(qn[0].dtype)], dim=2)          # (T, B, H + M, dk)
         gv = torch.stack([self._tagged_values(gn[i], vs[i]) for i in range(H)], dim=2)  # (T, B, H, dv) bf16
-        cum = torch.stack([o.cumsum0(self._trace_increment(a, T, B, gains[i])) for i in range(H)], dim=2)
+        cum = o.cumsum0(self._trace_increments(a, T, B, gains[:H]))                       # the H clocks, one scan
         reads = o.pool_read(q_all, torch.stack(kn, dim=2), gv, cum, self.induction_beta(), qtok, ktok,
                             self.induction_orders, self.match_scale)                    # (T, B, H + M, dv) bf16
         heads = [reads[:, :, i].to(torch.float32) for i in range(H)]

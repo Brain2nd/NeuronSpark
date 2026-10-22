@@ -14,13 +14,16 @@ Operators (registry names):
 
 Numerics contract
 -----------------
-* ``cumsum0``, narrow scans (at most 32 columns): one lane per column runs ATen's outer-dim recurrence ``acc = +0;
-  acc = add.rn(acc, x[t]); y[t] = acc`` strictly left to right (right to left for the backward), 64 loads in flight
-  per tile -- ATen's order of additions.
+* ``cumsum0``, narrow scans (at most 32 columns, a single column included): one lane per column runs ATen's outer-dim
+  recurrence ``acc = +0; acc = add.rn(acc, x[t]); y[t] = acc`` strictly left to right (right to left for the
+  backward), 64 loads in flight per tile -- ATen's order of additions.  (The pool clocks of the H heads are one
+  (T, B, H) scan: a single row still gives H columns.)
 * ``cumsum0``, wide scans (more than 32 columns): the T steps in 32 chunks; lane (chunk, column) runs the sequential
   fp32 chain over its chunk (pass 1 the chunk totals, an exclusive prefix over the totals, pass 2 the chain again from
   that offset).  Within a chunk the order is ATen's; the chunk offsets make the result the per-operator rule class.
-* A single column (``numel == size(0)``) is ``x.cumsum(dim=0)`` itself (ATen scans it with cub's inclusive scan).
+* Every form is deterministic: the same input gives the same output in every call.  (ATen scans a single column with
+  cub's decoupled look-back scan, whose order of additions depends on the timing of the thread blocks: a (32768, 1)
+  scan differs from call to call.)
 * ``exact_cumsum0``: the same IEEE fp32 operations as ``torch.cumsum`` in the same order (``add.rn``; the accumulator
   from +0).
 * ``centred_running``: the tokens in tiles; a tile's prefix sums by a parallel scan plus the carried sum of the earlier
@@ -747,7 +750,7 @@ def _launch_chunk(x: torch.Tensor, y: torch.Tensor, reverse: bool) -> None:
 @torch.library.custom_op("neuronspark::cumsum0", mutates_args=(), schema="(Tensor x, bool reverse) -> Tensor")
 def _cumsum0_op(x, reverse):
     """Contiguous fp32 scan of ``x`` along axis 0 (ascending t, or descending t when ``reverse``): the sequential
-    kernel for at most 32 columns, the chunked kernel otherwise.  ``x``: CUDA fp32 with more than one column."""
+    kernel for at most 32 columns, the chunked kernel otherwise.  ``x``: CUDA fp32."""
     if _two_level(x) is None:
         x = x.contiguous()        # ATen's expect_contiguous: a copy, the per-column order is unchanged
     y = torch.empty(x.shape, dtype=x.dtype, device=x.device)
@@ -784,14 +787,12 @@ class Cumsum0Fn(torch.autograd.Function):
 
 def cumsum0(x: torch.Tensor) -> torch.Tensor:
     """``x.cumsum(dim=0)`` for a CUDA fp32 tensor with at least one axis and one element (training regime; see the
-    module docstring for the narrow / wide / single-column forms)."""
+    module docstring for the narrow and wide forms)."""
     require_cuda(x, "cumsum0")
     if x.dtype != torch.float32:
         raise RuntimeError(f"neuronspark.cumsum0: a CUDA float32 tensor is required, got {x.dtype}")
     if x.dim() < 1 or x.numel() == 0:
         raise RuntimeError(f"neuronspark.cumsum0: at least one axis and one element are required, got {tuple(x.shape)}")
-    if x.numel() == x.shape[0]:
-        return x.cumsum(dim=0)
     return Cumsum0Fn.apply(x)
 
 

@@ -14,7 +14,7 @@ Sampling (:func:`next_tokens`): ``top_k == 1`` is greedy (the first index on tie
 the temperature and filtered in this order -- the ``top_k`` largest (``top_k > 1``), the tokens whose probability is at
 least ``min_p`` times the largest one (``0 < min_p < 1``), the most probable tokens whose cumulative probability first
 reaches ``top_p`` (``0 < top_p < 1``) -- and one token is drawn from the remaining distribution.  ``teacher_outputs``
-(B, >= max_length) forces the tokens instead (the tests' teacher-forced form).
+(B, >= max_length) forces the tokens instead (teacher-forced decoding).
 """
 from __future__ import annotations
 

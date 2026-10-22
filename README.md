@@ -24,7 +24,7 @@ associative memory.
 
 This repository contains the NeuronSpark architecture and its GPU operators: the model code (configuration, layers and
 an inference cache with CUDA-graph decoding), Triton and Gluon kernels for training, prefill and single-token decoding,
-and tests and benchmarks.
+and benchmarks.
 
 ## Architecture
 
@@ -194,19 +194,12 @@ custom ops.  `neuronspark/ops/registry.py` lists every operator with its signatu
 | readout balance | `ops/triton/balance_add.py` | scoring, prefill, decode |
 | readout balance + cross entropy | `ops/triton/lm_tail.py` | train |
 
-## Tests
+## Correctness
 
-Kernels are tested against their references with one tolerance rule, the default rule of flashinfer-bench
-(`neuronspark/utils/testing.py`).  An element fails only if both its absolute and its relative error exceed `1e-2`.  A
-tensor passes when no element fails.
-
-```bash
-pytest tests
-```
-
-The model tests build a fresh model of the default configuration and calibrate it on random token rows; no checkpoint
-is needed.  `tests/models/test_widths.py` also runs the model at D = 2048 (training against the references, CUDA-graph
-decoding); the operator tests of the gated-norm soma, product-key read and decode-step kernels cover both widths.
+Every kernel matches its reference implementation under one tolerance rule, the default rule of flashinfer-bench
+(`neuronspark/utils/testing.py`): an element fails only if both its absolute and its relative error exceed `1e-2`, and a
+tensor passes when no element fails.  The rule covers every output and every gradient, at the widths of both model
+configurations (D = 1536 and D = 2048).
 
 ## Benchmarks
 

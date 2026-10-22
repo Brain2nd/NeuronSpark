@@ -65,8 +65,8 @@ _MAX_REPS = 8            # BLOCK_N // (THREADS * VEC): the unrolled register-res
 # ------------------------------------------------------------------------------------------------ kernel
 @triton.jit
 def _soma_store(Y, NOUT, cols, m, y, TH, GA, STORE_N: tl.constexpr):
-    """the soma read-out of the bf16-rounded norm value: x = bf16(S(n, theta) * gamma); STORE_N also stores n (the
-    tests' per-operator comparison of the two stages)"""
+    """the soma read-out of the bf16-rounded norm value: x = bf16(S(n, theta) * gamma); STORE_N also stores n (for a
+    per-operator comparison of the two stages)"""
     if STORE_N:
         tl.store(NOUT + cols, _sr_f32_to_bf16(y), mask=m)
     v = _sr_bf16_to_f32(_sr_f32_to_bf16(y))
@@ -324,7 +324,7 @@ def _gated_norm_soma_fwd(y2: torch.Tensor, w: torch.Tensor, z2: torch.Tensor, th
                          eps: float, store_n: bool = False):
     """the read-out of fla ``layer_norm_fwd(y2, w, None, eps, z=z2, group_size=N, norm_before_gate=False,
     is_rms_norm=True)[0]`` for the reproduced domain (operands checked by the caller); a contiguous (M, N) bf16 output,
-    and with ``store_n`` also the norm n (M, N) bf16 that the read-out was formed from (for the stage-wise tests)."""
+    and with ``store_n`` also the norm n (M, N) bf16 that the read-out was formed from (for a stage-wise comparison)."""
     M, N = (int(s) for s in y2.shape)
     out = torch.empty((M, N), dtype=torch.bfloat16, device=y2.device)
     n_out = torch.empty((M, N), dtype=torch.bfloat16, device=y2.device) if store_n else out

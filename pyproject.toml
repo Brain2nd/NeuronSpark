@@ -23,18 +23,5 @@ dependencies = [
     "packaging",
 ]
 
-[project.optional-dependencies]
-test = ["pytest"]
-
 [project.urls]
 Repository = "https://github.com/Brain2nd/NeuronSpark"
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-# test files with the same basename live in different directories (tests/ops, tests/modules)
-addopts = "--import-mode=importlib"
-markers = [
-    "cuda: needs a CUDA GPU",
-    "sm100: needs a Blackwell GPU (compute capability >= 10.0)",
-    "ckpt: needs the NeuronSpark checkpoint (--ckpt)",
-]

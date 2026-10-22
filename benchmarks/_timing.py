@@ -14,8 +14,7 @@ Three clocks, each reported as the mean over trials of the per-trial median:
 * :func:`host_time_ms` -- host wall time (``time.perf_counter``) of each call, the device synchronised before and after:
   end-to-end latency including host work and synchronisation.
 
-The benchmarks report speed only; correctness is established by the tests (the per-operator rule of
-:mod:`neuronspark.utils.testing`).
+The benchmarks report speed only; correctness is the per-operator rule of :mod:`neuronspark.utils.testing`.
 """
 from __future__ import annotations
 

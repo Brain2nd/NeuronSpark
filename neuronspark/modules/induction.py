@@ -11,7 +11,7 @@ term ``sum_n beta[n, h] m_n`` with its own ``pool_ind_beta``.
 Whole row (:func:`induction_token_windows`): the two (B, T, n_max) id windows ``qtok[b, t, i] = x_{t-i}`` and
 ``ktok[b, j, i] = x_{j-1-i}`` (pad id ``V`` outside the row), from which the training pool read forms the matches of
 each (t, j) tile in-kernel; :func:`induction_window_matches` materialises the (B, T, T) matrices from them (the
-reference of the pool read and the tests).
+reference of the pool read).
 
 Inference (:func:`induction_session_match`): the cache keeps a keys ring
 (:class:`~neuronspark.utils.cache.InductionState`): slot ``w`` holds the ``n_max`` ids preceding the event written

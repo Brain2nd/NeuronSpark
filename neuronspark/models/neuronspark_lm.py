@@ -31,12 +31,15 @@ Regimes (decided in :meth:`NeuronSparkModel.forward`, one code path each):
   layer's carried state are read and updated in place; the final norm is ``rmsnorm_rows``; the device counters ``pos``
   / ``ring_ptr`` advance by T in place (CUDA-graph replay safe) and the host count ``seqlen_offset`` advances by T.
 
-Activation checkpointing (``gradient_checkpointing = True``, whole row with autograd): every dendritic neuron layer is
-recomputed in backward (``use_reentrant=False, preserve_rng_state=False``) and the dendritic-layer -> dendritic-layer
-join is not used (each checkpointed dendritic neuron layer forms its own pre-norm).  The hippocampal layers stay
-resident unless ``hippocampal_checkpointing = True`` as well: then each hippocampal layer keeps only its inputs and is
-recomputed in backward (its pool attention's T x T probabilities are not held across the layers: long rows); the
-copy-switch operands are collected in the forward only.
+Activation checkpointing (whole row with autograd): ``gradient_checkpointing = True`` recomputes every dendritic
+neuron layer in backward, an integer ``k`` the first ``k`` dendritic neuron layers (the memory of the others stays
+resident: the setting between none and all that a memory budget allows), ``use_reentrant=False,
+preserve_rng_state=False``.  A checkpointed dendritic neuron layer forms its own pre-norm (the dendritic-layer ->
+dendritic-layer join, in which a layer prepares the next one's pre-norm, is not used into or out of it).  The
+hippocampal layers stay resident unless ``hippocampal_checkpointing = True`` as well, with every dendritic neuron layer
+recomputed: then each hippocampal layer keeps only its inputs and is recomputed in backward (its pool attention's
+T x T probabilities are not held across the layers: long rows); the copy-switch operands are collected in the forward
+only.
 
 Inference weights: :meth:`NeuronSparkLMHeadModel.prepare_inference` attaches a bf16 copy to every projection weight
 (the tied embedding included); inference GEMMs read it (``neuronspark.ops.linear``).  A weight modified after the copy
@@ -100,9 +103,9 @@ MODEL_INITS = ("launch", "empty")
 EMBED_INIT_STD = 0.02
 # target id that carries no loss
 IGNORE_INDEX = -100
-# the readout GEMM and the fused readout-balance cross entropy index the (rows, V) logits with 32-bit offsets: a call
-# covers at most READOUT_MAX_ELEMENTS logits; a longer row set is read out in row chunks (a multiple of
-# READOUT_ROW_ALIGN rows each, the last one shorter), each token's logits and loss unchanged
+# a readout call covers at most READOUT_MAX_ELEMENTS logits: a longer row set is read out in row chunks (a multiple of
+# READOUT_ROW_ALIGN rows each, the last one shorter), each token's logits and loss unchanged; this bounds each call's
+# (rows, V) temporaries, e.g. the backward's logits gradient (the kernels address the logits with 64-bit row offsets)
 READOUT_MAX_ELEMENTS = 2 ** 31 - 1
 READOUT_ROW_ALIGN = 1024
 # 2-D parameters that are not projection weights (gathered or consumed in fp32 by their own operators): no bf16 copy
@@ -142,6 +145,17 @@ def _as_token_ids(ids: torch.Tensor, what: str = "input_ids") -> torch.Tensor:
 
 
 # ================================================================================================ backbone
+def checkpointed_dendritic_layers(setting, n_dend: int) -> int:
+    """How many dendritic neuron layers a ``gradient_checkpointing`` setting recomputes: False 0, True all, an integer
+    that many (0 <= k <= n_dend)."""
+    if isinstance(setting, bool):
+        return n_dend if setting else 0
+    if isinstance(setting, int) and 0 <= setting <= n_dend:
+        return setting
+    raise ValueError(f"gradient_checkpointing must be False, True or a number of dendritic neuron layers in "
+                     f"[0, {n_dend}], got {setting!r}")
+
+
 class NeuronSparkModel(nn.Module):
     """``NeuronSparkModel(config, device=None, dtype=torch.float32, impl="kernel", init="launch")``.
 
@@ -250,8 +264,14 @@ class NeuronSparkModel(nn.Module):
             lex = self.lexical_memory(ids)                                   # (T, B, 160) fp32
             ind = induction_token_windows(ids, cfg.hippocampal_induction_bias_orders, pad=int(cfg.vocab_size))
             copy = copy_stats_whole_row(lex, tuple(cfg.lexical_order1_slice))
-            ckpt = bool(self.gradient_checkpointing) and torch.is_grad_enabled()
-            ckpt_h = ckpt and bool(self.hippocampal_checkpointing)
+            n_dend = sum(1 for layer in self.layers if not isinstance(layer, HippocampalLayer))
+            k = checkpointed_dendritic_layers(self.gradient_checkpointing, n_dend) if torch.is_grad_enabled() else 0
+            ckpt_h = k == n_dend > 0 and bool(self.hippocampal_checkpointing)
+            ckpt, seen = [], 0                                           # per layer: a checkpointed dendritic layer
+            for layer in self.layers:
+                is_dend = not isinstance(layer, HippocampalLayer)
+                ckpt.append(is_dend and seen < k)
+                seen += is_dend
             carry: Optional[torch.Tensor] = None
             hn: Optional[torch.Tensor] = None
             n_layers = len(self.layers)
@@ -266,11 +286,12 @@ class NeuronSparkModel(nn.Module):
                     else:
                         x, carry = layer(x, lex=lex, ind=ind, copy=copy, carry=carry, aux_out=aux_out, calib=calib)
                     continue
-                if ckpt:
+                if ckpt[i]:
                     x, _ = checkpoint(layer, x, None, use_reentrant=False, preserve_rng_state=False)
                     continue
                 nxt = self.layers[i + 1] if i + 1 < n_layers else None
-                gain = nxt.mixer_a.pre_norm_gain if isinstance(nxt, DendriticNeuronLayer) else None
+                joined = isinstance(nxt, DendriticNeuronLayer) and not ckpt[i + 1]
+                gain = nxt.mixer_a.pre_norm_gain if joined else None
                 x, hn = layer(x, hn=hn, next_norm_gain=gain)
             if hn is not None:
                 raise RuntimeError("NeuronSparkModel: the last dendritic neuron layer prepared a pre-norm that no "
@@ -410,12 +431,16 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
         return self.backbone.embed_tokens.weight
 
     @property
-    def gradient_checkpointing(self) -> bool:
-        return bool(self.backbone.gradient_checkpointing)
+    def gradient_checkpointing(self):
+        """False, True (every dendritic neuron layer recomputed) or the number of dendritic neuron layers recomputed
+        (the first ones)."""
+        return self.backbone.gradient_checkpointing
 
     @gradient_checkpointing.setter
-    def gradient_checkpointing(self, enabled: bool) -> None:
-        self.backbone.gradient_checkpointing = bool(enabled)
+    def gradient_checkpointing(self, enabled) -> None:
+        n_dend = sum(1 for layer in self.backbone.layers if not isinstance(layer, HippocampalLayer))
+        checkpointed_dendritic_layers(enabled, n_dend)                     # validated
+        self.backbone.gradient_checkpointing = enabled
 
     @property
     def hippocampal_checkpointing(self) -> bool:

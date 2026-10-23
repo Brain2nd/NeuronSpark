@@ -33,7 +33,10 @@ TMA store of the bf16 state tile, which the compiler split over the four epilogu
 address when the GPU was time-sliced with another process; the plain stores do not); the compute partition reads each K
 step's dA / dt in the tile's row layout.  No partition
 uses an operation that needs compiler scratch memory (a layout conversion, a reduction across warps): the allocator
-places such scratch over the warp_specialize capture buffer, which partitions that start later still read.
+places such scratch over the warp_specialize capture buffer, which partitions that start later still read.  The
+initial-state barriers exist only with an initial state: an initialised barrier the kernel no longer uses is dead to the
+allocator, which put the capture buffer over it, and on a time-sliced GPU the context switch wrote the barrier back
+over the captured tensor-memory address (the MMA warp then issued its MMAs at an address out of range).
 """
 from __future__ import annotations
 
@@ -227,13 +230,17 @@ def _chunk_states_kernel(xd, bd, initd, DT, DA, STP, PRP, FNP, n_items, seqlen, 
         init_s = gl.allocate_shared_memory(initd.dtype, [P, N], initd.layout)
     else:
         init_s = b_s.index(0)                                          # placeholder (no initial state)
-    init_bar = gl.allocate_shared_memory(gl.int64, [1], BL)
-    init_free = gl.allocate_shared_memory(gl.int64, [1], BL)
     ready = gl.allocate_shared_memory(gl.int64, [R, 1], BL)
     scaled = gl.allocate_shared_memory(gl.int64, [R, 1], BL)
     free = gl.allocate_shared_memory(gl.int64, [R, 1], BL)
     acc_done = gl.allocate_shared_memory(gl.int64, [2, 1], BL)
     acc_free = gl.allocate_shared_memory(gl.int64, [2, 1], BL)
+    if HAS_INIT:
+        init_bar = gl.allocate_shared_memory(gl.int64, [1], BL)
+        init_free = gl.allocate_shared_memory(gl.int64, [1], BL)
+    else:                                                              # placeholders (no initial state)
+        init_bar = acc_done.index(0)
+        init_free = acc_free.index(0)
     for i in gl.static_range(R):
         mbarrier.init(ready.index(i), count=1)
         mbarrier.init(scaled.index(i), count=1)
@@ -241,8 +248,9 @@ def _chunk_states_kernel(xd, bd, initd, DT, DA, STP, PRP, FNP, n_items, seqlen, 
     for i in gl.static_range(2):
         mbarrier.init(acc_done.index(i), count=1)
         mbarrier.init(acc_free.index(i), count=1)
-    mbarrier.init(init_bar, count=1)
-    mbarrier.init(init_free, count=1)
+    if HAS_INIT:
+        mbarrier.init(init_bar, count=1)
+        mbarrier.init(init_free, count=1)
     fence_async_shared()
     acc = allocate_tensor_memory(gl.float32, [2, P, N], TL)
     gl.warp_specialize(

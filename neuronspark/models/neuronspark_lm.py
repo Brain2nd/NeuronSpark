@@ -539,6 +539,29 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
             loss = ce + aux
         return LossOutput(loss=loss, ce=ce, aux=aux, n_valid=n_valid)
 
+    @torch.no_grad()
+    def per_token_ce(self, input_ids: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """(B, T) fp32: the cross entropy of every target of a whole-row batch, as :meth:`loss` forms it (its ``ce``
+        is their mean over the targets != -100); 0 at the ignored targets.  For probes: no gradient, no auxiliary
+        loss, the same regime and readout chunks as the training loss."""
+        ids = _as_token_ids(input_ids)
+        tg = _as_token_ids(targets, "targets")
+        if tuple(tg.shape) != tuple(ids.shape):
+            raise ValueError(f"targets {tuple(tg.shape)} must have the shape of input_ids {tuple(ids.shape)}")
+        o = self._o
+        with regime("train"):
+            hidden = self.backbone(ids, aux_out=[])                                 # (B, T, D) fp32
+            B, T, D = (int(s) for s in hidden.shape)
+            rows = hidden.reshape(B * T, D)
+            labels = tg.reshape(-1).contiguous()
+            parts = []
+            for a, b in self._row_chunks(B * T):
+                logits = o.linear(rows[a:b], self.backbone.embed_tokens.weight)   # (b - a, V) bf16
+                parts.append(self.backbone.balance_stack.ce_per_token(logits, rows[a:b], labels[a:b]))
+            per = parts[0] if len(parts) == 1 else torch.cat(parts)              # (B * T,) fp32
+            per = per * (labels != IGNORE_INDEX).to(per.dtype)
+        return per.view(B, T)
+
     # ------------------------------------------------------------------------------------------------ inference
     def allocate_inference_cache(self, batch_size: int, max_seqlen: int = DEFAULT_MAX_SEQLEN,
                                  dendritic_state_dtype: Optional[Union[str, torch.dtype]] = None,

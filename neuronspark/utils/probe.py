@@ -8,7 +8,8 @@ outputs it forms anyway, and accumulates per layer and per head, as means over t
   fraction of a compartment's potential at the row's first token that is still there after its last token;
 * ``retention_horizon``: the same with the sum scaled by ``horizon / T``, the retention of a row ``horizon`` tokens long
   whose steps keep the row's mean (``horizon`` 32768 by default);
-* ``firing``: the fraction of the somatic outputs ``s_t`` released through the threshold (non-zero).
+* ``firing``: the fraction of the somatic outputs ``s_t`` released through the threshold (non-zero), and
+  ``firing_by_segment``: the same per segment of the row (``segments`` equal parts; one segment by default).
 
 The probe changes nothing in the forward, and a mixer without one (``probe is None``, the default) does no extra work.
 """
@@ -20,16 +21,16 @@ from typing import Dict, Iterator, List
 import torch
 import torch.nn.functional as F
 
-PROBE_NAMES = ("retention", "retention_horizon", "firing")
+PROBE_NAMES = ("retention", "retention_horizon", "firing", "firing_by_segment")
 
 
 class DendriticProbe:
     """Per-layer, per-head sums of the probed quantities; :meth:`summary` gives their means over the rows."""
 
-    def __init__(self, horizon: int = 32768) -> None:
-        if int(horizon) <= 0:
-            raise ValueError(f"DendriticProbe: horizon must be positive, got {horizon}")
-        self.horizon = int(horizon)
+    def __init__(self, horizon: int = 32768, segments: int = 1) -> None:
+        if int(horizon) <= 0 or int(segments) <= 0:
+            raise ValueError(f"DendriticProbe: horizon and segments must be positive, got {horizon}, {segments}")
+        self.horizon, self.segments = int(horizon), int(segments)
         self._sums: Dict[int, Dict[str, torch.Tensor]] = {}
         self._rows: Dict[int, int] = {}
 
@@ -38,15 +39,17 @@ class DendriticProbe:
         """Called by a dendritic mixer in its whole-row forward: ``zxbcdt`` (B, T, proj_dim) its projections (the dt
         rows last), ``xs`` (B T, d_inner) its somatic outputs."""
         B, T, _ = (int(s) for s in zxbcdt.shape)
-        H = int(mixer.nheads)
+        H, S = int(mixer.nheads), self.segments
+        if T % S:
+            raise RuntimeError(f"DendriticProbe: a row of {T} tokens does not split into {S} segments")
         dt = F.softplus(zxbcdt[:, :, -H:].float() + mixer.dt_bias)         # (B, T, H) the steps
         log_r = mixer.A() * dt.sum(dim=1)                                    # (B, H) <= 0: log of the row's retention
         P = int(mixer.head_dim)
-        fired = (xs.reshape(B * T, H, P) != 0).sum(dim=(0, 2), dtype=torch.float32) / (T * P)   # (H,) rows' sum
-        acc = self._sums.get(mixer.layer_idx)
+        fired = (xs.reshape(B, S, T // S, H, P) != 0).sum(dim=(0, 2, 4), dtype=torch.float32) / (T // S * P)
+        acc = self._sums.get(mixer.layer_idx)                        # (fired: (S, H), the rows' sum of fractions)
         if acc is None:
-            acc = self._sums[mixer.layer_idx] = {k: torch.zeros(H, dtype=torch.float32, device=zxbcdt.device)
-                                                  for k in PROBE_NAMES}
+            z = lambda *shape: torch.zeros(*shape, dtype=torch.float32, device=zxbcdt.device)
+            acc = self._sums[mixer.layer_idx] = {"retention": z(H), "retention_horizon": z(H), "firing": z(S, H)}
             self._rows[mixer.layer_idx] = 0
         acc["retention"] += torch.exp(log_r).sum(dim=0)
         acc["retention_horizon"] += torch.exp(log_r * (self.horizon / T)).sum(dim=0)
@@ -54,8 +57,15 @@ class DendriticProbe:
         self._rows[mixer.layer_idx] += B
 
     def summary(self) -> Dict[int, Dict[str, torch.Tensor]]:
-        """``{layer_idx: {name: (H,) fp32 on the CPU}}`` in layer order: the means over the rows seen."""
-        return {i: {k: (v / self._rows[i]).cpu() for k, v in acc.items()} for i, acc in sorted(self._sums.items())}
+        """``{layer_idx: {name: fp32 on the CPU}}`` in layer order, the means over the rows seen: ``retention``,
+        ``retention_horizon``, ``firing`` (H,) and ``firing_by_segment`` (segments, H)."""
+        out = {}
+        for i, acc in sorted(self._sums.items()):
+            n = self._rows[i]
+            seg = (acc["firing"] / n).cpu()
+            out[i] = {"retention": (acc["retention"] / n).cpu(), "retention_horizon": (acc["retention_horizon"] / n).cpu(),
+                      "firing": seg.mean(dim=0), "firing_by_segment": seg}
+        return out
 
 
 def dendritic_mixers(model) -> List:

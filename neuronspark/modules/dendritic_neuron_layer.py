@@ -18,6 +18,10 @@ P = 64 somata, N = 128 compartments, conv width 4)::
     s_t             = max(n_t - theta, 0) - max(-n_t - theta, 0)        theta = theta_floor + softplus(rho)
     h_{out}         = h_t + W_out (gamma * s_t)                         fp32 residual addition
 
+A ``neuronspark.utils.probe.DendriticProbe`` attached to a mixer (``mixer.probe``, None by default) reads the row's
+projections and somatic outputs of the whole-row regime (the row's retention ``exp(A sum_t dt_t)`` per head, the
+firing rate); the forward is unchanged.
+
 The soma has no retention and never resets the compartments.  The backward of the soma is the sigmoid surrogate
 ``ds/dn = sig(alpha (n - theta)) + sig(alpha (-n - theta))``, ``ds/dtheta = -(sig(alpha (n - theta)) -
 sig(alpha (-n - theta)))`` with ``alpha = surrogate_alpha = 8.0`` (inside the training operator).
@@ -182,6 +186,7 @@ class DendriticNeurons(nn.Module):
         self.norm_eps = float(norm_eps)
         self.layer_idx = int(layer_idx)
         self.impl = impl
+        self.probe = None                   # a neuronspark.utils.probe.DendriticProbe during a probed validation forward
         self.launch_seed = (mechanism_init_seed(DENDRITIC_LAUNCH_SEED_BASE, self.layer_idx) if launch_seed is None
                             else int(launch_seed))
 
@@ -341,6 +346,8 @@ class DendriticNeurons(nn.Module):
         zxbcdt = o.linear(hn.transpose(0, 1).reshape(B * T, Dm), self.in_proj.weight).view(B, T, self.proj_dim)
         xs = o.dendritic_chunk_scan_soma(zxbcdt, self.conv_weight, self.conv_bias, self.dt_bias, self.A(), self.D,
                                   self.theta(), self.gamma, alpha=self.surrogate_alpha, chunk_size=self.chunk_size)
+        if self.probe is not None:
+            self.probe.dendritic(self, zxbcdt, xs)
         upd = o.linear(xs, self.W_out).view(B, T, Dm).transpose(0, 1)                   # (T, B, D) bf16
         if next_norm_gain is not None:
             h_new, hn_next = o.dendritic_resid_norm(h, upd, next_norm_gain, self.norm_eps)

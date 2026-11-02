@@ -41,11 +41,16 @@ the spiking FFN and the product-key memory each hand it their tensors):
   spiking FFN's gate and up neurons;
 * ``pkm_entropy``: the mean entropy (nats) of a token's top-k slot weights per PKM head; ``pkm_slots_used``: the
   fraction of the PKM's slots read at least once over the rows; ``pkm_gate``: the mean PKM read gate ``sigmoid(glog)``;
+* ``rope_ext_q``, ``rope_ext_k`` (H,): the share of the head's query / key energy in the RoPE pairs whose wavelength
+  exceeds the training row length ``train_len`` (the pairs that never complete a rotation in training: beyond
+  ``train_len`` their relative phases are ones training never showed), and ``rope_ext_pairs``, the fraction of the
+  pairs that are such (the share a direction-free vector would have);
 * ``boundaries``: the boundaries seen.
 """
 from __future__ import annotations
 
 import contextlib
+import math
 from typing import Dict, Iterator, List
 
 import torch
@@ -55,7 +60,18 @@ PROBE_NAMES = ("retention", "retention_horizon", "exponent", "firing", "firing_b
                "boundary_step", "body_step", "boundaries")
 HIPPOCAMPAL_NAMES = ("decay_exponent", "clock_exponent", "clock_boundary_step", "clock_body_step", "write",
                      "gate_firing", "copy_pi", "novelty", "read_gain", "ffn_in_firing", "ffn_gate_firing",
-                     "ffn_up_firing", "pkm_entropy", "pkm_slots_used", "pkm_gate", "boundaries")
+                     "ffn_up_firing", "pkm_entropy", "pkm_slots_used", "pkm_gate", "rope_ext_q", "rope_ext_k",
+                     "rope_ext_pairs", "boundaries")
+
+
+def rope_trained_pairs(pairs: int, base: float, train_len: int) -> int:
+    """How many of a head's ``pairs`` RoPE pairs (``theta_j = base^(-j / pairs)``, j from 0) complete at least one
+    rotation within ``train_len`` tokens (wavelength ``2 pi / theta_j <= train_len``): the pairs whose every relative
+    phase training showed."""
+    if int(pairs) <= 0 or float(base) <= 1.0 or int(train_len) <= 0:
+        raise ValueError(f"rope_trained_pairs: pairs {pairs}, base {base}, train_len {train_len}")
+    x = math.log(train_len / (2 * math.pi)) / math.log(base)                 # j / pairs at the training length
+    return max(0, min(int(pairs), int(math.floor(x * pairs)) + 1))
 
 
 def _boundary_mask(tokens: torch.Tensor, eos_id: int, who: str) -> torch.Tensor:
@@ -170,10 +186,13 @@ class DendriticProbe:
 
 class HippocampalProbe:
     """Per hippocampal layer sums of the probed quantities (see the module docstring); :meth:`summary` gives the
-    means over the rows.  ``eos_id`` is the token that ends a document in the rows."""
+    means over the rows.  ``eos_id`` is the token that ends a document in the rows; ``train_len`` the training row
+    length, the split of the RoPE pairs."""
 
-    def __init__(self, eos_id: int) -> None:
-        self.eos_id = int(eos_id)
+    def __init__(self, eos_id: int, train_len: int) -> None:
+        if int(train_len) <= 0:
+            raise ValueError(f"HippocampalProbe: train_len must be positive, got {train_len}")
+        self.eos_id, self.train_len = int(eos_id), int(train_len)
         self.T = None
         self._eos = None
         self._read = set()
@@ -206,10 +225,11 @@ class HippocampalProbe:
             acc[name] = value.clone()
 
     @torch.no_grad()
-    def attention(self, layer, a: torch.Tensor, gn, gate: torch.Tensor, gains: torch.Tensor) -> None:
+    def attention(self, layer, a: torch.Tensor, gn, gate: torch.Tensor, gains: torch.Tensor, qn, kn) -> None:
         """From the pool attention: ``a`` (T, B, C, 1) the decay per channel, ``gn`` the H-tuple (T, B, dk) of the
         write-gate spikes plus the write bias, ``gate`` (T, B, H dk) the write-gate spikes, ``gains`` (H,) the heads'
-        eligibility slopes gamma_h."""
+        eligibility slopes gamma_h, ``qn`` / ``kn`` the H-tuples (T, B, dk) of the rotated query / key heads (a
+        pair's energy is the same before and after the rotation; a per-vector gain cancels in the share)."""
         T, B = int(a.shape[0]), int(a.shape[1])
         if self.T is None:
             self.T = T
@@ -237,6 +257,15 @@ class HippocampalProbe:
         write = torch.stack([torch.sigmoid(g.float() - layer.write_sparsity).mean() for g in gn])      # (H,)
         self._add(acc, "write", write * B)
         self._add(acc, "gate_firing", _firing(gate).sum().reshape(1))
+        pairs = int(layer.hippocampal_head_dim) // 2
+        ext = pairs - rope_trained_pairs(pairs, layer.rope_base, self.train_len)
+        for name, heads in (("rope_ext_q", qn), ("rope_ext_k", kn)):
+            share = []
+            for x in heads:
+                e = x.float().reshape(T, B, pairs, 2).pow(2).sum(dim=-1)              # (T, B, pairs)
+                share.append((e[..., pairs - ext:].sum(dim=-1) / e.sum(dim=-1).clamp_min(1e-30)).mean())
+            self._add(acc, name, torch.stack(share) * B)
+        acc["rope_ext_pairs"] = ext / pairs
         self._rows[layer.layer_idx]["attention"] += B
         self._counts[layer.layer_idx]["boundaries"] += int(pair.shape[0])
         self._counts[layer.layer_idx]["body"] += int(body.shape[0])
@@ -283,7 +312,8 @@ class HippocampalProbe:
     def summary(self) -> Dict[int, Dict[str, torch.Tensor]]:
         """``{layer_idx: {name: fp32 on the CPU}}`` in layer order (the names of ``HIPPOCAMPAL_NAMES``): the means
         over the rows; the clock boundary / body steps over the boundaries / the body tokens (NaN when none);
-        ``pkm_slots_used`` the fraction of the slots read; ``boundaries`` the count."""
+        ``pkm_slots_used`` the fraction of the slots read; ``rope_ext_pairs`` the fraction of the RoPE pairs beyond
+        the training length (a float); ``boundaries`` the count."""
         out = {}
         for i, acc in sorted(self._sums.items()):
             rows = self._rows[i]
@@ -292,7 +322,9 @@ class HippocampalProbe:
             n, nb, nbody = rows["attention"], self._counts[i]["boundaries"], self._counts[i]["body"]
             over = lambda v, k: (v / k).cpu() if k else torch.full_like(v, float("nan")).cpu()
             s = {name: (acc[name] / n).cpu() for name in HIPPOCAMPAL_NAMES
-                 if name not in ("clock_boundary_step", "clock_body_step", "pkm_slots_used", "boundaries")}
+                 if name not in ("clock_boundary_step", "clock_body_step", "pkm_slots_used", "rope_ext_pairs",
+                                 "boundaries")}
+            s["rope_ext_pairs"] = acc["rope_ext_pairs"]
             s["clock_boundary_step"] = over(acc["clock_boundary_step"], nb)
             s["clock_body_step"] = over(acc["clock_body_step"], nbody)
             s["pkm_slots_used"] = acc["pkm_used"].float().mean().reshape(1).cpu()

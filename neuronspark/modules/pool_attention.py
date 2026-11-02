@@ -278,6 +278,7 @@ class PoolAttentionMixin:
         self.attn_out_proj = Linear(Dv, D, device=device, dtype=dtype, init=li)
         rope_cos, rope_sin = rope_head_band_tables(Dk, H, int(config.rope_max_seq_len), float(config.rope_base),
                                                    device=device)
+        self.rope_base = float(config.rope_base)
         self.register_buffer("rope_cos", rope_cos, persistent=False)
         self.register_buffer("rope_sin", rope_sin, persistent=False)
         self.register_buffer("rope_cos_bf16", rope_cos.to(torch.bfloat16), persistent=False)
@@ -495,7 +496,7 @@ class PoolAttentionMixin:
         wbias = self.pool_write_bias_total()
         qn, kn, gn = o.pool_heads(q, k, gate, qgain, wbias, H, dk)
         if self.probe is not None:
-            self.probe.attention(self, a, gn, gate, gains[:H])
+            self.probe.attention(self, a, gn, gate, gains[:H], qn, kn)
         vs = o.value_split(v, H, dv)
         # one pool read for the layer: the H heads, then the last head's extra queries (its keys, tagged values,
         # clock and induction term)

@@ -185,6 +185,8 @@ class PKMMixin:
             s = self._pkm_raw_scores(qh) * self._pkm_gains().view(1, 1, H, 2, 1)
             sc, u, ii, jj = o.pkm_topk_train(s, k)
             w = torch.softmax(sc, dim=-1)
+            if self.probe is not None:
+                self.probe.pkm(self, w, u, glog)
             val = o.pkm_value_read(w.reshape(T, B, H * k), u.reshape(T, B, H * k), self.pkm_values)
             r = val * torch.rsqrt(val.pow(2).mean(dim=-1, keepdim=True) + PKM_EPS) * (
                 1.0 + self.pkm_norm_gain.to(torch.float32))

@@ -54,11 +54,15 @@ class SpikingFFN(nn.Module):
                 self.skip_proj.weight.zero_()
 
     def forward(self, z: torch.Tensor, gate_state: Optional[PLIFState] = None, up_state: Optional[PLIFState] = None,
-                pos: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """z (T, B, D) -> (T, B, D) bf16.  Both states None: whole-row form; both given: inference form."""
+                pos: Optional[torch.Tensor] = None, probe=None, layer=None) -> torch.Tensor:
+        """z (T, B, D) -> (T, B, D) bf16.  Both states None: whole-row form; both given: inference form.  ``probe``
+        (a ``neuronspark.utils.probe.HippocampalProbe`` of the whole-row form) receives the two neurons' spikes for
+        ``layer``."""
         if (gate_state is None) != (up_state is None):
             raise RuntimeError("SpikingFFN: pass both neuron states (inference) or neither (whole row)")
         lin = self._ops.linear
         g = self.gate_neuron(lin(z, self.gate_proj.weight), gate_state, pos)
         u = self.up_neuron(lin(z, self.up_proj.weight), up_state, pos)
+        if probe is not None:
+            probe.ffn(layer, g, u)
         return lin(g * u, self.down_proj.weight) + lin(z, self.skip_proj.weight)

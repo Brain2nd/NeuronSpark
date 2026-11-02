@@ -31,6 +31,10 @@ One call, residual stream h (T, B, D) fp32:
 * ``calib`` (whole row): the launch-calibration capture object (protocol in :mod:`neuronspark.modules.pkm`); while
   it is given, a layer whose PKM is not ready adds no PKM read and no read gain.
 
+A ``neuronspark.utils.probe.HippocampalProbe`` attached to a layer (``layer.probe``, None by default) reads, in the
+whole-row forward, the pool attention's decay and write gate, the copy arbitration's factors, the FFN neurons' spikes
+and the PKM read's slot weights; it changes nothing in the forward.
+
 The forward must run inside a bf16 CUDA autocast region (``neuronspark.utils.precision.regime``), which selects the
 regime's TF32 setting as well; it raises otherwise.
 
@@ -87,6 +91,7 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
                              f"{hippocampal_index}")
         self.impl = impl
         self._ops = namespace(impl)
+        self.probe = None                   # a neuronspark.utils.probe.HippocampalProbe during a probed forward
         self.D = int(config.D)
         self.D_ff = int(config.D_ff)
         self.norm_eps = float(config.rms_norm_eps)
@@ -190,11 +195,15 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
             with torch.autocast(h.device.type, enabled=False):
                 f = self.read_gain_factor(pi, c)
                 h = o.read_gain_residual(h, r, f)
+            if self.probe is not None:
+                self.probe.copy(self, pi, c, f)
         else:
             h = h + r
         x_hat = o.row_rmsnorm(h, self.ffn_norm.weight, self.ffn_norm.eps)
         zs = self.input_neuron2(x_hat)
-        ffn = o.linear(self.snn_ffn(zs), self.ffn_out_proj.weight)
+        if self.probe is not None:
+            self.probe.ffn_input(self, zs)
+        ffn = o.linear(self.snn_ffn(zs, probe=self.probe, layer=self), self.ffn_out_proj.weight)
         y = self._pkm_read_train(x_hat, r, calib, mode)
         if y is None:
             return h + ffn, carry_out

@@ -494,6 +494,8 @@ class PoolAttentionMixin:
         qgain = self.pool_query_gain(q.dtype)
         wbias = self.pool_write_bias_total()
         qn, kn, gn = o.pool_heads(q, k, gate, qgain, wbias, H, dk)
+        if self.probe is not None:
+            self.probe.attention(self, a, gn, gate, gains[:H])
         vs = o.value_split(v, H, dv)
         # one pool read for the layer: the H heads, then the last head's extra queries (its keys, tagged values,
         # clock and induction term)

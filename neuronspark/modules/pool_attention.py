@@ -504,7 +504,11 @@ class PoolAttentionMixin:
         q_all = torch.cat([torch.stack(qn, dim=2), xq.to(qn[0].dtype)], dim=2)          # (T, B, H + M, dk)
         gv = torch.stack([self._tagged_values(gn[i], vs[i]) for i in range(H)], dim=2)  # (T, B, H, dv) bf16
         cum = o.cumsum0(self._trace_increments(a, T, B, gains[:H]))                       # the H clocks, one scan
-        reads = o.pool_read(q_all, torch.stack(kn, dim=2), gv, cum, self.induction_beta(), qtok, ktok,
+        k_all = torch.stack(kn, dim=2)                                                   # (T, B, H, dk)
+        if self.probe is not None:                                   # (the weights by distance, off these inputs)
+            self.probe.pool_scores(self, q_all[:, :, :H], k_all, cum, self.induction_beta(), qtok, ktok,
+                                   self.induction_orders, self.match_scale)
+        reads = o.pool_read(q_all, k_all, gv, cum, self.induction_beta(), qtok, ktok,
                             self.induction_orders, self.match_scale)                    # (T, B, H + M, dv) bf16
         heads = [reads[:, :, i].to(torch.float32) for i in range(H)]
         heads[-1] = heads[-1] + self._extra_query_out_train(reads[:, :, H:])

@@ -18,6 +18,8 @@ work.
   of one probe have one length ``T``, kept in ``probe.T``);
 * ``firing``: the fraction of the somatic outputs ``s_t`` released through the threshold (non-zero), and
   ``firing_by_segment``: the same per segment of the row (``segments`` equal parts; one segment by default);
+  ``retention_by_segment`` (segments, H): the retention from the row's first token to the end of each segment,
+  ``exp(A sum_{t <= end of segment} dt_t)``, the decay curve of the row's start along the row;
 * at the document boundaries, as means over the boundaries: ``boundary_retention``, ``exp(A (dt_e + dt_e+1))``, what
   is left of the old document's potential after the new document's first token; ``boundary_step``,
   ``(dt_e + dt_e+1) / 2``, the mean step over the boundary's two tokens; and ``body_step``, the mean step over the
@@ -45,6 +47,14 @@ the spiking FFN and the product-key memory each hand it their tensors):
   exceeds the training row length ``train_len`` (the pairs that never complete a rotation in training: beyond
   ``train_len`` their relative phases are ones training never showed), and ``rope_ext_pairs``, the fraction of the
   pairs that are such (the share a direction-free vector would have);
+* ``attn_entropy`` (H,): the entropy (nats) of the pool read's weights per query, the mean over the queries of the
+  rows' last ``train_len`` positions (every ``attn_stride``-th row set, as the readings below);
+* ``attn_dist`` (H, ATTN_BINS): the pool read's weight by distance, for the queries of the rows' last ``train_len``
+  positions (every ``attn_stride``-th row set): bin 0 the query's own event, bin k >= 1 the events
+  2^(k-1) <= t - j < 2^k back; ``attn_beyond`` (H,): the weight on events ``train_len`` or more back (what a row
+  longer than the training rows reads from beyond their length); ``attn_mean_log2`` (H,): the weight-mean of
+  log2(1 + t - j); means over the queries -- the weights as the operator defines them (neuronspark.ops.pool_read),
+  recomputed from the heads' queries, keys, clocks and the induction matches (:meth:`HippocampalProbe.pool_scores`);
 * ``boundaries``: the boundaries seen.
 """
 from __future__ import annotations
@@ -56,12 +66,14 @@ from typing import Dict, Iterator, List
 import torch
 import torch.nn.functional as F
 
-PROBE_NAMES = ("retention", "retention_horizon", "exponent", "firing", "firing_by_segment", "boundary_retention",
-               "boundary_step", "body_step", "boundaries")
+PROBE_NAMES = ("retention", "retention_horizon", "exponent", "firing", "firing_by_segment", "retention_by_segment",
+               "boundary_retention", "boundary_step", "body_step", "boundaries")
 HIPPOCAMPAL_NAMES = ("decay_exponent", "clock_exponent", "clock_boundary_step", "clock_body_step", "write",
                      "gate_firing", "copy_pi", "novelty", "read_gain", "ffn_in_firing", "ffn_gate_firing",
                      "ffn_up_firing", "pkm_entropy", "pkm_slots_used", "pkm_gate", "rope_ext_q", "rope_ext_k",
-                     "rope_ext_pairs", "boundaries")
+                     "rope_ext_pairs", "attn_dist", "attn_beyond", "attn_mean_log2", "attn_entropy", "boundaries")
+ATTN_BINS = 17               # distance bins of the pool read's weight: events up to 2^16 back
+ATTN_CHUNK = 512             # queries per pass of the pool scores (a (rows, heads, chunk, T) fp32 tensor)
 
 
 def rope_trained_pairs(pairs: int, base: float, train_len: int) -> int:
@@ -142,6 +154,7 @@ class DendriticProbe:
         A = mixer.A()                                                        # (H,) < 0
         dt = F.softplus(zxbcdt[:, :, -H:].float() + mixer.dt_bias)         # (B, T, H) the steps
         log_r = A * dt.sum(dim=1)                                            # (B, H) <= 0: log of the row's retention
+        log_r_seg = A * dt.reshape(B, S, T // S, H).sum(dim=2).cumsum(dim=1)     # (B, S, H): to each segment's end
         P = int(mixer.head_dim)
         fired = (xs.reshape(B, S, T // S, H, P) != 0).sum(dim=(0, 2, 4), dtype=torch.float32) / (T // S * P)
         span, body_mask = _boundary_parts(self._eos.to(zxbcdt.device))
@@ -151,11 +164,12 @@ class DendriticProbe:
         if acc is None:
             z = lambda *shape: torch.zeros(*shape, dtype=torch.float32, device=zxbcdt.device)
             acc = self._sums[mixer.layer_idx] = {"retention": z(H), "retention_horizon": z(H), "exponent": z(H),
-                                                 "firing": z(S, H), "boundary_retention": z(H), "boundary_step": z(H),
-                                                 "body_step": z(H)}
+                                                 "firing": z(S, H), "retention_by_segment": z(S, H),
+                                                 "boundary_retention": z(H), "boundary_step": z(H), "body_step": z(H)}
             self._rows[mixer.layer_idx] = 0
             self._counts[mixer.layer_idx] = {"boundaries": 0, "body": 0}
         acc["retention"] += torch.exp(log_r).sum(dim=0)
+        acc["retention_by_segment"] += torch.exp(log_r_seg).sum(dim=0)
         acc["retention_horizon"] += torch.exp(log_r * (self.horizon / T)).sum(dim=0)
         acc["exponent"] += (-log_r).sum(dim=0)
         acc["firing"] += fired
@@ -168,9 +182,9 @@ class DendriticProbe:
 
     def summary(self) -> Dict[int, Dict[str, torch.Tensor]]:
         """``{layer_idx: {name: fp32 on the CPU}}`` in layer order, the means over the rows seen: ``retention``,
-        ``retention_horizon``, ``exponent``, ``firing`` (H,) and ``firing_by_segment`` (segments, H); over the
-        boundaries seen: ``boundary_retention``, ``boundary_step``, ``body_step`` (H,; NaN when ``boundaries``, their
-        count, is 0)."""
+        ``retention_horizon``, ``exponent``, ``firing`` (H,), ``firing_by_segment`` and ``retention_by_segment``
+        (segments, H); over the boundaries seen: ``boundary_retention``, ``boundary_step``, ``body_step`` (H,; NaN
+        when ``boundaries``, their count, is 0)."""
         out = {}
         for i, acc in sorted(self._sums.items()):
             n, nb, nbody = self._rows[i], self._counts[i]["boundaries"], self._counts[i]["body"]
@@ -178,6 +192,7 @@ class DendriticProbe:
             over = lambda v, k: (v / k).cpu() if k else torch.full_like(v, float("nan")).cpu()
             out[i] = {"retention": (acc["retention"] / n).cpu(), "retention_horizon": (acc["retention_horizon"] / n).cpu(),
                       "exponent": (acc["exponent"] / n).cpu(), "firing": seg.mean(dim=0), "firing_by_segment": seg,
+                      "retention_by_segment": (acc["retention_by_segment"] / n).cpu(),
                       "boundary_retention": over(acc["boundary_retention"], nb),
                       "boundary_step": over(acc["boundary_step"], nb), "body_step": over(acc["body_step"], nbody),
                       "boundaries": nb}
@@ -187,15 +202,19 @@ class DendriticProbe:
 class HippocampalProbe:
     """Per hippocampal layer sums of the probed quantities (see the module docstring); :meth:`summary` gives the
     means over the rows.  ``eos_id`` is the token that ends a document in the rows; ``train_len`` the training row
-    length, the split of the RoPE pairs."""
+    length, the split of the RoPE pairs and the queries of the pool scores; ``attn_stride``: the pool scores
+    (:meth:`pool_scores`, the costly reading) are taken on every ``attn_stride``-th row set given to :meth:`row`."""
 
-    def __init__(self, eos_id: int, train_len: int) -> None:
-        if int(train_len) <= 0:
-            raise ValueError(f"HippocampalProbe: train_len must be positive, got {train_len}")
-        self.eos_id, self.train_len = int(eos_id), int(train_len)
+    def __init__(self, eos_id: int, train_len: int, attn_stride: int = 1) -> None:
+        if int(train_len) <= 0 or int(attn_stride) <= 0:
+            raise ValueError(f"HippocampalProbe: train_len and attn_stride must be positive, got {train_len}, "
+                             f"{attn_stride}")
+        self.eos_id, self.train_len, self.attn_stride = int(eos_id), int(train_len), int(attn_stride)
         self.T = None
         self._eos = None
         self._read = set()
+        self._row_sets = 0
+        self._attn_turn = False
         self._sums: Dict[int, Dict[str, torch.Tensor]] = {}
         self._rows: Dict[int, Dict[str, int]] = {}                  # rows seen by each hook, per layer
         self._counts: Dict[int, Dict[str, int]] = {}                 # boundaries, body tokens, per layer
@@ -209,13 +228,15 @@ class HippocampalProbe:
         """The input tokens (B, T) of the forward about to run (see :meth:`DendriticProbe.row`)."""
         self._eos = _boundary_mask(tokens, self.eos_id, "HippocampalProbe")
         self._read = set()
+        self._attn_turn = self._row_sets % self.attn_stride == 0
+        self._row_sets += 1
 
     def _acc(self, layer) -> Dict[str, torch.Tensor]:
         acc = self._sums.get(layer.layer_idx)
         if acc is None:
             acc = self._sums[layer.layer_idx] = {}
             self._rows[layer.layer_idx] = {"attention": 0, "copy": 0, "ffn_input": 0, "ffn": 0, "pkm": 0}
-            self._counts[layer.layer_idx] = {"boundaries": 0, "body": 0}
+            self._counts[layer.layer_idx] = {"boundaries": 0, "body": 0, "queries": 0}
         return acc
 
     def _add(self, acc: Dict[str, torch.Tensor], name: str, value: torch.Tensor) -> None:
@@ -271,6 +292,72 @@ class HippocampalProbe:
         self._counts[layer.layer_idx]["body"] += int(body.shape[0])
 
     @torch.no_grad()
+    def pool_scores(self, layer, qn: torch.Tensor, kn: torch.Tensor, cum: torch.Tensor, beta: torch.Tensor,
+                    qtok: torch.Tensor, ktok: torch.Tensor, orders, scale: float) -> None:
+        """From the pool attention, the H heads' read as the operator defines it (neuronspark.ops.pool_read): for the
+        queries of the rows' last ``train_len`` positions, the softmax weights over the events j <= t of
+        ``scale q_t . k_j + bf16((cum_t - cum_j) + sum_n beta_n,h match_n[t, j])`` (q and k rounded to bf16 as the
+        kernel reads them, the matches as neuronspark.modules.induction.induction_window_matches), summed by distance
+        bin (``attn_dist`` (H, ATTN_BINS): bin 0 the query's own event, bin k >= 1 the events 2^(k-1) <= t - j < 2^k
+        back), on the events ``train_len`` or more back (``attn_beyond`` (H,)) and as the weight-mean of
+        log2(1 + t - j) (``attn_mean_log2`` (H,)); taken on every ``attn_stride``-th row set.  ``qn`` / ``kn``
+        (T, B, H, dk) the rotated, normalised heads, ``cum`` (T, B, H) the clocks, ``beta`` (orders, H), ``qtok`` /
+        ``ktok`` (B, T, n_max) int32 id windows, ``scale`` the score scale."""
+        if not self._attn_turn:
+            return
+        T, B, H = (int(s) for s in qn.shape[:3])
+        acc = self._acc(layer)
+        orders = tuple(int(n) for n in orders)
+        n_max = max(orders)
+        tail = min(self.train_len, T)
+        dev = qn.device
+        q = qn.to(torch.bfloat16).float()
+        k = kn.to(torch.bfloat16).float()
+        c = cum.float()
+        b = beta.float()                                             # (orders, H)
+        pos = torch.arange(T, device=dev)
+        dist = torch.zeros(H, ATTN_BINS, dtype=torch.float64, device=dev)
+        beyond = torch.zeros(H, dtype=torch.float64, device=dev)
+        mlog = torch.zeros(H, dtype=torch.float64, device=dev)
+        ent = torch.zeros(H, dtype=torch.float64, device=dev)
+        for t0 in range(T - tail, T, ATTN_CHUNK):
+            t1 = min(T, t0 + ATTN_CHUNK)
+            Q = t1 - t0
+            tq = pos[t0:t1]
+            d = tq.view(Q, 1) - pos.view(1, T)                          # (Q, T): t - j
+            bins = torch.where(d <= 0, torch.zeros_like(d),
+                               torch.floor(torch.log2(d.clamp_min(1).double())).long() + 1)
+            far = (d >= self.train_len).double()
+            lg = torch.log2(1.0 + d.clamp_min(0).double())
+            m = (d >= 1).view(1, Q, T).expand(B, Q, T)                 # the matches of every order (B, Q, T)
+            ms = []
+            for n in range(1, n_max + 1):
+                m = m & (qtok[:, t0:t1, None, n - 1] == ktok[:, None, :, n - 1])
+                if n in orders:
+                    ms.append((m & (tq.view(1, Q, 1) >= n - 1) & (pos.view(1, 1, T) >= n)).float())
+            x32 = torch.zeros(B, H, Q, T, dtype=torch.float32, device=dev)
+            for i in range(len(orders)):                             # fp32 adds in the orders' order, from +0
+                x32 = x32 + b[i].view(1, H, 1, 1) * ms[i].unsqueeze(1)
+            cq = c[t0:t1].permute(1, 2, 0)                            # (B, H, Q)
+            cj = c.permute(1, 2, 0)                                   # (B, H, T)
+            bias = ((cq.unsqueeze(3) - cj.unsqueeze(2)) + x32).to(torch.bfloat16).float()
+            s = float(scale) * torch.einsum("qbhd,jbhd->bhqj", q[t0:t1], k) + bias
+            s = s.masked_fill((d < 0).view(1, 1, Q, T), float("-inf"))
+            pw = torch.softmax(s, dim=-1)                            # (B, H, Q, T)
+            ent += -(pw * torch.log(pw.clamp_min(1e-30))).sum(dim=3).sum(dim=(0, 2)).double()
+            w = pw.sum(dim=0)                                        # (H, Q, T) over the rows
+            del pw
+            idx = bins.view(1, Q, T).expand(H, Q, T).contiguous()
+            dist += torch.zeros(H, Q, ATTN_BINS, device=dev).scatter_add_(2, idx, w).sum(dim=1).double()
+            beyond += (w.double() * far).sum(dim=(1, 2))
+            mlog += (w.double() * lg).sum(dim=(1, 2))
+        self._add(acc, "attn_dist", dist.float())
+        self._add(acc, "attn_beyond", beyond.float())
+        self._add(acc, "attn_mean_log2", mlog.float())
+        self._add(acc, "attn_entropy", ent.float())
+        self._counts[layer.layer_idx]["queries"] += B * tail
+
+    @torch.no_grad()
     def copy(self, layer, pi: torch.Tensor, c: torch.Tensor, f: torch.Tensor) -> None:
         """From the copy arbitration: ``pi``, ``c``, ``f`` (T, B) the copy confidence, the novelty factor and the
         read gain factor."""
@@ -313,21 +400,28 @@ class HippocampalProbe:
         """``{layer_idx: {name: fp32 on the CPU}}`` in layer order (the names of ``HIPPOCAMPAL_NAMES``): the means
         over the rows; the clock boundary / body steps over the boundaries / the body tokens (NaN when none);
         ``pkm_slots_used`` the fraction of the slots read; ``rope_ext_pairs`` the fraction of the RoPE pairs beyond
-        the training length (a float); ``boundaries`` the count."""
+        the training length (a float); the pool-score readings over the queries they were taken on (NaN when none);
+        ``boundaries`` the count."""
         out = {}
         for i, acc in sorted(self._sums.items()):
             rows = self._rows[i]
             if len(set(rows.values())) != 1 or not rows["attention"]:
                 raise RuntimeError(f"HippocampalProbe: layer {i} did not reach every hook on every row: {rows}")
             n, nb, nbody = rows["attention"], self._counts[i]["boundaries"], self._counts[i]["body"]
+            nq = self._counts[i]["queries"]
             over = lambda v, k: (v / k).cpu() if k else torch.full_like(v, float("nan")).cpu()
             s = {name: (acc[name] / n).cpu() for name in HIPPOCAMPAL_NAMES
                  if name not in ("clock_boundary_step", "clock_body_step", "pkm_slots_used", "rope_ext_pairs",
-                                 "boundaries")}
+                                 "attn_dist", "attn_beyond", "attn_mean_log2", "attn_entropy", "boundaries")}
             s["rope_ext_pairs"] = acc["rope_ext_pairs"]
             s["clock_boundary_step"] = over(acc["clock_boundary_step"], nb)
             s["clock_body_step"] = over(acc["clock_body_step"], nbody)
             s["pkm_slots_used"] = acc["pkm_used"].float().mean().reshape(1).cpu()
+            H = acc["write"].numel()
+            s["attn_dist"] = over(acc.get("attn_dist", torch.zeros(H, ATTN_BINS)), nq)
+            s["attn_beyond"] = over(acc.get("attn_beyond", torch.zeros(H)), nq)
+            s["attn_mean_log2"] = over(acc.get("attn_mean_log2", torch.zeros(H)), nq)
+            s["attn_entropy"] = over(acc.get("attn_entropy", torch.zeros(H)), nq)
             s["boundaries"] = nb
             out[i] = s
         return out

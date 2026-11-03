@@ -88,8 +88,8 @@ At the 650M BabyLM tier facts are probed by **cloze exact match** of the final t
 * `write`: online consolidation on (the mechanism).
 * `no-write`: the same sessions with the write disabled (floor; must equal the base checkpoint on every probe).
 * `in-context`: the probes asked with the session document in the context (ceiling for acquisition).
-* `finetune`: AdamW on the session document (1 epoch, the training LR); the classical comparison for acquisition and,
-  above all, for forgetting (Gupta et al.).
+* `finetune`: AdamW on the session document (one step over the document as rows of 1024 tokens, the arm's training
+  length, the training LR); the classical comparison for acquisition and, above all, for forgetting (Gupta et al.).
 
 ### Pre-registered acceptance
 

@@ -57,6 +57,7 @@ cfg = NeuronSparkConfig.from_dict(json.load(open(path / "config.json")))
 model = NeuronSparkLMHeadModel(cfg, device=dev, init="empty")
 model.load_state_dict({k: v.to(dev) for k, v in load_file(str(path / "model.safetensors")).items()}, strict=True)
 model.eval()
+torch.cuda.empty_cache()                                                      # the loaded copies' fragments
 tok = Tokenizer.from_file(a.tokenizer)
 dstream = np.load(f"{a.data}/dev.u32.npy", mmap_mode="r")
 CH = int(cfg.dendritic_chunk_size)
@@ -100,9 +101,21 @@ def pad_rows(rows, fill=FX.EOT):
     return ids, last
 
 
+def ce_rows(rows, labels, step=2048):
+    """Per-token CE (n,) fp32 of hidden rows (n, D) fp32 against labels (n,), as the LM head's ``per_token_ce`` forms it
+    but in row chunks of ``step`` (its own chunk is 14k rows: the (rows, V) logits of a long document in one piece)."""
+    E = model.backbone.embed_tokens.weight
+    parts = []
+    for i in range(0, int(rows.shape[0]), step):
+        lg = model._o.linear(rows[i:i + step], E)                                   # (step, V) bf16
+        parts.append(model.backbone.balance_stack.ce_per_token(lg, rows[i:i + step], labels[i:i + step]))
+    return parts[0] if len(parts) == 1 else torch.cat(parts)
+
+
 @torch.no_grad()
 def predict_next(prompts, tokens_per_call=32 * 256):
-    """Top-1 next token after each prompt (list of id lists); prompts are batched by their padded width."""
+    """Top-1 next token after each prompt (list of id lists); prompts are batched by their padded width.  Only the last
+    real position of every row goes through the readout (the logits of all positions were the one big tensor)."""
     tops = []
     i = 0
     with writes_off():
@@ -114,9 +127,10 @@ def predict_next(prompts, tokens_per_call=32 * 256):
         ids, last = pad_rows(chunk)
         x = ids[:, :-1].to(dev)
         with regime("train"):
-            logits = model(x).logits                                    # (b, T, V) bf16
-        for j, l in enumerate(last):
-            tops.append(int(logits[j, l].argmax()))
+            hidden = model.backbone(x, aux_out=[])                              # (b, T, D) fp32
+            rows = hidden[torch.arange(len(last), device=dev), torch.tensor(last, device=dev)]
+            logits = model._readout(rows.unsqueeze(1))                          # (b, 1, V) bf16
+        tops += logits[:, 0].argmax(-1).tolist()
     return tops
 
 
@@ -127,24 +141,33 @@ def read_document(doc_ids):
         raise RuntimeError(f"session document of {len(doc_ids)} tokens exceeds rope_max_seq_len {cfg.rope_max_seq_len}")
     ids, _ = pad_rows([list(doc_ids)])
     x, y = ids[:, :-1].to(dev), ids[:, 1:].to(dev)
-    with regime("train"):
-        per = model.per_token_ce(x, y)
     n = len(doc_ids) - 1
-    return float(per[0, :n].mean())
+    with regime("train"):
+        hidden = model.backbone(x, aux_out=[])                                  # the writes happen in here
+        per = ce_rows(hidden[0, :n], y[0, :n])
+    return float(per.mean())
 
 
 def finetune_document(doc_ids):
+    """One AdamW step on the document, as consecutive rows of ``a.seq`` tokens (the arm's training length; every target
+    predicted once, the gradient accumulated over the rows, the loss the token mean over the document)."""
     model.train()
-    ids, _ = pad_rows([list(doc_ids)])
-    x, y = ids[:, :-1].to(dev), ids[:, 1:].to(dev)
-    y = y.clone(); y[0, len(doc_ids) - 1:] = -100
-    with regime("train"):
-        lo = model.loss(x, y)
-        lo.loss.backward()
+    ids = list(doc_ids)
+    n_tok = len(ids) - 1
+    tot = 0.0
+    for i in range(0, n_tok, a.seq):
+        r = ids[i:i + a.seq + 1]
+        padded, _ = pad_rows([r])
+        x, y = padded[:, :-1].to(dev), padded[:, 1:].to(dev)
+        y = y.clone(); y[0, len(r) - 1:] = -100
+        with regime("train"):
+            lo = model.loss(x, y)
+            (lo.loss * ((len(r) - 1) / n_tok)).backward()
+        tot += float(lo.ce) * (len(r) - 1)
     torch.nn.utils.clip_grad_norm_([p for g in opt.param_groups for p in g["params"]], 1.0)
     opt.step(); opt.zero_grad(set_to_none=True)
     model.eval()
-    return float(lo.ce)
+    return tot / n_tok
 
 
 @torch.no_grad()
@@ -152,9 +175,9 @@ def dev_ce():
     idx = np.sort(np.random.default_rng(a.seed + 1).permutation(len(dstream) // (a.seq + 1))[:a.dev_windows])
     tot, n = 0.0, 0
     with writes_off():
-      for i in range(0, len(idx), 8):
+      for i in range(0, len(idx), 4):
         w = torch.from_numpy(np.stack([np.asarray(dstream[int(k) * (a.seq + 1):(int(k) + 1) * (a.seq + 1)], dtype=np.int64)
-                                       for k in idx[i:i + 8]])).to(dev)
+                                       for k in idx[i:i + 4]])).to(dev)
         with regime("train"):
             per = model.per_token_ce(w[:, :-1].contiguous(), w[:, 1:].contiguous())
         tot += float(per.sum()); n += per.numel()
@@ -206,7 +229,7 @@ def eval_probes(sessions, with_doc=None):
         for p in s.probes:
             pr = p["prompt_ids"]
             if with_doc is not None:
-                room = 4096 - len(pr)
+                room = int(cfg.rope_max_seq_len) - len(pr)
                 pr = list(with_doc[-room:]) + pr[1:]                        # the document, then the prompt (no second EOT)
             prompts.append(pr)
         tops = predict_next(prompts)
@@ -223,9 +246,9 @@ if cons and a.prior_windows:
     for c in cons:
         c.collect = True
     with torch.no_grad():
-        for i in range(0, len(idx), 8):
+        for i in range(0, len(idx), 4):
             w = torch.from_numpy(np.stack([np.asarray(dstream[int(k) * (a.seq + 1):(int(k) + 1) * (a.seq + 1)], dtype=np.int64)
-                                           for k in idx[i:i + 8]])).to(dev)
+                                           for k in idx[i:i + 4]])).to(dev)
             with regime("train"):
                 model.per_token_ce(w[:, :-1].contiguous(), w[:, 1:].contiguous())
     for c in cons:

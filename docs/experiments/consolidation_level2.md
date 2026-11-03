@@ -143,3 +143,39 @@ Decisions: the target is the gated recall `r f`; writes go to the 2 strongest sl
 from 32 dev windows; lam in {10, 100} is carried into the phase-A matrix (acquisition decides between them).  The
 scale anchor of the target is the read of `V` alone (anchoring on `V + dV` fed back and diverged).  `captured` (the
 share of the target the PKM's output subspace can express) is 0.96-0.97 with the gated target.
+
+## Phase A result on the Hebbian arm (final checkpoint, 2026-11-03)
+
+Matrix (`runs/consolidation/hebbian/`, 16 entities, 32-token distractor windows, documents 2.9-5.8k tokens, K = 8): the
+in-context ceiling itself is at chance (same-template cloze 0.05-0.09 at session 7) because the model's in-context recall
+reaches less than 1024 tokens (recall probe: 0.005 beyond 1024), so acquisition cannot be read there.  The forgetting side
+can: write lam 10 keeps 0.92-0.98 of the invariant facts, dev CE +0.02 to +0.07, BLiMP unchanged (0.740 -> 0.740/0.744/0.741);
+lam 100 keeps 0.97-0.99, dev CE +0.003 to +0.012.
+
+Short-document variant (`runs/consolidation/hebbian_short/`, 4 entities, no distractor text, documents 200-770 tokens):
+the in-context ceiling is 0.31-0.69 (same template), rephrase 0.06-0.31, two-hop at chance; `write` at lam 10 and lam 100
+acquires exactly nothing (0.000 at every session, every m), like `no-write`.
+
+Mechanism diagnostic (`exp/consolidation/diag.py`, one short session of 16 facts, m = 2; sessions 6 and 3):
+
+| quantity | value |
+|---|---|
+| RLS step closed per token write, lam 10 / lam 100 | 0.010 / 0.0014 of the gap |
+| gap closed at the write token after the whole document, lam 10 / lam 100 | 0.04-0.07 / 0.01 |
+| addressed-slot overlap, write time vs probe time (weighted) | 0.4-0.7 |
+| exact joint least-squares write of the target at the write tokens (gap closed 1.000) | cloze 0.00-0.06 |
+| exact target placed at the probe's own addressing (the read returns val* at the probe) | 0.00-0.06 |
+| the pool's residual at the mention token, (1 + f) r, transplanted into h' of all six layers at the probe | 0.06 |
+| the pool's residual of the **in-context probe itself** transplanted into the closed-book probe | 0.50 (8 of 12 in-context-correct), 0.375 (5 of 5) |
+| in-context with the pool residual removed (r = 0 in all six layers) | 0.000 |
+| in-context, no writes | 0.75 / 0.31 |
+
+Reading: (1) at the lam that leaves the pretrained read intact, one exposure writes 1 % of the target, so a fact seen
+once or twice is never written -- the write rate and the forgetting cost are one knob.  (2) Independently, the taught
+content is wrong: the pool's recall at the *mention* token, written exactly, does not answer the probe; what answers the
+probe is the pool's output *for the probe's own query* (transplanted, it restores 8 of 12 in-context answers with
+closed-book dendritic states), and that vector is not available at reading time.  The pool is necessary for the
+in-context answer (removed: 0) and the hippocampal stream can carry the answer when the right vector is there; the
+design's premise "the same query later gets the same contribution" is false for this model.  The level-2 mechanism as
+specified above is therefore falsified at the mechanism level on this checkpoint, before any training-time version
+(phase B) is attempted.  The predictive arm's matrix and short variant run for completeness.

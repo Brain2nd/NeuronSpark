@@ -75,12 +75,6 @@ _SPECS: List[OpSpec] = [
         "xs (B*T, 9216) bf16; grads for zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma", "train",
         doc="zxbcdt (B, T, 18832) bf16, conv_w (9472, 4) fp32, conv_b (9472,), dt_bias (144,), A (144,) fp32 = "
             "-exp(A_log), D (144,), theta (9216,), gamma (9216,); alpha = 8.0, chunk_size = 256; T % 256 == 0"),
-    _op("dendritic_predictive_scan_soma", "neuronspark.ops.dendritic_predictive",
-        "zxbcdt conv_w conv_b dt_bias A D theta gamma * alpha chunk_size",
-        "xs (B*T, 9216) bf16; grads for zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma", "train",
-        doc="dendritic_chunk_scan_soma's operands; the compartments write the prediction error (config "
-            "dendritic_plasticity \"predictive\", an experiment option); kernel path: the conv and soma kernels around "
-            "flash-linear-attention's chunked gated delta rule (an experiment dependency, imported on the call)"),
     _op("dendritic_prenorm_rows", _T + "dendritic_step", "x gain eps",
         "(M, D) bf16", "prefill decode",
         doc="x (M, D) fp32 rows, gain (D,) fp32"),

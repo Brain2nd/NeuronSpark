@@ -18,16 +18,6 @@ P = 64 somata, N = 128 compartments, conv width 4)::
     s_t             = max(n_t - theta, 0) - max(-n_t - theta, 0)        theta = theta_floor + softplus(rho)
     h_{out}         = h_t + W_out (gamma * s_t)                         fp32 residual addition
 
-Plasticity of the compartments (``plasticity``, config ``dendritic_plasticity``): ``"hebbian"`` is the update above
-(the compartments integrate the token's synaptic input).  ``"predictive"`` writes the error between the synaptic
-input and the compartments' own prediction of it for the token's presynaptic pattern (Urbanczik & Senn, 2014)::
-
-    b_t = B_t / |B_t|,  eta_t = 1 - exp(-dt_t)
-    S_t = a_t S_{t-1} + eta_t (x_t - a_t S_{t-1} b_t) b_t^T
-
-with the same leak, read-out and soma (``neuronspark.ops.dendritic_predictive``).  It is an experiment option of the
-whole-row regime: a predictive layer refuses prefill and decode (NotImplementedError).
-
 A ``neuronspark.utils.probe.DendriticProbe`` attached to a mixer (``mixer.probe``, None by default) reads the row's
 projections and somatic outputs of the whole-row regime (the row's retention ``exp(A sum_t dt_t)`` per head, the
 firing rate); the forward is unchanged.
@@ -113,7 +103,6 @@ DENDRITIC_CONV_WIDTH = 4                      # causal depthwise conv width (the
 
 DENDRITIC_IMPLS = ("kernel", "ref")
 DENDRITIC_INITS = ("launch", "empty")
-DENDRITIC_PLASTICITIES = ("hebbian", "predictive")     # = NeuronSparkConfig.DENDRITIC_PLASTICITIES
 
 _StateDtype = Union[str, torch.dtype]
 
@@ -147,7 +136,6 @@ class DendriticNeurons(nn.Module):
         surrogate_alpha: float = 8.0,
         n_residual_branches: int = 30,
         norm_eps: float = 1e-5,
-        plasticity: str = "hebbian",
         layer_idx: int = 0,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
@@ -158,9 +146,6 @@ class DendriticNeurons(nn.Module):
         super().__init__()
         if impl not in DENDRITIC_IMPLS:
             raise ValueError(f"DendriticNeurons: impl must be one of {DENDRITIC_IMPLS}, got {impl!r}")
-        if plasticity not in DENDRITIC_PLASTICITIES:
-            raise ValueError(f"DendriticNeurons: plasticity must be one of {DENDRITIC_PLASTICITIES}, got "
-                             f"{plasticity!r}")
         if init not in DENDRITIC_INITS:
             raise ValueError(f"DendriticNeurons: init must be one of {DENDRITIC_INITS}, got {init!r}")
         if dtype != torch.float32:
@@ -199,7 +184,6 @@ class DendriticNeurons(nn.Module):
         self.surrogate_alpha = float(surrogate_alpha)
         self.n_residual_branches = int(n_residual_branches)
         self.norm_eps = float(norm_eps)
-        self.plasticity = str(plasticity)
         self.layer_idx = int(layer_idx)
         self.impl = impl
         self.probe = None                   # a neuronspark.utils.probe.DendriticProbe during a probed validation forward
@@ -287,13 +271,7 @@ class DendriticNeurons(nn.Module):
 
     def extra_repr(self) -> str:
         return (f"d_model={self.d_model}, d_inner={self.d_inner}, heads={self.nheads}x{self.head_dim}, "
-                f"state={self.state_size}, chunk={self.chunk_size}, plasticity={self.plasticity!r}, "
-                f"impl={self.impl!r}")
-
-    def _check_inference_rule(self, where: str) -> None:
-        if self.plasticity != "hebbian":
-            raise NotImplementedError(f"DendriticNeurons (layer {self.layer_idx}): {where} is not implemented for "
-                                      f"plasticity {self.plasticity!r} (whole-row regime only)")
+                f"state={self.state_size}, chunk={self.chunk_size}, impl={self.impl!r}")
 
     # ------------------------------------------------------------------------------------------------ checks
     def _check_params(self) -> None:
@@ -366,10 +344,8 @@ class DendriticNeurons(nn.Module):
                              f"pre-norm, got {hn.dtype} {tuple(hn.shape)}")
         # W_in on the (B * T, D) rows: for the B-major stream the transposed view is contiguous (one GEMM, no copy)
         zxbcdt = o.linear(hn.transpose(0, 1).reshape(B * T, Dm), self.in_proj.weight).view(B, T, self.proj_dim)
-        scan_soma = (o.dendritic_chunk_scan_soma if self.plasticity == "hebbian"
-                     else o.dendritic_predictive_scan_soma)
-        xs = scan_soma(zxbcdt, self.conv_weight, self.conv_bias, self.dt_bias, self.A(), self.D, self.theta(),
-                       self.gamma, alpha=self.surrogate_alpha, chunk_size=self.chunk_size)
+        xs = o.dendritic_chunk_scan_soma(zxbcdt, self.conv_weight, self.conv_bias, self.dt_bias, self.A(), self.D,
+                                  self.theta(), self.gamma, alpha=self.surrogate_alpha, chunk_size=self.chunk_size)
         if self.probe is not None:
             self.probe.dendritic(self, zxbcdt, xs)
         upd = o.linear(xs, self.W_out).view(B, T, Dm).transpose(0, 1)                   # (T, B, D) bf16
@@ -381,7 +357,6 @@ class DendriticNeurons(nn.Module):
     def forward_prefill(self, h: torch.Tensor, state: DendriticState) -> torch.Tensor:
         """Prefill regime (no grad): ``h`` (T, B, D) fp32 with T >= 2 (T-major contiguous as the model passes it), the
         layer's ``state`` read and advanced in place -> ``h + upd`` (T, B, D) fp32."""
-        self._check_inference_rule("prefill")
         self._check_no_grad("prefill")
         self._check_stream(h)
         self._check_params()
@@ -414,7 +389,6 @@ class DendriticNeurons(nn.Module):
 
     def step(self, h: torch.Tensor, state: DendriticState) -> torch.Tensor:
         """Decode regime (no grad): ``h`` (1, B, D) fp32, ``state`` advanced in place -> (1, B, D) fp32."""
-        self._check_inference_rule("decode")
         self._check_no_grad("decode")
         self._check_stream(h)
         self._check_params()
@@ -479,7 +453,6 @@ class DendriticNeuronLayer(nn.Module):
             surrogate_alpha=float(config.dendritic_surrogate_alpha),
             n_residual_branches=int(config.dendritic_residual_branches),
             norm_eps=float(config.dendritic_norm_eps),
-            plasticity=str(config.dendritic_plasticity),
             layer_idx=self.layer_idx,
             device=device,
             dtype=dtype,

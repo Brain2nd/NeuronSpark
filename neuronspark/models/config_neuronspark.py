@@ -39,7 +39,6 @@ __all__ = [
     "MODEL_TYPE",
     "ARCHITECTURES",
     "DENDRITIC_STATE_DTYPES",
-    "DENDRITIC_PLASTICITIES",
 ]
 
 # "model_type" of the configuration file
@@ -48,8 +47,6 @@ MODEL_TYPE = "neuronspark"
 ARCHITECTURES = ("NeuronSparkLMHeadModel",)
 # values of the inference_dendritic_state_dtype option
 DENDRITIC_STATE_DTYPES = ("bfloat16", "float32")
-# values of the dendritic_plasticity option: how the dendritic compartments write the token's synaptic input
-DENDRITIC_PLASTICITIES = ("hebbian", "predictive")
 
 _PathLike = Union[str, "os.PathLike[str]"]
 
@@ -85,10 +82,7 @@ class NeuronSparkConfig:
       ``lexical_memory_gate_bias`` (init of ``lex_beta``), ``lexical_memory_hash_seed``.
     * dendritic neuron layer: ``dendritic_expand``, ``dendritic_head_dim``, ``dendritic_state_size``,
       ``dendritic_chunk_size``, ``dendritic_theta0`` / ``dendritic_theta_floor`` (soma threshold ``theta = floor +
-      softplus(rho)``, launched at ``theta0``), ``dendritic_surrogate_alpha``, ``dendritic_plasticity`` (``"hebbian"``:
-      the compartments integrate the token's synaptic input; ``"predictive"``: they write the error between it and
-      their own prediction of it -- an experiment option of the training regime, see
-      ``neuronspark.ops.dendritic_predictive``).
+      softplus(rho)``, launched at ``theta0``), ``dendritic_surrogate_alpha``.
     * readout: ``readout_balance_widths`` (tiled balance projections, added width 16 first, then 32).
     * norms: ``dendritic_norm_eps`` (dendritic-layer pre-norm and gated norm), ``rms_norm_eps`` (every other RMSNorm).
     * inference: ``inference_dendritic_state_dtype`` (see the module docstring).
@@ -153,7 +147,6 @@ class NeuronSparkConfig:
     dendritic_theta0: float = 0.05
     dendritic_theta_floor: float = 0.02
     dendritic_surrogate_alpha: float = 8.0
-    dendritic_plasticity: str = "hebbian"
     # ---- readout
     readout_balance_widths: Tuple[int, ...] = (16, 32)
     # ---- norms
@@ -183,8 +176,6 @@ class NeuronSparkConfig:
         if not isinstance(self.inference_dendritic_state_dtype, str):
             raise TypeError("inference_dendritic_state_dtype must be a string, got "
                             f"{type(self.inference_dendritic_state_dtype).__name__}")
-        if not isinstance(self.dendritic_plasticity, str):
-            raise TypeError(f"dendritic_plasticity must be a string, got {type(self.dendritic_plasticity).__name__}")
         self._validate()
 
     def _validate(self) -> None:
@@ -245,8 +236,6 @@ class NeuronSparkConfig:
         need(self.inference_dendritic_state_dtype in DENDRITIC_STATE_DTYPES,
              f"inference_dendritic_state_dtype must be one of {DENDRITIC_STATE_DTYPES}, got "
              f"{self.inference_dendritic_state_dtype!r}")
-        need(self.dendritic_plasticity in DENDRITIC_PLASTICITIES,
-             f"dendritic_plasticity must be one of {DENDRITIC_PLASTICITIES}, got {self.dendritic_plasticity!r}")
 
     # ------------------------------------------------------------------------------------------------ layout
     @property

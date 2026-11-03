@@ -3,11 +3,11 @@
 [![arXiv](https://img.shields.io/badge/arXiv-2603.16148-b31b1b.svg)](https://arxiv.org/abs/2603.16148)
 [![OpenReview](https://img.shields.io/badge/OpenReview-NeurIPS%202026%20submission-8c1b13.svg)](https://openreview.net/forum?id=P7pyNdvnfr)
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
-[![W&B: 2B pre-training](https://img.shields.io/badge/W%26B-2B%20pre--training%2C%20live-FFBE00.svg)](https://forge.coreweave.com/wandb/brain2nd/ns-pretrain/runs/yvqwqxjs)
+[![W&B: 2B pre-training](https://img.shields.io/badge/W%26B-2B%20pre--training%2C%20live-FFBE00.svg)](https://forge.coreweave.com/wandb/brain2nd/ns-pretrain/runs/3wyvdeuf)
 
 **Pre-training in progress.** A 2B-parameter NeuronSpark is being pre-trained from scratch on the open MiniCPM corpora
-(one GPU, started 2026-10-31); the training curves are public on Weights & Biases:
-https://forge.coreweave.com/wandb/brain2nd/ns-pretrain/runs/yvqwqxjs -- loss, learning rate, throughput and the
+(one GPU, started 2026-11-02); the training curves are public on Weights & Biases:
+https://forge.coreweave.com/wandb/brain2nd/ns-pretrain/runs/3wyvdeuf -- loss, learning rate, throughput and the
 held-out losses per corpus, updated as it runs.  The trainer is [NeuronSpark-Trainer](https://github.com/Brain2nd/NeuronSpark-Trainer).
 
 > **NeuronSpark: A Spiking Neural Network Language Model with Selective State Space Dynamics**\

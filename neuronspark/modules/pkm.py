@@ -160,9 +160,11 @@ class PKMMixin:
 
     # ------------------------------------------------------------------------------------------------ whole row
     def _pkm_read_train(self, x_hat: torch.Tensor, res_attn: torch.Tensor, calib=None,
-                        mode: Optional[str] = None) -> Optional[torch.Tensor]:
+                        mode: Optional[str] = None, gates=None) -> Optional[torch.Tensor]:
         """Whole-row read y (T, B, D) bf16, or None when nothing is added (a launch-calibration call: an unready layer,
-        or a layer captured by the calibration's ``mode``)."""
+        or a layer captured by the calibration's ``mode``).  With a ``consolidation`` attached (experiment,
+        :mod:`neuronspark.modules.consolidation`) the read adds its delta table and, given ``gates`` = (f, rho) of this
+        call, writes it chunk by chunk from the pool residual ``res_attn``."""
         if mode not in PKM_CALIB_MODES:
             raise RuntimeError(f"PKM: unknown calibration mode {mode!r}")
         if mode is None and not self._pkm_ready:
@@ -187,11 +189,16 @@ class PKMMixin:
             w = torch.softmax(sc, dim=-1)
             if self.probe is not None:
                 self.probe.pkm(self, w, u, glog)
-            val = o.pkm_value_read(w.reshape(T, B, H * k), u.reshape(T, B, H * k), self.pkm_values)
-            r = val * torch.rsqrt(val.pow(2).mean(dim=-1, keepdim=True) + PKM_EPS) * (
-                1.0 + self.pkm_norm_gain.to(torch.float32))
-            r = r * torch.sigmoid(glog.to(torch.float32))
-        y = self._pkm_out(r, x_hat)
+            cons = getattr(self, "consolidation", None)
+            if cons is not None and mode is None:
+                y = cons.read_write(o, w.reshape(T, B, H * k), u.reshape(T, B, H * k), glog, x_hat, res_attn, gates)
+            else:
+                val = o.pkm_value_read(w.reshape(T, B, H * k), u.reshape(T, B, H * k), self.pkm_values)
+                r = val * torch.rsqrt(val.pow(2).mean(dim=-1, keepdim=True) + PKM_EPS) * (
+                    1.0 + self.pkm_norm_gain.to(torch.float32))
+                r = r * torch.sigmoid(glog.to(torch.float32))
+        if cons is None or mode is not None:
+            y = self._pkm_out(r, x_hat)
         if mode == "rms":
             calib.record(self, "pkm_usage", (u.detach(), w.detach(), ii.detach(), jj.detach()))
             yc = y.detach().float()

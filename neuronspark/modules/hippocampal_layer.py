@@ -92,6 +92,8 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
         self.impl = impl
         self._ops = namespace(impl)
         self.probe = None                   # a neuronspark.utils.probe.HippocampalProbe during a probed forward
+        self.consolidation = None           # a neuronspark.modules.consolidation.Consolidation (experiment); None:
+                                            # the layer as it is
         self.D = int(config.D)
         self.D_ff = int(config.D_ff)
         self.norm_eps = float(config.rms_norm_eps)
@@ -204,12 +206,15 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
         if self.probe is not None:
             self.probe.ffn_input(self, zs)
         ffn = o.linear(self.snn_ffn(zs, probe=self.probe, layer=self), self.ffn_out_proj.weight)
-        y = self._pkm_read_train(x_hat, r, calib, mode)
+        gates = None
+        if self.consolidation is not None and pi is not None and mode is None:
+            gates = (f, self.pkm_copy_rho(pi))                       # the write's teacher needs the gates of this token
+        y = self._pkm_read_train(x_hat, r, calib, mode, gates=gates)
         if y is None:
             return h + ffn, carry_out
         if pi is None:
             raise RuntimeError("HippocampalLayer: the PKM read ran without the copy confidence of this call")
-        rho = self.pkm_copy_rho(pi)
+        rho = gates[1] if gates is not None else self.pkm_copy_rho(pi)
         return o.pkm_tail(h, ffn, y, rho), carry_out
 
     # ------------------------------------------------------------------------------------------------ inference

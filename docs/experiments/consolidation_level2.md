@@ -121,5 +121,25 @@ At the 650M BabyLM tier facts are probed by **cloze exact match** of the final t
    `dV[u]`, and the whole-row forward writes per chunk, the decode step per token.
 3. The harness `exp/consolidation/`: fact corpus generator, cloze probes, retention probes, session loop, the four arms,
    FUAR and the curves; one JSON per run, one table per experiment.
-4. Tests (verify repository): the write reproduces a target on a single slot set; a written fact is read back at the same
-   query; `no-write` equals the unchanged layer bit for bit; `dV` cleared per row in training.
+4. Tests (verify repository): writes off equals the unchanged layer under the per-operator rule; a write moves the read
+   of the same query toward its target and touches only the addressed slots; a second pass writes less; reset clears.
+5. Phase B needs a per-row delta table (B, slots, dv) and a batched read of `V + dV[b]` (the rows of a training batch
+   are unrelated and must not see each other's writes); phase A runs one document at a time and uses one table.
+
+## Calibration on the development checkpoint (Hebbian arm, update 4000 of 18.4k; 3 sessions x 32 facts, m = 2)
+
+Acquisition cannot be judged there (the model is far from trained; every arm reads 0-3%), the forgetting side can:
+
+| setting | dev CE drift after 3 sessions | invariant facts kept |
+|---|---|---|
+| teach `r (1 + f)`, lam 1, all 16 slots | +0.17 nat | 0.86 |
+| teach `r f`, lam 1, all 16 | +0.17 | 0.86 |
+| teach `r f`, lam 10, all 16 | +0.077 | 0.95 |
+| teach `r f`, lam 10, 2 slots per head | +0.024 | 0.96 |
+| teach `r f`, lam 10, 2 slots, usage prior (32 dev windows) | +0.008 | 0.99 |
+| teach `r f`, lam 100, 2 slots, usage prior | +0.002 | 1.00 |
+
+Decisions: the target is the gated recall `r f`; writes go to the 2 strongest slots per head; the RLS precision is primed
+from 32 dev windows; lam in {10, 100} is carried into the phase-A matrix (acquisition decides between them).  The
+scale anchor of the target is the read of `V` alone (anchoring on `V + dV` fed back and diverged).  `captured` (the
+share of the target the PKM's output subspace can express) is 0.96-0.97 with the gated target.

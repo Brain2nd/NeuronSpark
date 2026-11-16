@@ -62,8 +62,10 @@ def require_cuda(t: torch.Tensor, what: str) -> None:
 
 
 def require_sm100(dev: _Device, what: str) -> None:
-    """Raise unless the device is Blackwell (compute capability >= 10.0): TMA / tcgen05 / TMEM / Gluon kernels."""
+    """Raise unless the device is a datacenter Blackwell GPU (compute capability 10.x: B200 / GB200 10.0, B300 / GB300
+    10.3): TMA / tcgen05 / TMEM / Gluon kernels.  Compute capability 12.x (RTX 50, RTX PRO 6000 Blackwell, GB10) has
+    no tcgen05 or tensor memory."""
     cap = device_capability(dev)
-    if cap < SM100:
-        raise RuntimeError(f"neuronspark.{what}: requires a Blackwell GPU (compute capability >= 10.0), "
-                           f"got {cap[0]}.{cap[1]}")
+    if cap[0] != SM100[0]:
+        raise RuntimeError(f"neuronspark.{what}: requires a datacenter Blackwell GPU (compute capability 10.x: B200, "
+                           f"GB200, B300, GB300), got {cap[0]}.{cap[1]}")

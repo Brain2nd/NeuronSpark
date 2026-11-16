@@ -50,7 +50,7 @@ call's only when every split point is a multiple of the chunk size (256); other 
 another association (the rule class).  A partial last chunk is supported (by the TMA chunk-scan kernel).  Tests: the
 per-operator tolerance rule of :mod:`neuronspark.utils.testing`, each kernel against the references below.
 
-Contract (anything else raises): CUDA tensors on one device of a Blackwell GPU (compute capability >= 10.0: TMA
+Contract (anything else raises): CUDA tensors on one device of a datacenter Blackwell GPU (compute capability 10.x: TMA
 descriptors, tcgen05 / TMEM); the dtypes and shapes above with ngroups 1, N in {64, 128}, P in {16, 32, 64, 128}
 (P <= 64 and H even when T is a multiple of 256: the Gluon kernel's two heads per item in tensor memory),
 ``chunk_size`` 256, any number of chunks per call; ``x`` with a contiguous (H, P) part (or a non-unit last

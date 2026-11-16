@@ -109,7 +109,7 @@ The speed tables are updated with every operator improvement.
 
 Requirements:
 
-- Linux and an NVIDIA Blackwell GPU (compute capability ≥ 10.0)
+- Linux and an NVIDIA datacenter Blackwell GPU (compute capability 10.x: B200, GB200, B300, GB300)
 - Python ≥ 3.10
 - PyTorch 2.9.1 (CUDA 13.0) and Triton 3.5.1
 

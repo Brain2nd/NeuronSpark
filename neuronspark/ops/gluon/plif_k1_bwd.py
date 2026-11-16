@@ -13,7 +13,7 @@ two tiles' loads issued ahead), the adjoint of the bipolar soft-reset scan and t
 
 Every arithmetic step is one RN inline-PTX operation (helpers in :mod:`neuronspark.ops.gluon._ptx`).  The membrane
 at t = -1 and the gradient of the last membrane are zero (whole rows), the kernel's HAS_V0 / HAS_GVLAST constexprs are
-0.  Launch: 32 lanes per program, 4 warps, grid cdiv(B * C, 32); requires compute capability >= 10.0.
+0.  Launch: 32 lanes per program, 4 warps, grid cdiv(B * C, 32); requires compute capability 10.x.
 
 Public: :func:`plif_k1_bwd` (custom op ``neuronspark::plif_k1_bwd``) and the pure-torch :func:`plif_k1_bwd_ref`;
 the kernel is checked against the reference with the per-operator tolerance rule of :mod:`neuronspark.utils.testing`.

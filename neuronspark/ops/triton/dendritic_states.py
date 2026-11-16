@@ -29,7 +29,7 @@ sums over heads in head order.  Checked with the per-operator tolerance rule of 
 against the references below.
 
 Launch constants: db and dc (BM 64, BN 64, 4 warps), DB_HEADS / DC_HEADS heads per program.  The TMA descriptor kernels
-need a GPU with TMA (sm_90+); the package targets Blackwell (sm_100+).
+need a GPU with TMA (sm_90+); the package targets datacenter Blackwell (sm_100 / sm_103).
 """
 from __future__ import annotations
 

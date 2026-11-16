@@ -350,7 +350,7 @@ def plif_scan_train(w_eta: torch.Tensor, b_eta: torch.Tensor, zp: torch.Tensor, 
     ``w_eta``, ``b_eta``, ``v_th``: contiguous fp32 (C,); ``zp``: contiguous bf16 (T, B, C) (the eta projection of the
     caller); ``x``: fp32 or bf16 (T, B, C) with channel stride 1, T-major or a (T, B, C) view of B-major storage;
     T >= 2.  ``out_dtype``: dtype of S (float32 / bfloat16), default ``x.dtype``.  When a gradient is needed, the
-    backward runs a Gluon kernel (compute capability >= 10.0, checked here); ``alpha`` is the surrogate slope
+    backward runs a Gluon kernel (compute capability 10.x, checked here); ``alpha`` is the surrogate slope
     (0 < alpha < 64: the plain RN sigmoid form of the kernel).
     """
     _check_scan_train(w_eta, b_eta, zp, x, v_th)

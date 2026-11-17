@@ -77,6 +77,61 @@ architecture differs:
 Parameters: Transformer 199.6M / 501.4M / 1,312.0M; Mamba-2 199.6M / 501.1M / 1,312.3M; RWKV-7 199.6M / 501.6M /
 1,312.2M; NeuronSpark 217.5M / 508.6M / 1,270.3M.
 
+### Pre-training to 10B tokens
+
+The 2B NeuronSpark of the pre-training run above against a Transformer of the same size, both trained once to 10B
+tokens (61 times the training tokens of the BabyLM comparison) with one recipe in which only the architecture differs:
+
+- data: the open MiniCPM pre-training corpora, a mixture of web text, code and mathematics from seven sources, with the
+  same tokenizer, the same 4,096-token rows and the same order for both models;
+- training: the same optimizer schedule (learning rate 3e-4), the same batch-size ramp (0.26M → 0.39M → 0.52M
+  tokens per update) and the same seed; one update of the Transformer was skipped at 3.70B tokens for a non-finite
+  gradient, none of NeuronSpark;
+- baseline: a Llama-style Transformer decoder (width 2,560, 24 layers, 20 heads, SwiGLU hidden size 5,856, tied embedding),
+  2,042.9M parameters against 2,042.6M of NeuronSpark (its product-key memories and lexical tables included);
+- metric: cross entropy (nats per token) every 2B tokens on the same held-out rows of 15 sources, the seven training
+  sources and eight sources never trained on; the mixture-weighted loss weights the training sources as the training
+  mixture does.
+
+NeuronSpark has the lower validation loss on each of the 15 sources at each of the five checkpoints, and the lower
+cross entropy on each of the 3,144 training batches logged by both runs (every tenth update, the same batch for both
+models), by 0.051 to 1.26 nats.
+
+| validation loss | 2B | 4B | 6B | 8B | 10B | fitted asymptote E |
+|---|---|---|---|---|---|---|
+| Transformer, mean of the 7 training sources | 2.738 | 2.401 | 2.258 | 2.204 | 2.164 | 1.964 |
+| **NeuronSpark**, mean of the 7 training sources | **2.573** | **2.320** | **2.198** | **2.150** | **2.116** | **1.880** |
+| Transformer, mixture-weighted | 3.176 | 2.821 | 2.667 | 2.610 | 2.563 | 2.327 |
+| **NeuronSpark**, mixture-weighted | **3.000** | **2.732** | **2.601** | **2.548** | **2.508** | **2.231** |
+
+The fitted asymptote is E of L(D) = E + A·D^(−α), fitted to the five checkpoints of each curve (D = training tokens).
+The Transformer has the higher E on the mean, on the mixture-weighted loss and on each of the 15 sources, and leaving
+the same checkpoint out of both fits keeps this order in all five cases.  Fitted directly, the difference between the
+two models levels off at 0.040 nats on the mean and 0.045 on the mixture-weighted loss, against 0.048 and 0.055
+measured at 10B tokens.
+
+| validation loss at 10B tokens | in the training mixture | Transformer | NeuronSpark | NeuronSpark − Transformer |
+|---|---|---|---|---|
+| Ultra-FineWeb, English | yes | 2.868 | **2.814** | −0.054 |
+| Ultra-FineWeb, recent English | yes | 2.369 | **2.321** | −0.048 |
+| Ultra-FineWeb, Chinese | yes | 3.226 | **3.153** | −0.073 |
+| UltraData-Math L1 | yes | 2.483 | **2.434** | −0.049 |
+| UltraData-Math L2 | yes | 2.223 | **2.183** | −0.040 |
+| UltraData-Code L2 | yes | 0.811 | **0.772** | −0.039 |
+| UltraData-Stack | yes | 1.165 | **1.132** | −0.033 |
+| Ultra-FineWeb-L3, English question–answer rewrites | no | 2.365 | **2.341** | −0.024 |
+| Ultra-FineWeb-L3, English style rewrites | no | 2.728 | **2.673** | −0.055 |
+| Ultra-FineWeb-L3, Chinese question–answer rewrites | no | 2.867 | **2.824** | −0.043 |
+| Ultra-FineWeb-L3, Chinese style rewrites | no | 3.385 | **3.305** | −0.080 |
+| UltraX | no | 3.140 | **3.079** | −0.061 |
+| UltraData-Math L3 | no | 1.193 | **1.161** | −0.032 |
+| UltraData-Code L3 | no | 1.527 | **1.492** | −0.035 |
+| InfLLM long-context mix | no | 2.019 | **1.986** | −0.033 |
+
+The NeuronSpark side of this comparison is public: it is the first 10B tokens of the W&B run above
+(https://forge.coreweave.com/wandb/brain2nd/ns-pretrain/runs/3wyvdeuf), which logs the training loss and the
+held-out loss of every source at every 2B checkpoint.
+
 ### Speed
 
 1.3B-parameter models on one NVIDIA GB300.  NeuronSpark is measured with the operators of this repository in our

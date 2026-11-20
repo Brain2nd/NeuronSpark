@@ -26,14 +26,16 @@ xor butterfly inside each warp, (3) the 8 warp partials combined by the same but
 ``tl.split`` and added in order 0..7 -- and hands the 256 partials to ``tl.sum`` on a [256] tensor with the same 8
 warps, which is stages (2) and (3) again.  The gated row of each rep stays in registers between the two passes (no
 second load or sigmoid).  The division, square root, sigmoid and the final cast are the same Triton expressions as
-fla's.  The weight operand is the unit vector (materialised per call), multiplied as in fla.  Tests: the
+fla's.  The weight operand is the unit vector (materialised per call), multiplied as in fla.  A narrower row
+(2048 < N <= 8192: the model widths 512 and 1024, N = 3072 and 6144) runs the same kernel with fewer reps: the same
+function with this kernel's summation order (fla itself would choose a smaller block there).  Tests: the
 per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the reference.
 
 Launch constants: 8 warps (256 threads), VEC 8 elements per thread per rep, rep-outer chain order, the
 register-resident two-pass form; one program per row.
 
 Contract (anything else raises): CUDA bf16 ``y`` and ``z`` of the same (M, N) shape on one device, unit last strides,
-8192 < N <= 16384 (the domain of the reproduced fla layout), M >= 1, row offsets below 2^31 elements; theta / gamma
+2048 < N <= 16384 (the fla layout is reproduced for 8192 < N), M >= 1, row offsets below 2^31 elements; theta / gamma
 contiguous fp32 (N,). Reference: :func:`dendritic_gated_norm_soma_ref` (pure torch, fp32, the same formulas with torch's
 reduction order). The operands are 2-D views; the gate is read in place. The reproduced kernel: fla-core 0.5.2
 ``layer_norm_fwd_kernel`` (MIT; see NOTICE).
@@ -58,7 +60,7 @@ BLOCK_N = 16384          # fla's BLOCK_N for 8192 < N <= 16384 (bf16: MAX_FUSED_
 NUM_WARPS = 8            # fla: min(max(BLOCK_N // 256, 1), 8)
 THREADS = 32 * NUM_WARPS
 VEC = 8                  # fla's elements per thread per rep (16-byte bf16 vectors)
-MIN_N_EXCLUSIVE = 8192   # the reproduced layout holds for 8192 < N <= BLOCK_N
+MIN_N_EXCLUSIVE = 2048   # rows of more than one rep (THREADS * VEC columns) up to BLOCK_N
 _MAX_REPS = 8            # BLOCK_N // (THREADS * VEC): the unrolled register-resident reps
 
 
@@ -370,7 +372,7 @@ def dendritic_gated_norm_soma(y: torch.Tensor, z: torch.Tensor, theta: torch.Ten
         _fail(f"y and z must be bf16, got {y.dtype} {z.dtype}")
     M, N = (int(s) for s in y.shape)
     if M < 1 or not MIN_N_EXCLUSIVE < N <= BLOCK_N:
-        _fail(f"rows M >= 1 and {MIN_N_EXCLUSIVE} < N <= {BLOCK_N} (the reproduced layout) expected, got ({M}, {N})")
+        _fail(f"rows M >= 1 and {MIN_N_EXCLUSIVE} < N <= {BLOCK_N} expected, got ({M}, {N})")
     if y.stride(1) != 1 or z.stride(1) != 1:
         _fail(f"unit last strides expected, got y {tuple(y.stride())} z {tuple(z.stride())}")
     if (M - 1) * max(int(y.stride(0)), int(z.stride(0)), N) + N >= 2 ** 31:

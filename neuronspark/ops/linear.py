@@ -25,7 +25,12 @@ Numerics contract (training, whole-row regime):
 Inference (no autograd needed): ``F.linear(x.to(bf16), w)`` where ``w`` is the bf16 copy made by :func:`cache_bf16_`
 when one is present and current, else ``weight.to(bf16)``; the two hold the same values while the cache is current.  A
 cache whose weight was modified after caching (a version bump), moved or re-typed raises: call
-``prepare_inference()`` again.  The input's view and strides are kept (no copy), as in the autocast call.  A product of
+``prepare_inference()`` again.  The input's view and strides are kept (no copy), as in the autocast call.  A weight of
+at least 16 output features whose count is not a multiple of 8 (the tied readout) is multiplied on the padded layout of
+the training GEMMs: ``w`` holds ``padded_extent(N)`` rows, the pad rows zero, and the (..., N) view of the (..., P)
+product is returned (row stride P; the real columns are the same dot products of the same bf16 operands, and the
+aligned extent keeps cuBLAS off its unaligned kernel: 0.08 ms against 0.11 / 0.35 / 0.39 ms for the readout of 1 / 8 /
+32 rows on a B200).  A product of
 2 to 32 rows and fewer than 16 output features (the decode step's per-head projections) runs
 :func:`neuronspark.ops.triton.linear_small_n.linear_small_n` instead of cuBLAS's split-K GEMM and reduction: one kernel,
 fp32 accumulation, one bf16 rounding (the same reference).
@@ -48,6 +53,7 @@ __all__ = [
     "drop_bf16_",
     "has_bf16_cache",
     "padded_extent",
+    "inference_extent",
 ]
 
 _CACHE_ATTR = "_ns_bf16"
@@ -56,6 +62,8 @@ _VERSION_ATTR = "_ns_bf16_version"
 # (the tied readout's vocabulary: 151,669 -> 151,680)
 ALIGN = 8
 PAD_MULTIPLE = 128
+# inference pads the same way from this many output features on (fewer: the weight as it is; see linear_small_n)
+INFERENCE_PAD_MIN = 16
 
 
 def padded_extent(n: int) -> int:
@@ -65,6 +73,25 @@ def padded_extent(n: int) -> int:
     if n % ALIGN == 0:
         return n
     return (n + PAD_MULTIPLE - 1) // PAD_MULTIPLE * PAD_MULTIPLE
+
+
+def inference_extent(n: int) -> int:
+    """Rows of the bf16 inference weight of ``n`` output features: ``padded_extent(n)`` from ``INFERENCE_PAD_MIN``
+    features on, else ``n``."""
+    n = int(n)
+    return padded_extent(n) if n >= INFERENCE_PAD_MIN else n
+
+
+def _inference_bf16(weight: torch.Tensor) -> torch.Tensor:
+    """The bf16 inference weight: ``weight.to(bf16)``, with zero pad rows up to :func:`inference_extent`."""
+    n, k = int(weight.shape[0]), int(weight.shape[1])
+    p = inference_extent(n)
+    if p == n:
+        return weight.to(torch.bfloat16)
+    wb = torch.empty((p, k), dtype=torch.bfloat16, device=weight.device)
+    wb[:n].copy_(weight)                             # RNE fp32 -> bf16: the bits of weight.to(bf16)
+    wb[n:].zero_()
+    return wb
 
 
 # ------------------------------------------------------------------------------------------------ checks
@@ -89,7 +116,9 @@ def _cached_bf16(weight: torch.Tensor) -> Optional[torch.Tensor]:
     if getattr(weight, _VERSION_ATTR, None) != weight._version:
         raise RuntimeError("neuronspark.ops.linear: the bf16 inference copy of a weight is stale (the weight was "
                            "modified after prepare_inference()); call prepare_inference() again")
-    if w.device != weight.device or w.shape != weight.shape or w.dtype != torch.bfloat16:
+    rows = inference_extent(int(weight.shape[0]))
+    if (w.device != weight.device or tuple(w.shape) != (rows, int(weight.shape[1]))
+            or w.dtype != torch.bfloat16):
         raise RuntimeError("neuronspark.ops.linear: the bf16 inference copy of a weight no longer matches it "
                            f"(copy {tuple(w.shape)} {w.dtype} on {w.device}, weight {tuple(weight.shape)} on "
                            f"{weight.device}); call prepare_inference() again")
@@ -99,11 +128,11 @@ def _cached_bf16(weight: torch.Tensor) -> Optional[torch.Tensor]:
 # ------------------------------------------------------------------------------------------------ bf16 cache
 @torch.no_grad()
 def cache_bf16_(param: torch.Tensor) -> torch.Tensor:
-    """Attach (or refresh) the bf16 inference copy of ``param``: ``param.detach().to(bf16)``, contiguous, with the
-    parameter's version recorded.  Returns the copy."""
+    """Attach (or refresh) the bf16 inference copy of ``param``: ``param.detach().to(bf16)``, contiguous (with zero pad
+    rows up to :func:`inference_extent`), with the parameter's version recorded.  Returns the copy."""
     if param.dim() != 2 or param.dtype not in (torch.float32, torch.bfloat16):
         raise RuntimeError(f"cache_bf16_: expected a 2-D fp32/bf16 weight, got {tuple(param.shape)} {param.dtype}")
-    w = param.detach().to(torch.bfloat16).contiguous()
+    w = _inference_bf16(param.detach()).contiguous()
     setattr(param, _CACHE_ATTR, w)
     setattr(param, _VERSION_ATTR, param._version)
     return w
@@ -188,16 +217,18 @@ def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         # then an ordinary view update for autograd, and the slice's backward hands the Function the (..., P)
         # gradient with zero pad columns
         return out if int(out.shape[-1]) == n else out[..., :n]
+    n = int(weight.shape[0])
     w = _cached_bf16(weight)
     if w is None:
-        w = weight.to(torch.bfloat16)
+        w = _inference_bf16(weight)
     xb = x.to(torch.bfloat16)
-    if int(w.shape[0]) < 16 and xb.is_cuda and xb.dim() >= 2:
+    if n < INFERENCE_PAD_MIN and xb.is_cuda and xb.dim() >= 2:
         from neuronspark.ops.triton.linear_small_n import linear_small_n, takes
         x2 = xb.reshape(-1, int(xb.shape[-1]))
         if takes(x2, w):
-            return linear_small_n(x2, w).view(*xb.shape[:-1], int(w.shape[0]))
-    return F.linear(xb, w)
+            return linear_small_n(x2, w).view(*xb.shape[:-1], n)
+    out = F.linear(xb, w)
+    return out if int(out.shape[-1]) == n else out[..., :n]
 
 
 def linear_ref(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:

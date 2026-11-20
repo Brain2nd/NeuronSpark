@@ -26,7 +26,9 @@ Forms (one per regime; the module picks the form from its arguments):
   store rounding) -> the two eta linears -> ``ops.plif_gate_prefill`` (a, drive; it reads the bf16 projection and
   widens it on load, exactly as an fp32 cast would) -> ``ops.plif_scan_prefill``, which carries the membrane
   ``state.v`` in place;
-* step (``state`` given, T == 1, no autograd): the same expressions in torch, one token, membrane updated in place.
+* step (``state`` given, T == 1, no autograd): ``ops.centred_step`` over the carried input sum (centred neuron,
+  written in bf16) -> the two eta linears -> ``ops.plif_step`` (the gate chain, one leaky step, the release and the
+  soft reset in one kernel; the membrane ``state.v`` updated in place).
 
 Parameters (state-dict keys): ``w`` (C,) frozen launch seed of the retention, ``v_th`` (C,), ``w_eta`` (C,), ``b_eta``
 (C,), ``eta_V`` (rank, C), ``eta_U`` (C, rank).  ``b_eta`` is computed from ``w`` in the constructor
@@ -57,7 +59,6 @@ __all__ = [
     "W_INIT_STD",
     "INITS",
     "plif_b_eta_launch",
-    "centred_running_step",
     "rows_rmsnorm",
     "forked_rng",
     "check_init",
@@ -111,28 +112,6 @@ def rows_rmsnorm(ops, x: torch.Tensor, eps: float, weight: Optional[torch.Tensor
     n = int(shape[-1])
     y = ops.rmsnorm_rows(x.reshape(-1, n), eps, weight=weight, zero_centered=zero_centered, out_dtype=out_dtype)
     return y.reshape(shape)
-
-
-def centred_running_step(x: torch.Tensor, run_sum: torch.Tensor, count: torch.Tensor) -> torch.Tensor:
-    """One-token strictly-past centring over a carried sum (decode form, torch): x (1, B, C), run_sum (B, C) fp32 the
-    sum of the row's earlier inputs, count (B,) int64 the row position of this token.  Returns the fp32 (1, B, C)
-    c = (x - S / max(n, 1)) [n > 0] and advances ``run_sum`` in place by x (the whole row's cumulative sum's next
-    addition, in its order)."""
-    if x.dim() != 3 or int(x.shape[0]) != 1 or tuple(run_sum.shape) != tuple(x.shape[1:]) \
-            or run_sum.dtype != torch.float32:
-        raise RuntimeError(f"running mean (step): input {tuple(x.shape)} for a carried sum {tuple(run_sum.shape)} "
-                           f"{run_sum.dtype} (expected x (1, B, C), fp32 (B, C))")
-    B = int(x.shape[1])
-    if not isinstance(count, torch.Tensor) or tuple(count.shape) != (B,) or count.dtype != torch.int64:
-        raise RuntimeError(f"running mean (step): the count must be a ({B},) int64 tensor")
-    xf = x.float()
-    xcum = run_sum.unsqueeze(0)                                           # S_t (a view; read before the add)
-    pos = count.view(1, B, 1) + torch.arange(1, device=x.device, dtype=torch.int64).view(1, 1, 1)
-    xn = pos.to(torch.float32).clamp_min(1.0)
-    has_past = (pos > 0).to(torch.float32)
-    out = (xf - xcum / xn) * has_past
-    run_sum.add_(xf[0])
-    return out
 
 
 def plif_b_eta_launch(w: torch.Tensor) -> torch.Tensor:
@@ -254,7 +233,7 @@ class PLIFNeuron(nn.Module):
                                    "call's first token")
         od = x.dtype if out_dtype is None else out_dtype
         if int(x.shape[0]) == 1:
-            return self._forward_step(x, state, pos).to(od)
+            return self._forward_step(x, state, pos, od)
         return self._forward_prefill(x, state, pos, od)
 
     def _eta_projection(self, xc: torch.Tensor, contiguous: bool) -> torch.Tensor:
@@ -288,23 +267,12 @@ class PLIFNeuron(nn.Module):
         S = self._ops.plif_scan_prefill(a, drive, self.v_th, state.v, out_dtype)
         return S.to(out_dtype)
 
-    def _forward_step(self, x: torch.Tensor, state: PLIFState, pos: Optional[torch.Tensor]) -> torch.Tensor:
-        """Single-token form (torch): the gate chain, one leaky step, the bipolar release, the soft reset; the membrane
-        (and the input sum) updated in place."""
-        if self.centred:
-            xc = centred_running_step(x, state.xsum, pos).to(x.dtype)
-        else:
-            xc = x
-        zp = self._eta_projection(xc, contiguous=False).to(torch.float32)
-        z_eta = self.w_eta.to(torch.float32) * x.to(torch.float32) + self.b_eta.to(torch.float32)
-        z_eta = z_eta + zp
-        eta = torch.sigmoid(z_eta)
-        a_eta = 1.0 - eta
-        drive = eta * x.to(torch.float32)
-        v = state.v.to(torch.float32)
-        th = self.v_th.to(torch.float32)
-        pre = a_eta[0] * v + drive[0]
-        s = torch.clamp_min(pre - th, 0.0)
-        s = s - torch.clamp_min(-pre - th, 0.0)
-        state.v.copy_(pre - s)
-        return s.unsqueeze(0).to(x.dtype)
+    def _forward_step(self, x: torch.Tensor, state: PLIFState, pos: Optional[torch.Tensor],
+                      out_dtype: torch.dtype) -> torch.Tensor:
+        """Single-token form: the centring (centred neuron; bf16, the operand dtype of the first eta linear), the two
+        eta linears and ``ops.plif_step``; the membrane (and the input sum) updated in place."""
+        o = self._ops
+        x2 = x[0]                                                           # (B, C)
+        xc = o.centred_step(x2, state.xsum, pos, torch.bfloat16) if self.centred else x2
+        zp = self._eta_projection(xc, contiguous=False)                    # (B, C) bf16, widened in the kernel
+        return o.plif_step(x2, zp, self.w_eta, self.b_eta, self.v_th, state.v, out_dtype).unsqueeze(0)

@@ -42,7 +42,7 @@ Regime differences kept explicitly in the code paths (each regime has its own nu
   ``RING_KERNEL_DECODE_SIZES`` and by the torch ring chain (+ ``ops.xq_form_t1`` for the extra queries) at the others;
 * the pool clock: ``ops.cumsum0`` (whole row), ``ops.exact_cumsum0`` over the carried clock (prefill), one add
   (decode); the value-residual running mean: ``ops.cumsum0`` + ``ops.zc_center`` (whole row),
-  ``ops.centred_running`` (prefill), torch over the carried sum (decode);
+  ``ops.centred_running`` (prefill), ``ops.centred_step`` over the carried sum (decode);
 * short conv: ``ops.short_conv_train`` / ``ops.short_conv_silu_prefill`` (T >= 3, the SiLU in the store; a 2-token call takes the depthwise
   ``F.conv1d`` over the carried history) / ``ops.short_conv_step``;
 * prefill only: the value-residual gate's centred input is written in bf16 (the operand dtype of its projection),
@@ -68,7 +68,7 @@ import torch.nn.functional as F
 
 from neuronspark.modules.linear import Linear, ShortConvWeight
 from neuronspark.modules.norms import RMSNorm
-from neuronspark.modules.plif import PLIFNeuron, centred_running_step, forked_rng, linear_init
+from neuronspark.modules.plif import PLIFNeuron, forked_rng, linear_init
 from neuronspark.modules.rope import apply_rope_interleaved_ref, rope_head_band_tables
 from neuronspark.utils.cache import HippocampalState
 
@@ -627,7 +627,7 @@ class PoolAttentionMixin:
         q, k, v = qkv.split([self.D_key, self.D_key, self.D_value], dim=-1)
         q, k, v = F.silu(q), F.silu(k), F.silu(v)
         lam = self.value_residual_lambda0()
-        zc = centred_running_step(z, st.vr_sum, pos0).to(z.dtype)
+        zc = o.centred_step(z[0], st.vr_sum, pos0, torch.bfloat16).unsqueeze(0)   # bf16: the gate projection's operand
         g_vr = torch.tanh(lin(zc, self.pool_vr_gate).to(torch.float32))
         lam = lam.view(1, 1, -1) + g_vr.repeat_interleave(dv, dim=-1)
         v, carry_out = self._value_residual_torch(v, lam, carry)

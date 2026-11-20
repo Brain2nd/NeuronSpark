@@ -467,8 +467,10 @@ class PoolAttentionMixin:
         T, B, D = (int(s) for s in h.shape)
         H, dk, dv = self.hippocampal_heads, self.hippocampal_head_dim, self.hippocampal_value_head_dim
         qtok, ktok = self._check_windows(ind, B, T)
+        # the layer input's norm is a (T, B, D) view of batch-major memory: one row-major copy serves every projection
+        zc = z.contiguous()
         # qkv projection (on the (T * B, D) view) and the causal short conv
-        qkv = lin(z.reshape(T * B, D), self.qkv_proj.weight).view(T, B, -1)
+        qkv = lin(zc.view(T * B, D), self.qkv_proj.weight).view(T, B, -1)
         qkv = o.short_conv_train(qkv, self.qkv_conv.weight)
         q, k, v = qkv.split([self.D_key, self.D_key, self.D_value], dim=-1)
         v = F.silu(v)
@@ -485,18 +487,17 @@ class PoolAttentionMixin:
             self._check_carry(carry, v)
             carry_out = carry_in = carry
         # GLU addend of the last head, applied with the value residual
-        zc = z.contiguous()
         gp = F.silu(lin(zc, self.pool_glu_a).float()) * lin(zc, self.pool_glu_b).float()
         gv_add = lin(gp.to(z.dtype).contiguous(), self.pool_glu_u).float()
         v = o.value_residual(v, lam, carry_in, gv_add)
         # q / k SiLU + RoPE at positions 0 .. T - 1
-        cos = self.rope_cos[:T].to(q.dtype)
-        sin = self.rope_sin[:T].to(q.dtype)
+        cos = self.rope_cos_bf16[:T]
+        sin = self.rope_sin_bf16[:T]
         q = o.silu_rope(q, cos, sin)
         k = o.silu_rope(k, cos, sin)
         # write gate, decay
         gate = self.gate_neuron(z)
-        a = self._memory_decay(lin(z.float().reshape(T * B, D), self.W_decay.weight).view(T, B, -1))
+        a = self._memory_decay(lin(zc.view(T * B, D), self.W_decay.weight).view(T, B, -1))
         # per-head pool constants and the H clocks (one scan)
         gains = self.pool_bias_gains()
         qgain = self.pool_query_gain(q.dtype)
@@ -519,7 +520,7 @@ class PoolAttentionMixin:
         # zero-centred output norm x sigmoid gate (the gate reads h), output projection, centring
         gate_logits = lin(h.reshape(T * B, D), self.attn_out_gate.weight).view(T, B, -1)
         attn = o.out_norm_gate(attn, self.attn_out_norm.weight, gate_logits, self.attn_out_norm.eps)
-        return self._out_proj_centred(attn), carry_out
+        return o.centre_rows(lin(attn, self.attn_out_proj.weight)), carry_out
 
     def _extra_query_projections(self, zc):
         """(the M bf16 (T, B, dk) rank-r projections of the last head's extra queries, their bf16 (T, B, M) log-gain

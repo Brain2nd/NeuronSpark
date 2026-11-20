@@ -12,6 +12,8 @@ Operators (registry names):
   (T, B, d).
 * ``zc_center(z, zcum)``: ``((z - zcum / max(t, 1)) * (t > 0)).contiguous()`` for fp32 (T, B, C) ``z`` and its
   strictly-past running sum ``zcum`` (the value-residual gate's centred input).
+* ``centre_rows(r)``: ``r - mean_c(r)`` for the bf16 (T, B, C) output projection of the attention sub-block (bf16
+  mean and difference), forward and backward one kernel each.
 * ``read_gain_residual(h, r, f)``: ``h + bf16(float(r) * (1 + f))`` for fp32 ``h`` (T, B, C), the centred bf16
   attention residual ``r`` and the fp32 (T, B) read-gain factor ``f``.  The gained residual is one kernel; the residual
   add is the torch line ``h + rg``.
@@ -65,6 +67,7 @@ from neuronspark.ops.triton.hippo_norms import (  # noqa: F401  (jit helpers res
 __all__ = [
     "ValueResidualFn", "value_residual", "value_residual_ref",
     "ZcCenterFn", "zc_center", "zc_center_ref",
+    "CentreRowsFn", "centre_rows", "centre_rows_ref",
     "ReadGainFn", "read_gain_residual", "read_gain_residual_ref",
     "PkmTailFn", "pkm_tail", "pkm_tail_ref", "PKM_TAIL_MIN_ROWS",
 ]
@@ -73,6 +76,7 @@ __all__ = [
 VRES_BT, VRES_BC, VRES_WARPS = 64, 64, 4   # value_residual (t tile, channel tile, warps)
 FLAT_BLOCK, FLAT_WARPS = 1024, 4           # flat elementwise kernels (zc_center, the read-gain forward)
 ROW_BR, ROW_WARPS = 4, 8                   # row kernels of the backwards (read gain, PKM tail)
+CENTRE_BR, CENTRE_WARPS = 4, 8             # centre_rows forward / backward (rows per program, warps)
 PKT_FWDX_ROWS, PKT_FWDX_WARPS = 1, 4       # PKM tail fused forward (exact-order bf16 mean)
 
 
@@ -177,6 +181,32 @@ def _zc_bwd_kernel(G, GZ, GC, N, S0, S1, T0, gs0, gs1, gs2, as0, as1, as2, cs0, 
     gm = _g_mul(tl.load(G + (i0 * gs0 + i1 * gs1 + i2 * gs2), mask=m, other=0.0), mk)   # MulBackward0: grad * mask
     tl.store(GZ + (i0 * as0 + i1 * as1 + i2 * as2), gm, mask=m)                          # SubBackward0: self
     tl.store(GC + (i0 * cs0 + i1 * cs1 + i2 * cs2), _g_div(_g_neg(gm), zn), mask=m)      # other: (-g) / zn
+
+
+@triton.jit
+def _centre_fwd_kernel(R, O, NR, D, INVB, BR: tl.constexpr, BD: tl.constexpr):
+    """o = bf16(r - bf16(mean_c r)) over BR contiguous rows (the mean an fp32 sum times the fp32 factor 1 / D)."""
+    row = (tl.program_id(0) * BR + tl.arange(0, BR)).to(tl.int64)
+    c = tl.arange(0, BD).to(tl.int64)
+    m = (row < NR)[:, None] & (c < D)[None, :]
+    off = row[:, None] * D + c[None, :]
+    x = _g_w(tl.load(R + off, mask=m, other=0.0))
+    mean = _g_r16(_g_mul(tl.sum(x, axis=1), _g_bits(INVB)))
+    tl.store(O + off, _g_n(_g_sub(x, tl.broadcast_to(mean[:, None], (BR, BD)))), mask=m)
+
+
+@triton.jit
+def _centre_bwd_kernel(G, O, NR, D, INVB, BR: tl.constexpr, BD: tl.constexpr):
+    """r's gradient bf16(g + bf16(bf16(sum_c -g) (1 / D))) over BR contiguous rows (SubBackward0's reduced other
+    gradient, MeanBackward1's factor, the accumulation with the direct gradient)."""
+    row = (tl.program_id(0) * BR + tl.arange(0, BR)).to(tl.int64)
+    c = tl.arange(0, BD).to(tl.int64)
+    m = (row < NR)[:, None] & (c < D)[None, :]
+    off = row[:, None] * D + c[None, :]
+    g = _g_w(tl.load(G + off, mask=m, other=0.0))
+    s = _g_r16(tl.sum(_g_neg(g), axis=1))
+    mm = _g_r16(_g_mul(s, _g_bits(INVB)))
+    tl.store(O + off, _g_n(_g_add(g, tl.broadcast_to(mm[:, None], (BR, BD)))), mask=m)
 
 
 @triton.jit
@@ -419,6 +449,41 @@ def value_residual_ref(v: torch.Tensor, lam: torch.Tensor, carry: Optional[torch
     else:
         vp = (v.float() + lam * carry.float()).to(v.dtype)
     return torch.cat([vp[..., :D - dt], (vp[..., D - dt:].float() + glu_add).to(v.dtype)], dim=-1)
+
+
+# ================================================================================================ centre_rows
+def _centre_launch(kernel, x: torch.Tensor, last):
+    T, B, D = (int(v) for v in x.shape)
+    out = torch.empty((T, B, D), dtype=torch.bfloat16, device=x.device)
+    kernel[(triton.cdiv(T * B, CENTRE_BR),)](x, out, T * B, D, last, BR=CENTRE_BR, BD=_pow2(D),
+                                              num_warps=CENTRE_WARPS, enable_fp_fusion=False)
+    return out
+
+
+class CentreRowsFn(torch.autograd.Function):
+    """r - mean_c(r) for a contiguous bf16 (T, B, C) r."""
+
+    @staticmethod
+    def forward(ctx, r):
+        return _centre_launch(_centre_fwd_kernel, r, _invb(int(r.shape[-1])))
+
+    @staticmethod
+    def backward(ctx, g):
+        return _centre_launch(_centre_bwd_kernel, g.contiguous(), _invb(int(g.shape[-1])))
+
+
+def centre_rows(r: torch.Tensor) -> torch.Tensor:
+    """``r - r.mean(-1, keepdim=True)`` for a bf16 (T, B, C) CUDA ``r`` (the attention sub-block's output projection)
+    -> contiguous bf16.  Training regime."""
+    require_cuda(r, "centre_rows")
+    if not (r.dtype == torch.bfloat16 and r.dim() == 3 and 0 < r.numel() < 2 ** 31):
+        raise RuntimeError(f"neuronspark.centre_rows: r must be a 3-D bf16 CUDA tensor, got {r.dtype} "
+                           f"{tuple(r.shape)}")
+    return CentreRowsFn.apply(r.contiguous())
+
+
+def centre_rows_ref(r: torch.Tensor) -> torch.Tensor:
+    return r - r.mean(dim=-1, keepdim=True)
 
 
 # ================================================================================================ zc_center

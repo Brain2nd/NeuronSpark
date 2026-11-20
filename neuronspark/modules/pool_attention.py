@@ -615,7 +615,7 @@ class PoolAttentionMixin:
         o = self._ops
         lin = o.linear
         T, B, D = (int(s) for s in h.shape)
-        H, dk, dv, M = self.hippocampal_heads, self.hippocampal_head_dim, self.hippocampal_value_head_dim, self.xq_count
+        H, dk, dv = self.hippocampal_heads, self.hippocampal_head_dim, self.hippocampal_value_head_dim
         matches = self._check_ind(ind, (B, 1, W))
         if dk != dv or D != H * dk:
             raise RuntimeError(f"hippocampal layer: the decode step writes key and value heads of one width over the "
@@ -648,12 +648,9 @@ class PoolAttentionMixin:
         # this step; ptr0 = this step's slot; the step's clocks are the carried clocks just advanced)
         red = o.ring_read_t1(q_h, xq, st.pool_run, st.pool_k, st.pool_gv, st.pool_cum, pos0, ptr0, matches, beta,
                              self.match_scale)
-        red = red.reshape(B, -1)
-        base = red[:, :H * dv].reshape(1, B, H * dv).to(h.dtype)
-        r_x = red[:, H * dv:].reshape(T, B, M * dv)                              # bf16: the projection's operand
-        xq_add = lin(lin(r_x, self.pool_xq_out_in), self.pool_xq_out)
-        last = (H - 1) * dv
-        attn = torch.cat([base[..., :last], base[..., last:] + xq_add], dim=-1)
-        gated = o.rmsnorm_gate_rows(attn, self.attn_out_norm.eps, self.attn_out_norm.weight,
-                                    lin(hb, self.attn_out_gate.weight).unsqueeze(0))
-        return lin(gated, self.attn_out_proj.weight), carry_out
+        red = red.reshape(B, -1)                                                 # (B, (H + M) dv) bf16
+        xq_add = lin(lin(red[:, H * dv:], self.pool_xq_out_in), self.pool_xq_out)   # (B, dv) bf16
+        # the heads' reads with the extra-query addend on the last head, the output norm and the gate: one kernel
+        gated = o.attn_out_step(red, xq_add, lin(hb, self.attn_out_gate.weight), self.attn_out_norm.weight,
+                                self.attn_out_norm.eps)
+        return lin(gated, self.attn_out_proj.weight).unsqueeze(0), carry_out

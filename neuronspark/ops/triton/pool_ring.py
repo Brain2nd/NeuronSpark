@@ -21,8 +21,8 @@ Operators (each: private launcher, ``torch.library`` custom op with a fake, publ
 ``ring_read_t1``  decode step (T = 1), split-W form.  Kernel 1, program (row b, head h, chunk): the logits of the
     chunk's live slots into an fp32 scratch and the chunk's (running max, sum of exp) per query row (libdevice expf);
     kernel 2, same grid: the row's max / denominator combined from the chunk pairs, ``p = bf16(div.rn(exp(l - m), Z))``
-    times the tagged values, an fp32 partial read per (row, query, chunk); the partials are summed over the chunks in
-    fp32 and rounded to bf16.  Only the row's live slots are read: the ``L = min(pos + 1, W)`` slots ending at this
+    times the tagged values, an fp32 partial read per (row, query, chunk); kernel 3, program (row, query): the
+    partials summed over the chunks in fp32 and rounded to bf16.  Only the row's live slots are read: the ``L = min(pos + 1, W)`` slots ending at this
     step's slot ``ring_ptr % W`` (every other slot has an infinite clock: weight 0 in the softmax).  Deterministic (fixed
     chunk order, no atomics). Compiled without FMA contraction. The hippocampal layer reads the ring with this kernel at
     every decode batch size; ``ring_read_t1_ref`` evaluates the torch expression chain of the read.
@@ -90,6 +90,8 @@ RING2_CONFIGS = (
     (8, 128, 64, 4, 2),
     (None, 512, 64, 4, 3),
 )
+# the sum of a row's partial reads: one program per (row, query row), warps
+RING2_SUM_WARPS = 4
 # extra-query formation: one program per (row, query)
 XQ_FORM_WARPS = 4
 # prefill ring write: head width, (t, b, h) rows per program, warps; the norm's reduction order is fixed (see above)
@@ -256,6 +258,18 @@ def _ring2_pv_kernel(lg_ptr, st_ptr, gv_ptr, pos_ptr, ptr_ptr, part_ptr, H, W, X
     tl.store(part_ptr + pb[:, None] + offs_dv[None, :], acc, mask=rmask[:, None])
 
 
+@triton.jit
+def _ring2_sum_kernel(part_ptr, out_ptr, NS, DV, NSP: tl.constexpr, DVB: tl.constexpr):
+    """Kernel 3, program (b, row): the row's NS partial reads summed (fp32) and rounded to bf16."""
+    r = tl.program_id(0).to(tl.int64)
+    offs_s = tl.arange(0, NSP)
+    offs_dv = tl.arange(0, DVB)
+    dmask = offs_dv < DV
+    x = tl.load(part_ptr + ((r * NS + offs_s) * DV)[:, None] + offs_dv[None, :],
+                mask=(offs_s < NS)[:, None] & dmask[None, :], other=0.0)
+    tl.store(out_ptr + r * DV + offs_dv, tl.sum(x, axis=0).to(tl.bfloat16), mask=dmask)
+
+
 def _ring2_config(B: int) -> Tuple[int, int, int, int]:
     """(chunk, block_w, warps, stages) of the split-W read for decode batch B."""
     for bmax, chunk, block_w, warps, stages in RING2_CONFIGS:
@@ -278,10 +292,11 @@ def _ring_read_t1_fwd(qb: torch.Tensor, qx: torch.Tensor, pool_k: torch.Tensor, 
                       pool_cum: torch.Tensor, cum_t: torch.Tensor, pos: torch.Tensor, ring_ptr: torch.Tensor,
                       matches: List[torch.Tensor], beta: Optional[torch.Tensor], gain: float,
                       mx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The two split-W kernels on prepared operands: qb (B, H, dk) bf16 contiguous, qx (B, M, dk) bf16 contiguous (qb
-    when M = 0), the contiguous rings, cum_t (B, H) fp32, pos (B,) int64, ring_ptr (1,) int64, matches (n_ord <= 4
-    bool (B, 1, W) tensors, [] without a term), beta (n_ord, H) fp32 or None.  Returns (part (B, H + M, NS, dv) fp32,
-    st (B, H + M, NS, 2) fp32): row h = head h's query, row H + m = extra query m of the last head."""
+    """The two split-W kernels and the sum of their partial reads on prepared operands: qb (B, H, dk) bf16 contiguous,
+    qx (B, M, dk) bf16 contiguous (qb when M = 0), the contiguous rings, cum_t (B, H) fp32, pos (B,) int64, ring_ptr
+    (1,) int64, matches (n_ord <= 4 bool (B, 1, W) tensors, [] without a term), beta (n_ord, H) fp32 or None.  Returns
+    (red (B, H + M, dv) bf16, st (B, H + M, NS, 2) fp32): row h = head h's read, row H + m = the read of extra query
+    m of the last head."""
     B, H, W, dk = (int(s) for s in pool_k.shape)
     dv = int(pool_gv.shape[-1])
     M = int(mx)
@@ -312,7 +327,10 @@ def _ring_read_t1_fwd(qb: torch.Tensor, qx: torch.Tensor, pool_k: torch.Tensor, 
     _ring2_pv_kernel[grid](lg, st, pool_gv, pos, ring_ptr, part, H, W, H - 1,
                            DV=dv, MX=M, QP=RING2_QUERY_ROWS, BLOCK_W=bw, CHUNK=ch, NS=ns, NSP=nsp,
                            num_warps=nwarp, num_stages=nst, enable_fp_fusion=False)
-    return part, st
+    red = torch.empty((B, nr, dv), dtype=torch.bfloat16, device=dev)
+    _ring2_sum_kernel[(B * nr,)](part, red, ns, dv, NSP=nsp, DVB=triton.next_power_of_2(dv),
+                                 num_warps=RING2_SUM_WARPS, enable_fp_fusion=False)
+    return red, st
 
 
 @torch.library.custom_op("neuronspark::ring_t1_partials2", mutates_args=())
@@ -327,7 +345,7 @@ def _ring_t1_partials2_op(qb: torch.Tensor, qx: torch.Tensor, pool_k: torch.Tens
 def _ring_t1_partials2_fake(qb, qx, pool_k, pool_gv, pool_cum, cum_t, pos, ring_ptr, matches, beta, gain, mx):
     B, H, W = int(pool_k.shape[0]), int(pool_k.shape[1]), int(pool_k.shape[2])
     _, ns, _, nr = _ring2_shapes(B, H, W, int(mx))
-    return (pool_k.new_empty((B, nr, ns, int(pool_gv.shape[-1])), dtype=torch.float32),
+    return (pool_k.new_empty((B, nr, int(pool_gv.shape[-1])), dtype=torch.bfloat16),
             pool_k.new_empty((B, nr, ns, 2), dtype=torch.float32))
 
 
@@ -417,10 +435,9 @@ def ring_read_t1(q: torch.Tensor, xq: Optional[torch.Tensor], cum_t: torch.Tenso
     B, H, W, dk, dv, M = _check_t1(q, xq, cum_t, pool_k, pool_gv, pool_cum, pos, ring_ptr, ms, beta)
     qb = q.to(torch.bfloat16).contiguous()
     qx = xq.to(torch.bfloat16).contiguous() if M else qb
-    part, st = torch.ops.neuronspark.ring_t1_partials2(qb, qx, pool_k, pool_gv, pool_cum, cum_t, pos,
-                                                       ring_ptr.reshape(1), ms, beta if ms else None, float(gain), M)
-    red = part.sum(dim=2)                                                     # (B, H + M, dv) fp32 over the chunks
-    return red.to(torch.bfloat16).reshape(B, 1, (H + M) * dv)
+    red, _ = torch.ops.neuronspark.ring_t1_partials2(qb, qx, pool_k, pool_gv, pool_cum, cum_t, pos,
+                                                     ring_ptr.reshape(1), ms, beta if ms else None, float(gain), M)
+    return red.reshape(B, 1, (H + M) * dv)                                    # (B, H + M, dv) bf16 over the chunks
 
 
 def _ring_live_mask(pos: torch.Tensor, ring_ptr: torch.Tensor, W: int) -> torch.Tensor:

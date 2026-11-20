@@ -379,6 +379,10 @@ _DECODE_STEP_SPECS: List[OpSpec] = [
         "(maximum, lse) each (1, B) fp32; -inf where the row has no valid slot", "decode", mutates="ring",
         doc="z (B, 96) fp32 order-1 slice of the token's lexical vector, ring (B, W, 96) fp32 unit operands (the "
             "token's written at ring_ptr % W), ring_ptr (1,) int64, pos (B,) int64 tokens before this one"),
+    _op("attn_out_step", _T + "attn_out_step", "red xq_add gate weight eps",
+        "(B, 1536) bf16 gated output norm (the output projection's operand)", "decode",
+        doc="red (B, 1536 + extra-query width) bf16 ring read, xq_add (B, 256) bf16, gate (B, 1536) bf16 logits, "
+            "weight (1536,) fp32 zero-centred norm weight, eps"),
     _op("lex_read_step", _T + "lex_read_step", "h q_raw k_raw o q_gain k_gain beta eps eps_z",
         "(h' (B, 1536) fp32, h' bf16, z (B, 1536) fp32 frozen norm of h', z bf16)", "decode",
         doc="h (B, 1536) fp32, q_raw / k_raw (B, 64) bf16, o (B, 1536) bf16, q_gain / k_gain (64,) fp32, beta (1,) "

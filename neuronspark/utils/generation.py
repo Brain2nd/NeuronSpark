@@ -8,7 +8,7 @@ prompt and the new tokens; the hippocampal slot rings hold :func:`ring_capacity`
 CUDA-graph decoding keeps one :class:`DecodeGraph` on the model (``model._decode_graph``): the inference cache the step
 reads and writes, the memory pool of the capture and the captured single-token step.  Before each generation the cache
 is reset to the row start; the graph is captured again only when the batch size, the device, the dendritic-layer state
-dtype or a weight (its storage or version) changed, or when the rings must grow.
+dtype or a weight (the storage or version of a parameter or buffer) changed, or when the rings must grow.
 
 The prefill of a CUDA-graph generation runs over the same cache.  One :class:`PrefillGraph` is kept on the model
 (``model._prefill_graph``): the prefill call of one prompt length, captured over the decode graph's cache.  A prompt
@@ -103,7 +103,9 @@ class DecodeGraph:
 
     @staticmethod
     def _weights(model) -> Tuple:
-        return tuple((int(p.data_ptr()), int(p._version)) for p in model.parameters())
+        """Storage and version of every parameter and buffer: the captured step reads values formed from both (the
+        modules' weight constants)."""
+        return tuple((int(t.data_ptr()), int(t._version)) for t in (*model.parameters(), *model.buffers()))
 
     def ensure(self, model, batch_size: int, max_length: int, dendritic_state_dtype=None,
                warmup_steps: int = 2) -> InferenceParams:

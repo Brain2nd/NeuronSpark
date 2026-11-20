@@ -41,8 +41,10 @@ Regimes (the caller picks one per call; :class:`DendriticNeuronLayer` dispatches
   ``dendritic_res_add``, the residual addition of the transposed GEMM output (the bf16 operand converted exactly to
   fp32, one row-coalesced kernel).
 * decode (inference, T == 1): ``dendritic_prenorm_rows`` -> bf16 GEMM -> ``dendritic_step_core`` (conv tail roll, state
-  update in the state's storage dtype, gated norm, soma) -> bf16 GEMM -> the residual addition; ``A`` and ``theta`` are
-  read from a per-weight-version cache (:class:`neuronspark.utils.cache.WeightConstants`).
+  update in the state's storage dtype, gated norm, soma) -> bf16 GEMM -> the residual addition.
+
+The prefill and the decode step read ``A`` and ``theta`` from a per-weight-version cache
+(:class:`neuronspark.utils.cache.WeightConstants`).
 
 Every operator is taken from the namespace chosen at construction (``impl="kernel"`` the kernels, ``impl="ref"`` the
 pure-torch references with the same signatures).  The inference GEMMs go through :func:`neuronspark.ops.linear.linear`
@@ -381,11 +383,11 @@ class DendriticNeurons(nn.Module):
         Cm = xbc[..., di + N:].view(B, T, 1, N)
         # the scan starts from the state in fp32; the final state is stored back in the cache's dtype (one rounding
         # per call for a bf16 state)
-        y, final_state = o.dendritic_chunk_scan_prefill(x, dt, self.A(), Bm, Cm, self.D, self.dt_bias, state.ssm,
-                                                 chunk_size=self.chunk_size)
+        A, theta = self._step_constants.get((self.A_log, self.rho), lambda: (self.A(), self.theta()))
+        y, final_state = o.dendritic_chunk_scan_prefill(x, dt, A, Bm, Cm, self.D, self.dt_bias, state.ssm,
+                                                        chunk_size=self.chunk_size)
         state.ssm.copy_(final_state)
-        xo = o.dendritic_gated_norm_soma(y.reshape(B * T, di), z.reshape(B * T, di), self.theta(), self.gamma,
-                                       self.norm_eps)
+        xo = o.dendritic_gated_norm_soma(y.reshape(B * T, di), z.reshape(B * T, di), theta, self.gamma, self.norm_eps)
         upd = o.linear(xo, self.W_out).view(B, T, Dm).transpose(0, 1)                   # (T, B, D) bf16
         return o.dendritic_res_add(h, upd)                        # h + upd: the bf16 operand converted exactly, fp32
 

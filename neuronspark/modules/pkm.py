@@ -24,8 +24,10 @@ Ops per regime:
 * prefill (T >= 2): ``ops.pkm_topk_prefill`` (exact top-k) + torch softmax; ``ops.pkm_weighted_sum``;
   ``ops.rmsnorm_rows`` for the ZCN;
 * decode (T == 1): ``ops.pkm_topk_softmax_t1`` (the gain multiply, the exact top-k and the softmax in one kernel);
-  ``F.embedding`` + an fp32 einsum for the value sum; torch ZCN; the unit sub-keys, the score gains and the ZCN gain
-  are read from a per-weight-version cache (:class:`neuronspark.utils.cache.WeightConstants`).
+  ``F.embedding`` + an fp32 einsum for the value sum; torch ZCN.
+
+The prefill and the decode step read the unit sub-keys, the score gains and (decode) the ZCN gain from a
+per-weight-version cache (:class:`neuronspark.utils.cache.WeightConstants`).
 
 Parameters (keys, flat on the layer): ``pkm_q.weight`` (512, 1536), ``pkm_g.weight`` (768, 1536), ``pkm_o.weight``
 (1536, 768), ``pkm_values`` (16384, 768), ``pkm_subkeys`` (4, 2, 128, 64), ``pkm_norm_gain`` (768,) = 0,
@@ -52,7 +54,7 @@ Calibration capture protocol (the ``calib`` object handed to the whole-row forwa
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -206,6 +208,14 @@ class PKMMixin:
             return None
         return y
 
+    def _pkm_constants(self) -> Tuple[torch.Tensor, ...]:
+        """The inference reads' values that depend on parameters only, per weight version: (the unit sub-keys, the
+        (H, 2) score gains, the ZCN gain 1 + pkm_norm_gain), fp32."""
+        return self._pkm_step_constants.get(
+            (self.pkm_subkeys, self.pkm_log_gain, self.pkm_norm_gain),
+            lambda: (F.normalize(self.pkm_subkeys.to(torch.float32), dim=-1), self._pkm_gains().contiguous(),
+                     1.0 + self.pkm_norm_gain.to(torch.float32)))
+
     # ------------------------------------------------------------------------------------------------ prefill
     def _pkm_read_prefill(self, x_hat: torch.Tensor) -> torch.Tensor:
         """Prefill read (T >= 2, no autograd) y (T, B, D) bf16."""
@@ -216,8 +226,9 @@ class PKMMixin:
         q = o.linear(x_hat, self.pkm_q.weight)
         glog = o.linear(x_hat, self.pkm_g.weight)
         with torch.autocast(x_hat.device.type, enabled=False):
+            kh, gains, _ = self._pkm_constants()  # the unit sub-keys and the score gains: per weight version
             qh = self._pkm_queries(q, T, B)
-            s = self._pkm_raw_scores(qh) * self._pkm_gains().view(1, 1, H, 2, 1)
+            s = self._pkm_raw_scores(qh, kh) * gains.view(1, 1, H, 2, 1)
             sc, u, ii, jj = o.pkm_topk_prefill(s[..., 0, :], s[..., 1, :], k)
             w = torch.softmax(sc, dim=-1)
             val = o.pkm_weighted_sum(w.reshape(T, B, H * k), u.reshape(T, B, H * k), self.pkm_values)
@@ -236,11 +247,7 @@ class PKMMixin:
         q = o.linear(x_hat, self.pkm_q.weight)
         glog = o.linear(x_hat, self.pkm_g.weight)
         with torch.autocast(x_hat.device.type, enabled=False):
-            # the unit sub-keys, the score gains and the ZCN gain: per weight version
-            kh, gains, norm_gain = self._pkm_step_constants.get(
-                (self.pkm_subkeys, self.pkm_log_gain, self.pkm_norm_gain),
-                lambda: (F.normalize(self.pkm_subkeys.to(torch.float32), dim=-1), self._pkm_gains().contiguous(),
-                         1.0 + self.pkm_norm_gain.to(torch.float32)))
+            kh, gains, norm_gain = self._pkm_constants()
             qh = self._pkm_queries(q, T, B)
             s_raw = self._pkm_raw_scores(qh, kh)
             sc, w, u, ii, jj = o.pkm_topk_softmax_t1(s_raw[0], gains, k)

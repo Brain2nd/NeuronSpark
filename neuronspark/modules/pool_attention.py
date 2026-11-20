@@ -53,9 +53,9 @@ Regime differences kept explicitly in the code paths (each regime has its own nu
 
 The forward runs inside a bf16 CUDA autocast region (``neuronspark.utils.precision.regime``): the expressions in the
 code are evaluated under that autocast, which sets their dtypes (e.g. ``F.normalize`` of a bf16 tensor returns fp32,
-the extra queries' projections are bf16 GEMMs).  The decode step reads the values that depend on parameters only (the
-static value-residual mix, the gains, the write bias, the decay rate, the stacked extra-query projections) from a
-per-weight-version cache (:class:`neuronspark.utils.cache.WeightConstants`).
+the extra queries' projections are bf16 GEMMs).  The decode step and the prefill read the values that depend on
+parameters only (the static value-residual mix, the gains, the write bias, the decay rate, the stacked extra-query
+projections) from a per-weight-version cache (:class:`neuronspark.utils.cache.WeightConstants`).
 
 Parameters (keys, flat on the layer): see :class:`PoolAttentionMixin`.
 """
@@ -408,15 +408,15 @@ class PoolAttentionMixin:
         return t[..., lo:lo + half]
 
     def _xq_queries_prefill(self, z: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-                            q_dtype: torch.dtype) -> torch.Tensor:
+                            head_gain: torch.Tensor) -> torch.Tensor:
         """(B, M, T, dk) bf16 extra queries of a prefill call: the projections (bf16 GEMMs), then SiLU, the
         interleaved RoPE on the last head's band, the normalisation and the gain exp(clamp(psi, -3, 3)) times the last
-        head's match gain (in the query dtype) for all M queries in one kernel (``ops.xq_queries_prefill``), rounded
-        once to bf16 -- the rounding the ring read applies to its queries."""
+        head's match gain ``head_gain`` (one element: the gain rounded to the query dtype) for all M queries in one
+        kernel (``ops.xq_queries_prefill``), rounded once to bf16 -- the rounding the ring read applies to its
+        queries."""
         o = self._ops
         lin = o.linear
-        H, M, r = self.hippocampal_heads, self.xq_count, self.xq_rank
-        head_gain = self.pool_query_gain(q_dtype)[H - 1]
+        M, r = self.xq_count, self.xq_rank
         cos5, sin5 = self._xq_band(cos), self._xq_band(sin)
         u = lin(z, self.pool_xq_a)
         psi = lin(z, self.pool_xq_gain_proj).to(torch.float32).clamp(-XQ_PSI_CLAMP, XQ_PSI_CLAMP)
@@ -545,6 +545,9 @@ class PoolAttentionMixin:
         matches = self._check_ind(ind, (B, T, W))
         if T > W:
             raise RuntimeError(f"hippocampal layer: a call of {T} tokens exceeds the ring capacity {W}")
+        # the parameter-only values (the decode step's, per weight version); the queries are bf16, so the extra
+        # queries' gain is the one the step forms
+        lam0, qgain, xq_gain, wbias, bias_gains, rate, beta, _ = self._step_constants()
         qkv = lin(z, self.qkv_proj.weight)
         if T >= 3:
             qkv = o.short_conv_silu_prefill(qkv, st.conv_hist, self.qkv_conv.weight)      # the conv and its SiLU
@@ -559,33 +562,32 @@ class PoolAttentionMixin:
         else:
             self._check_carry(carry, v)
             carry_in = carry_out = carry
-        v = o.vr_mix_prefill(v, carry_in, lin(zc, self.pool_vr_gate), self.value_residual_lambda0(), self._glu_addend(z))
+        v = o.vr_mix_prefill(v, carry_in, lin(zc, self.pool_vr_gate), lam0, self._glu_addend(z))
         positions = pos0.view(1, B) + torch.arange(T, device=h.device, dtype=torch.int64).view(T, 1)
         cos = self.rope_cos_bf16[positions].to(q.dtype)
         sin = self.rope_sin_bf16[positions].to(q.dtype)
         q = o.rope_interleaved(q, cos, sin)
         k = o.rope_interleaved(k, cos, sin)
         gate = self.gate_neuron(z, st.gate_neuron, pos0)
-        a = self._memory_decay(lin(z.float(), self.W_decay.weight))
+        a = self._memory_decay(lin(z.float(), self.W_decay.weight), rate)
         # ring write of the call's events (unit keys, tagged values); the gained unit queries (fp32 gain)
         q_h = q.reshape(T, B, H, dk)
         k_h = k.reshape(T, B, H, dk)
         v_h = v.reshape(T, B, H, dv)
         g_h = gate.reshape(T, B, H, dk)
-        qn = o.ring_write_prefill(k_h, q_h, g_h, v_h, self.pool_query_gain(torch.float32), self.pool_write_bias_total(),
-                                  self.write_sparsity, st.pool_k, st.pool_gv, ptr0, T, B, H, W)
+        qn = o.ring_write_prefill(k_h, q_h, g_h, v_h, qgain, wbias, self.write_sparsity, st.pool_k, st.pool_gv, ptr0,
+                                  T, B, H, W)
         # absolute clocks: the sequential cumulative sum from the carried clock
-        la = self._clock_increments(a, T, B)
+        la = self._clock_increments(a, T, B, bias_gains)
         run = torch.cat([st.pool_run.unsqueeze(0), la], dim=0)
         cum_abs = o.exact_cumsum0(run.reshape(T + 1, B * H)).view(T + 1, B, H)[1:]
         slots = (ptr0 + torch.arange(T, device=h.device, dtype=torch.int64)) % W
         st.pool_cum.index_copy_(2, slots, cum_abs.permute(1, 2, 0).contiguous())
-        beta = self.induction_beta().to(torch.float32)
         out = o.ring_recall_prefill(qn.permute(1, 2, 0, 3), st.pool_k, st.pool_gv, st.pool_cum, cum_abs.permute(1, 2, 0),
                                     ptr0, (matches, beta), self.match_scale, T, B, H, W, dk, dv, h.dtype, False, 0)
         st.pool_run.copy_(cum_abs[-1])
         # extra queries of the last head over its ring
-        xq = self._xq_queries_prefill(z, cos, sin, q.dtype)
+        xq = self._xq_queries_prefill(z, cos, sin, xq_gain)
         # the reads in bf16: their only consumer is the bf16 pool_xq_out_in projection
         reads = o.ring_recall_prefill(xq, st.pool_k, st.pool_gv, st.pool_cum, None, ptr0, (matches, beta),
                                       self.match_scale, T, B, self.xq_count, W, dk, dv, torch.bfloat16, True, H - 1)

@@ -98,7 +98,9 @@ class WeightConstants:
     ``get(sources, build)`` returns ``build()`` (a tuple of tensors, evaluated without autograd) and keeps it until
     the version counter, the storage or the device of one of ``sources`` changes.  A documented cache: a captured
     decode step reads the kept tensors, so :class:`neuronspark.utils.generation.DecodeGraph` holds them
-    (:func:`weight_constants`) for as long as it holds the capture."""
+    (:func:`weight_constants`) for as long as it holds the capture.  A value built inside a CUDA-graph capture is
+    returned without being kept: its tensors belong to the graph (their values exist only after a replay), and the
+    graph then evaluates the expression itself."""
 
     __slots__ = ("_key", "_value")
 
@@ -110,8 +112,10 @@ class WeightConstants:
         key = tuple((int(t._version), int(t.data_ptr()), t.device) for t in sources)
         if key != self._key:
             with torch.no_grad():
-                self._value = tuple(build())
-            self._key = key
+                value = tuple(build())
+            if value and value[0].is_cuda and torch.cuda.is_current_stream_capturing():
+                return value
+            self._value, self._key = value, key
         return self._value
 
     def tensors(self) -> Tuple[torch.Tensor, ...]:

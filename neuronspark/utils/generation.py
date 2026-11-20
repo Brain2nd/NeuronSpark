@@ -189,17 +189,24 @@ class PrefillGraph:
         self.tokens: Optional[torch.Tensor] = None     # static input (B, T)
         self.logits: Optional[torch.Tensor] = None     # static output (B, 1, V)
         self.bf16_weights: list = []                    # the bf16 weight copies the graph reads, kept alive with it
+        self.constants: list = []                       # the modules' weight constants the graph reads, likewise
+        self.buffers: list = []                         # (buffer, version) of the model's buffers at the capture
         self._ran: Optional[Tuple[InferenceParams, int]] = None   # the (cache, length) of the last eager prefill
 
     def holds(self, params: InferenceParams, seq_len: int) -> bool:
-        """Whether the captured call is the prefill of ``seq_len`` tokens over ``params``."""
-        return self.graph is not None and self.params is params and self.seq_len == int(seq_len)
+        """Whether the captured call is the prefill of ``seq_len`` tokens over ``params`` with the model's buffers as
+        they were at the capture (the weight constants the graph reads are functions of parameters and buffers; the
+        parameters are covered by the cache's identity, see :meth:`DecodeGraph.ensure`)."""
+        return (self.graph is not None and self.params is params and self.seq_len == int(seq_len)
+                and all(int(t._version) == v for t, v in self.buffers))
 
     def _drop(self) -> None:
         held = self.graph is not None
         self.params = self.graph = self.pool = self.tokens = self.logits = self._ran = None
         self.seq_len = 0
         self.bf16_weights = []
+        self.constants = []
+        self.buffers = []
         if held:
             gc.collect()
 
@@ -236,6 +243,8 @@ class PrefillGraph:
         self.params, self.seq_len, self.graph, self.pool = params, T, graph, pool
         self.tokens, self.logits = tokens, logits
         self.bf16_weights = [w for w in (getattr(p, "_ns_bf16", None) for p in model.parameters()) if w is not None]
+        self.constants = weight_constants(model)
+        self.buffers = [(t, int(t._version)) for t in model.buffers()]
 
     def replay(self, ids: torch.Tensor) -> torch.Tensor:
         """Replay the prefill on ``ids`` (B, T): the cache advances in place; returns the last position's logits

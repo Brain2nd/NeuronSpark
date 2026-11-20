@@ -185,11 +185,12 @@ def _rope_bwdp_kernel(GY, C, S, GX, T, P, gs0, gs1, cs0, cs1, cs2, ss0, ss1, ss2
 
 # ================================================================================================ prefill kernel
 @triton.jit
-def _rope_interleaved_kernel(X, COS, SIN, Y, R, D2, s_x_r, s_c_t, s_c_b, s_s_t, s_s_b, B,
+def _rope_interleaved_kernel(X, COS, SIN, Y, R, D2, s_x_r, s_y_r, s_c_t, s_c_b, s_s_t, s_s_b, B,
                              BLOCK_R: tl.constexpr, BLOCK_P: tl.constexpr):
-    """rows r = t * B + b of a (T, B, D) bf16 tensor (row stride s_x_r, unit last stride); pairs p of D / 2.  The (even,
-    odd) pair is loaded and stored as one contiguous (BLOCK_R, 2 BLOCK_P) tile, split / joined on the last axis; every
-    product rounded to bf16 before the difference / sum."""
+    """rows r = t * B + b of a (T, B, D) bf16 tensor (row stride s_x_r: a column slice of a wider tensor is read in
+    place; unit last stride) into the contiguous output (row stride s_y_r); pairs p of D / 2.  The (even, odd) pair is
+    loaded and stored as one contiguous (BLOCK_R, 2 BLOCK_P) tile, split / joined on the last axis; every product
+    rounded to bf16 before the difference / sum."""
     pid_r = tl.program_id(axis=0)
     pid_p = tl.program_id(axis=1)
     offs_r = (pid_r * BLOCK_R + tl.arange(0, BLOCK_R)).to(tl.int64)
@@ -211,7 +212,7 @@ def _rope_interleaved_kernel(X, COS, SIN, Y, R, D2, s_x_r, s_c_t, s_c_b, s_s_t, 
     y_e = (p1 - p2).to(tl.bfloat16)
     y_o = (p3 + p4).to(tl.bfloat16)
     y2 = tl.reshape(tl.join(y_e, y_o), (BLOCK_R, 2 * BLOCK_P))
-    tl.store(Y + offs_r[:, None] * s_x_r + offs_e[None, :], y2, mask=m2)
+    tl.store(Y + offs_r[:, None] * s_y_r + offs_e[None, :], y2, mask=m2)
 
 
 # ================================================================================================ host helpers
@@ -430,8 +431,9 @@ def rope_paired_ref(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> to
 def _rope_interleaved_op(x, cos, sin):
     T, B, D = (int(v) for v in x.shape)
     D2 = D // 2
-    if x.stride(1) != D or x.stride(0) != B * D:
-        x = x.contiguous()                   # a (T, B, D) tensor whose rows are not D apart: as the reference reads it
+    if T > 1 and B > 1 and x.stride(0) != B * x.stride(1):
+        x = x.contiguous()                   # rows t * B + b that are not evenly spaced: as the reference reads it
+    s_x_r = x.stride(1) if B > 1 else x.stride(0)       # the row spacing (a column slice keeps its tensor's)
     sct, scb = _bcast_strides(cos, T, B, D2)
     sst, ssb = _bcast_strides(sin, T, B, D2)
     y = torch.empty((T, B, D), dtype=x.dtype, device=x.device)
@@ -439,8 +441,8 @@ def _rope_interleaved_op(x, cos, sin):
     BLOCK_P = min(64, triton.next_power_of_2(D2))
     BLOCK_R = 16 if BLOCK_P >= 64 else 32
     grid = (triton.cdiv(R, BLOCK_R), triton.cdiv(D2, BLOCK_P))
-    _rope_interleaved_kernel[grid](x, cos, sin, y, R, D2, D, sct, scb, sst, ssb, B, BLOCK_R=BLOCK_R, BLOCK_P=BLOCK_P,
-                                   num_warps=4, enable_fp_fusion=False)
+    _rope_interleaved_kernel[grid](x, cos, sin, y, R, D2, s_x_r, D, sct, scb, sst, ssb, B, BLOCK_R=BLOCK_R,
+                                   BLOCK_P=BLOCK_P, num_warps=4, enable_fp_fusion=False)
     return y
 
 
@@ -461,9 +463,9 @@ def _bcast_strides(c: torch.Tensor, T: int, B: int, D2: int):
 
 
 def rope_interleaved(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """``rope(x)`` (interleaved layout) for a bf16 (T, B, C) CUDA ``x`` with unit last stride, one kernel; ``cos`` /
-    ``sin`` bf16 (T, C / 2) or (T|1, B|1, C / 2) with unit last stride.  Returns a contiguous bf16 (T, B, C) tensor.
-    Prefill regime (no autograd)."""
+    """``rope(x)`` (interleaved layout) for a bf16 (T, B, C) CUDA ``x`` with unit last stride (a column slice of a
+    wider (T, B, C') tensor is read in place), one kernel; ``cos`` / ``sin`` bf16 (T, C / 2) or (T|1, B|1, C / 2) with
+    unit last stride.  Returns a contiguous bf16 (T, B, C) tensor.  Prefill regime (no autograd)."""
     _check_x(x, "rope_interleaved")
     if x.stride(-1) != 1:
         raise RuntimeError(f"neuronspark.rope_interleaved: x needs unit last stride, got {tuple(x.stride())}")

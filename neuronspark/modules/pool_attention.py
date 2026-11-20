@@ -548,7 +548,8 @@ class PoolAttentionMixin:
         # the parameter-only values (the decode step's, per weight version); the queries are bf16, so the extra
         # queries' gain is the one the step forms
         lam0, qgain, xq_gain, wbias, bias_gains, rate, beta, _ = self._step_constants()
-        qkv = lin(z, self.qkv_proj.weight)
+        zb = z.to(torch.bfloat16)                 # the projections' operand: the rounding of their input cast, once
+        qkv = lin(zb, self.qkv_proj.weight)
         if T >= 3:
             qkv = o.short_conv_silu_prefill(qkv, st.conv_hist, self.qkv_conv.weight)      # the conv and its SiLU
         else:
@@ -562,14 +563,14 @@ class PoolAttentionMixin:
         else:
             self._check_carry(carry, v)
             carry_in = carry_out = carry
-        v = o.vr_mix_prefill(v, carry_in, lin(zc, self.pool_vr_gate), lam0, self._glu_addend(z))
+        v = o.vr_mix_prefill(v, carry_in, lin(zc, self.pool_vr_gate), lam0, self._glu_addend(zb))
         positions = pos0.view(1, B) + torch.arange(T, device=h.device, dtype=torch.int64).view(T, 1)
         cos = self.rope_cos_bf16[positions].to(q.dtype)
         sin = self.rope_sin_bf16[positions].to(q.dtype)
         q = o.rope_interleaved(q, cos, sin)
         k = o.rope_interleaved(k, cos, sin)
         gate = self.gate_neuron(z, st.gate_neuron, pos0)
-        a = self._memory_decay(lin(z.float(), self.W_decay.weight), rate)
+        a = self._memory_decay(lin(zb, self.W_decay.weight), rate)
         # ring write of the call's events (unit keys, tagged values); the gained unit queries (fp32 gain)
         q_h = q.reshape(T, B, H, dk)
         k_h = k.reshape(T, B, H, dk)
@@ -587,7 +588,7 @@ class PoolAttentionMixin:
                                     ptr0, (matches, beta), self.match_scale, T, B, H, W, dk, dv, h.dtype, False, 0)
         st.pool_run.copy_(cum_abs[-1])
         # extra queries of the last head over its ring
-        xq = self._xq_queries_prefill(z, cos, sin, xq_gain)
+        xq = self._xq_queries_prefill(zb, cos, sin, xq_gain)
         # the reads in bf16: their only consumer is the bf16 pool_xq_out_in projection
         reads = o.ring_recall_prefill(xq, st.pool_k, st.pool_gv, st.pool_cum, None, ptr0, (matches, beta),
                                       self.match_scale, T, B, self.xq_count, W, dk, dv, torch.bfloat16, True, H - 1)

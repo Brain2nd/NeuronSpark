@@ -223,8 +223,9 @@ class PKMMixin:
         o = self._ops
         T, B, _ = (int(s) for s in x_hat.shape)
         H, k = self.pkm_heads, self.pkm_k
-        q = o.linear(x_hat, self.pkm_q.weight)
-        glog = o.linear(x_hat, self.pkm_g.weight)
+        xb = x_hat.to(torch.bfloat16)             # the projections' operand: the rounding of their input cast, once
+        q = o.linear(xb, self.pkm_q.weight)
+        glog = o.linear(xb, self.pkm_g.weight)
         with torch.autocast(x_hat.device.type, enabled=False):
             kh, gains, _ = self._pkm_constants()  # the unit sub-keys and the score gains: per weight version
             qh = self._pkm_queries(q, T, B)

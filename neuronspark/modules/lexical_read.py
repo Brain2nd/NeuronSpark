@@ -105,9 +105,10 @@ class LexicalReadMixin:
         hn = rows_rmsnorm(o, h, LEX_EPS, out_dtype=torch.bfloat16)          # its only consumer is the bf16 lex_q projection
         m_in = lex.to(h.dtype)
         if int(h.shape[0]) > 1:
+            m_b = m_in.to(torch.bfloat16)         # the projections' operand: the rounding of their input cast, once
             q_raw = o.linear(hn, self.lex_q.weight)
-            k_raw = o.linear(m_in, self.lex_k.weight)
-            o_raw = o.linear(m_in, self.lex_o.weight)
+            k_raw = o.linear(m_b, self.lex_k.weight)
+            o_raw = o.linear(m_b, self.lex_o.weight)
             return o.lex_read_prefill(h, q_raw, k_raw, o_raw, self.lex_q_gain, self.lex_k_gain, self.lex_beta, LEX_EPS)
         alpha = self._lexical_gate(o.linear(hn, self.lex_q.weight), o.linear(m_in, self.lex_k.weight))
         return h + (alpha * o.linear(m_in, self.lex_o.weight).float()).to(h.dtype)

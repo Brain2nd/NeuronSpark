@@ -20,9 +20,8 @@ Forward:
      chunk) kept in fp32 for the backward's state gradients, and in bf16 for the chunk scan;
   4. CB = C B^T per chunk (``dendritic_chunk.chunk_cb``, fp32), kept;
   5. the chunk scan (Gluon ``chunk_scan_fwd_gluon``, Blackwell), y bf16 kept;
-  6. gated RMSNorm (unit weight, eps 1e-5) + bipolar soma + gamma (``dendritic_soma.gated_norm_soma_fwd``): xs, with the
-  norm's
-     rstd and its bf16 output n kept.
+  6. gated RMSNorm (unit weight, eps 1e-5) + bipolar soma + gamma (``dendritic_gated_norm.gated_norm_soma_fwd``, the
+     row kernel of the prefill read-out): xs, with the norm's rstd and its bf16 output n kept.
 Backward: the soma + gated-norm backward on the kept n (``dendritic_soma.gated_norm_soma_bwd``, dz written into the
 projection gradient), the SSD backward on the kept tensors (``dendritic_glue.bwd_store_glue``, dx / dB / dC into the
 conv-input gradient, ddt into the projection gradient), the conv backward (dx into the projection gradient; weight /
@@ -50,10 +49,10 @@ from neuronspark.ops.triton.dendritic_chunk import chunk_cb, chunk_dt_cumsum
 from neuronspark.ops.triton.dendritic_conv import (_conv_bwd, _conv_fwd, _ensure_stride, dendritic_conv_silu_ref,
                                                    split_dwb)
 from neuronspark.ops.gluon.dendritic_chunk_states import chunk_states_train
+from neuronspark.ops.triton.dendritic_gated_norm import BLOCK_N, gated_norm_soma_fwd
 from neuronspark.ops.triton.dendritic_glue import bwd_store_glue
 from neuronspark.ops.triton.dendritic_scan import ssd_forward_ref
-from neuronspark.ops.triton.dendritic_soma import (_gated_norm_ref, bipolar_release, gated_norm_soma_bwd,
-                                                 gated_norm_soma_fwd)
+from neuronspark.ops.triton.dendritic_soma import _gated_norm_ref, bipolar_release, gated_norm_soma_bwd
 
 __all__ = ["NORM_EPS", "CHUNK_SIZE", "DendriticChunkScanSomaFn", "dendritic_chunk_scan_soma",
            "dendritic_chunk_scan_soma_ref"]
@@ -62,7 +61,7 @@ NORM_EPS = 1e-5          # the gated RMSNorm eps of the dendritic neuron populat
 CHUNK_SIZE = 256         # the only chunk size the backward kernels cover (32 x 8 dda tiles)
 _DT_LIMIT = (0.0, float("inf"))
 
-# (width, device index) -> fp32 ones: the gated norm's unit weight (a documented first-call cache)
+# (width, device index) -> fp32 ones: the unit weight of the gated norm's backward (a documented first-call cache)
 _ONES: Dict[Tuple[int, int], torch.Tensor] = {}
 
 
@@ -117,7 +116,7 @@ def _dendritic_chunk_scan_soma_fwd_op(zxbcdt, conv_w, conv_b, dt_bias, A, D, the
     out_x = chunk_scan_fwd_gluon(CB, x, dt_sp, dA_cumsum, C, states, D)
     x_rms = out_x.view(batch * seqlen, dim)
     z_rms = z.view(batch * seqlen, dim)
-    xs, rstd, n = gated_norm_soma_fwd(x_rms, _ones(dim, zxbcdt.device), NORM_EPS, z_rms, theta, gamma)
+    xs, rstd, n = gated_norm_soma_fwd(x_rms, NORM_EPS, z_rms, theta, gamma)
     return xs, out_x, rstd, xBC_conv, dt_sp, dA_cumsum, CB, states_passed, n
 
 
@@ -253,6 +252,8 @@ def _check_call(zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma, alpha, chun
         nheads, dim, headdim, dstate = _geometry(zxbcdt, conv_w, D, theta)
         if dim % nheads or headdim not in (16, 32, 64, 128) or dstate <= 0:
             bad.append(f"d_inner {dim} / nheads {nheads} / dstate {dstate}")
+        if dim % 1024 or dim > BLOCK_N:
+            bad.append(f"d_inner {dim} must be a multiple of 1024, at most {BLOCK_N} (the gated norm's row kernels)")
         if zxbcdt.dim() == 3 and int(zxbcdt.shape[-1]) != 2 * dim + 2 * dstate + nheads:
             bad.append(f"zxbcdt width {int(zxbcdt.shape[-1])} != 2 d_inner + 2 N + H = {2 * dim + 2 * dstate + nheads}")
         for name, t, n in (("dt_bias", dt_bias, nheads), ("A", A, nheads), ("theta", theta, dim),

@@ -1,6 +1,6 @@
-"""dendritic-layer gated RMSNorm + soma read-out (inference prefill): the normalisation of the SSD output gated by
-SiLU(z), unit weight, rounded to bf16, then the bipolar soft-threshold soma times gamma -- W_out's bf16 input -- in one
-kernel.
+"""dendritic-layer gated RMSNorm + soma read-out (the inference prefill and the training forward): the normalisation
+of the SSD output gated by SiLU(z), unit weight, rounded to bf16, then the bipolar soft-threshold soma times gamma --
+W_out's bf16 input -- in one kernel.
 
 Op (registry name ``dendritic_gated_norm_soma``; no autograd)::
 
@@ -31,6 +31,10 @@ fla's.  The norm's weight is the unit vector: the product with it is not formed 
 function with this kernel's summation order (fla itself would choose a smaller block there).  Tests: the
 per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the reference.
 
+The training forward (``gated_norm_soma_fwd(x, eps, z, theta, gamma) -> (x_soma, rstd, n)``, internal to
+:class:`neuronspark.ops.dendritic_combined.DendriticChunkScanSomaFn`) is the same kernel with n (bf16) and the rows'
+rstd (fp32) stored for the backward; it takes rows of any N up to 16384 and row offsets of any size.
+
 Launch constants: 8 warps (256 threads), VEC 8 elements per thread per rep, rep-outer chain order, the
 register-resident two-pass form; one program per row.
 
@@ -52,7 +56,8 @@ from neuronspark.ops.triton.dendritic_soma import dendritic_soma_readout_ref
 
 __all__ = [
     "BLOCK_N", "NUM_WARPS", "THREADS", "VEC", "MIN_N_EXCLUSIVE",
-    "dendritic_gated_norm_soma", "dendritic_gated_norm_soma_ref", "dendritic_gated_rmsnorm_ref",
+    "dendritic_gated_norm_soma", "gated_norm_soma_fwd", "dendritic_gated_norm_soma_ref",
+    "dendritic_gated_rmsnorm_ref",
 ]
 
 # ------------------------------------------------------------------------------------------------ launch constants
@@ -66,10 +71,47 @@ _MAX_REPS = 8            # BLOCK_N // (THREADS * VEC): the unrolled register-res
 
 # ------------------------------------------------------------------------------------------------ kernel
 @triton.jit
-def _soma_store(Y, NOUT, cols, m, y, TH, GA, STORE_N: tl.constexpr):
-    """the soma read-out of the bf16-rounded norm value: x = bf16(S(n, theta) * gamma); STORE_N also stores n (for a
-    per-operator comparison of the two stages)"""
-    if STORE_N:
+def _rep_load(X, Z, k: tl.constexpr, N, T: tl.constexpr, VEC: tl.constexpr):
+    """rep k of the row (T * VEC columns): the bf16 operands as loaded, zero past N"""
+    cols = k * (T * VEC) + tl.arange(0, T * VEC)
+    m = cols < N
+    return tl.load(X + cols, mask=m, other=0.0), tl.load(Z + cols, mask=m, other=0.0)
+
+
+@triton.jit
+def _rep_gate(xr, zr, acc, k: tl.constexpr, N, T: tl.constexpr, VEC: tl.constexpr):
+    """rep k: the gated fp32 values g = x * (z * sigmoid(z)) and each thread's chain continued over the rep's 8
+    register slots in order 0..7 (the slots peeled out of the thread's registers with ``tl.split``)"""
+    cols = k * (T * VEC) + tl.arange(0, T * VEC)
+    g = xr.to(tl.float32)
+    z = zr.to(tl.float32)
+    g *= z * tl.sigmoid(z)
+    xb = tl.where(cols < N, g, 0.)
+    p = xb * xb
+    pe, po = tl.split(tl.reshape(p, [T, 4, 2]))          # j even / j odd
+    pee, peo = tl.split(tl.reshape(pe, [T, 2, 2]))       # {0, 4} / {2, 6}
+    poe, poo = tl.split(tl.reshape(po, [T, 2, 2]))       # {1, 5} / {3, 7}
+    p0, p4 = tl.split(pee)
+    p2, p6 = tl.split(peo)
+    p1, p5 = tl.split(poe)
+    p3, p7 = tl.split(poo)
+    acc = acc + p0
+    acc = acc + p1
+    acc = acc + p2
+    acc = acc + p3
+    acc = acc + p4
+    acc = acc + p5
+    acc = acc + p6
+    acc = acc + p7
+    return g, acc
+
+
+@triton.jit
+def _soma_store(Y, NOUT, TH, GA, y, k: tl.constexpr, N, T: tl.constexpr, VEC: tl.constexpr, KEEP: tl.constexpr):
+    """rep k: the soma read-out of the bf16-rounded norm value, x = bf16(S(n, theta) * gamma); KEEP also stores n"""
+    cols = k * (T * VEC) + tl.arange(0, T * VEC)
+    m = cols < N
+    if KEEP:
         tl.store(NOUT + cols, _sr_f32_to_bf16(y), mask=m)
     v = _sr_bf16_to_f32(_sr_f32_to_bf16(y))
     th = tl.load(TH + cols, mask=m, other=0.0)
@@ -79,238 +121,115 @@ def _soma_store(Y, NOUT, cols, m, y, TH, GA, STORE_N: tl.constexpr):
 
 
 @triton.jit
-def _gated_norm_soma_kernel(X, Z, Y, NOUT, TH, GA, sx, sz, sy, N, eps,
-                            VEC: tl.constexpr, T: tl.constexpr, NREP_EFF: tl.constexpr, STORE_N: tl.constexpr):
-    row = tl.program_id(0)
+def _gated_norm_soma_kernel(X, Z, Y, NOUT, RSTD, TH, GA, sx, sz, sy, N, eps,
+                            VEC: tl.constexpr, T: tl.constexpr, NREP_EFF: tl.constexpr, KEEP: tl.constexpr):
+    """One row per program.  KEEP (the training forward): n and the row's rstd are stored as well."""
+    row = tl.program_id(0).to(tl.int64)                  # int64: rows x row stride may exceed 2^31 elements
     X += row * sx
     Z += row * sz
     Y += row * sy
     NOUT += row * sy
-    acc = tl.zeros([T], dtype=tl.float32)
+    tl.static_assert(VEC == 8, "the chain peels 8 slots")
+    tl.static_assert(NREP_EFF <= 8, "the chain unrolls up to 8 reps")
     # pass 1: each thread's sequential chain over its register slots (rep, j) of fla's [BLOCK_N] layout.  The gated
     # fp32 row stays in registers between the passes (NREP_EFF x 8 values per thread): pass 1 loads x / z once, gates,
     # forms the chain; pass 2 scales the kept values -- no second load or sigmoid.
-    tl.static_assert(VEC == 8, "the chain peels 8 slots")
-    tl.static_assert(NREP_EFF <= 8, "the chain unrolls up to 8 reps")
+    acc = tl.zeros([T], dtype=tl.float32)
     if NREP_EFF > 0:
-        cols0 = 0 * (T * VEC) + tl.arange(0, T * VEC)
-        m0 = cols0 < N
-        g0 = tl.load(X + cols0, mask=m0, other=0.0).to(tl.float32)
-        z0 = tl.load(Z + cols0, mask=m0, other=0.0).to(tl.float32)
-        g0 *= z0 * tl.sigmoid(z0)
-        xb0 = tl.where(m0, g0, 0.)
-        p = xb0 * xb0
-        pe, po = tl.split(tl.reshape(p, [T, 4, 2]))          # j even / j odd
-        pee, peo = tl.split(tl.reshape(pe, [T, 2, 2]))       # {0, 4} / {2, 6}
-        poe, poo = tl.split(tl.reshape(po, [T, 2, 2]))       # {1, 5} / {3, 7}
-        p0, p4 = tl.split(pee)
-        p2, p6 = tl.split(peo)
-        p1, p5 = tl.split(poe)
-        p3, p7 = tl.split(poo)
-        acc = acc + p0
-        acc = acc + p1
-        acc = acc + p2
-        acc = acc + p3
-        acc = acc + p4
-        acc = acc + p5
-        acc = acc + p6
-        acc = acc + p7
+        x0, z0 = _rep_load(X, Z, 0, N, T, VEC)
+        g0, acc = _rep_gate(x0, z0, acc, 0, N, T, VEC)
     if NREP_EFF > 1:
-        cols1 = 1 * (T * VEC) + tl.arange(0, T * VEC)
-        m1 = cols1 < N
-        g1 = tl.load(X + cols1, mask=m1, other=0.0).to(tl.float32)
-        z1 = tl.load(Z + cols1, mask=m1, other=0.0).to(tl.float32)
-        g1 *= z1 * tl.sigmoid(z1)
-        xb1 = tl.where(m1, g1, 0.)
-        p = xb1 * xb1
-        pe, po = tl.split(tl.reshape(p, [T, 4, 2]))
-        pee, peo = tl.split(tl.reshape(pe, [T, 2, 2]))
-        poe, poo = tl.split(tl.reshape(po, [T, 2, 2]))
-        p0, p4 = tl.split(pee)
-        p2, p6 = tl.split(peo)
-        p1, p5 = tl.split(poe)
-        p3, p7 = tl.split(poo)
-        acc = acc + p0
-        acc = acc + p1
-        acc = acc + p2
-        acc = acc + p3
-        acc = acc + p4
-        acc = acc + p5
-        acc = acc + p6
-        acc = acc + p7
+        x1, z1 = _rep_load(X, Z, 1, N, T, VEC)
+        g1, acc = _rep_gate(x1, z1, acc, 1, N, T, VEC)
     if NREP_EFF > 2:
-        cols2 = 2 * (T * VEC) + tl.arange(0, T * VEC)
-        m2 = cols2 < N
-        g2 = tl.load(X + cols2, mask=m2, other=0.0).to(tl.float32)
-        z2 = tl.load(Z + cols2, mask=m2, other=0.0).to(tl.float32)
-        g2 *= z2 * tl.sigmoid(z2)
-        xb2 = tl.where(m2, g2, 0.)
-        p = xb2 * xb2
-        pe, po = tl.split(tl.reshape(p, [T, 4, 2]))
-        pee, peo = tl.split(tl.reshape(pe, [T, 2, 2]))
-        poe, poo = tl.split(tl.reshape(po, [T, 2, 2]))
-        p0, p4 = tl.split(pee)
-        p2, p6 = tl.split(peo)
-        p1, p5 = tl.split(poe)
-        p3, p7 = tl.split(poo)
-        acc = acc + p0
-        acc = acc + p1
-        acc = acc + p2
-        acc = acc + p3
-        acc = acc + p4
-        acc = acc + p5
-        acc = acc + p6
-        acc = acc + p7
+        x2, z2 = _rep_load(X, Z, 2, N, T, VEC)
+        g2, acc = _rep_gate(x2, z2, acc, 2, N, T, VEC)
     if NREP_EFF > 3:
-        cols3 = 3 * (T * VEC) + tl.arange(0, T * VEC)
-        m3 = cols3 < N
-        g3 = tl.load(X + cols3, mask=m3, other=0.0).to(tl.float32)
-        z3 = tl.load(Z + cols3, mask=m3, other=0.0).to(tl.float32)
-        g3 *= z3 * tl.sigmoid(z3)
-        xb3 = tl.where(m3, g3, 0.)
-        p = xb3 * xb3
-        pe, po = tl.split(tl.reshape(p, [T, 4, 2]))
-        pee, peo = tl.split(tl.reshape(pe, [T, 2, 2]))
-        poe, poo = tl.split(tl.reshape(po, [T, 2, 2]))
-        p0, p4 = tl.split(pee)
-        p2, p6 = tl.split(peo)
-        p1, p5 = tl.split(poe)
-        p3, p7 = tl.split(poo)
-        acc = acc + p0
-        acc = acc + p1
-        acc = acc + p2
-        acc = acc + p3
-        acc = acc + p4
-        acc = acc + p5
-        acc = acc + p6
-        acc = acc + p7
+        x3, z3 = _rep_load(X, Z, 3, N, T, VEC)
+        g3, acc = _rep_gate(x3, z3, acc, 3, N, T, VEC)
     if NREP_EFF > 4:
-        cols4 = 4 * (T * VEC) + tl.arange(0, T * VEC)
-        m4 = cols4 < N
-        g4 = tl.load(X + cols4, mask=m4, other=0.0).to(tl.float32)
-        z4 = tl.load(Z + cols4, mask=m4, other=0.0).to(tl.float32)
-        g4 *= z4 * tl.sigmoid(z4)
-        xb4 = tl.where(m4, g4, 0.)
-        p = xb4 * xb4
-        pe, po = tl.split(tl.reshape(p, [T, 4, 2]))
-        pee, peo = tl.split(tl.reshape(pe, [T, 2, 2]))
-        poe, poo = tl.split(tl.reshape(po, [T, 2, 2]))
-        p0, p4 = tl.split(pee)
-        p2, p6 = tl.split(peo)
-        p1, p5 = tl.split(poe)
-        p3, p7 = tl.split(poo)
-        acc = acc + p0
-        acc = acc + p1
-        acc = acc + p2
-        acc = acc + p3
-        acc = acc + p4
-        acc = acc + p5
-        acc = acc + p6
-        acc = acc + p7
+        x4, z4 = _rep_load(X, Z, 4, N, T, VEC)
+        g4, acc = _rep_gate(x4, z4, acc, 4, N, T, VEC)
     if NREP_EFF > 5:
-        cols5 = 5 * (T * VEC) + tl.arange(0, T * VEC)
-        m5 = cols5 < N
-        g5 = tl.load(X + cols5, mask=m5, other=0.0).to(tl.float32)
-        z5 = tl.load(Z + cols5, mask=m5, other=0.0).to(tl.float32)
-        g5 *= z5 * tl.sigmoid(z5)
-        xb5 = tl.where(m5, g5, 0.)
-        p = xb5 * xb5
-        pe, po = tl.split(tl.reshape(p, [T, 4, 2]))
-        pee, peo = tl.split(tl.reshape(pe, [T, 2, 2]))
-        poe, poo = tl.split(tl.reshape(po, [T, 2, 2]))
-        p0, p4 = tl.split(pee)
-        p2, p6 = tl.split(peo)
-        p1, p5 = tl.split(poe)
-        p3, p7 = tl.split(poo)
-        acc = acc + p0
-        acc = acc + p1
-        acc = acc + p2
-        acc = acc + p3
-        acc = acc + p4
-        acc = acc + p5
-        acc = acc + p6
-        acc = acc + p7
+        x5, z5 = _rep_load(X, Z, 5, N, T, VEC)
+        g5, acc = _rep_gate(x5, z5, acc, 5, N, T, VEC)
     if NREP_EFF > 6:
-        cols6 = 6 * (T * VEC) + tl.arange(0, T * VEC)
-        m6 = cols6 < N
-        g6 = tl.load(X + cols6, mask=m6, other=0.0).to(tl.float32)
-        z6 = tl.load(Z + cols6, mask=m6, other=0.0).to(tl.float32)
-        g6 *= z6 * tl.sigmoid(z6)
-        xb6 = tl.where(m6, g6, 0.)
-        p = xb6 * xb6
-        pe, po = tl.split(tl.reshape(p, [T, 4, 2]))
-        pee, peo = tl.split(tl.reshape(pe, [T, 2, 2]))
-        poe, poo = tl.split(tl.reshape(po, [T, 2, 2]))
-        p0, p4 = tl.split(pee)
-        p2, p6 = tl.split(peo)
-        p1, p5 = tl.split(poe)
-        p3, p7 = tl.split(poo)
-        acc = acc + p0
-        acc = acc + p1
-        acc = acc + p2
-        acc = acc + p3
-        acc = acc + p4
-        acc = acc + p5
-        acc = acc + p6
-        acc = acc + p7
+        x6, z6 = _rep_load(X, Z, 6, N, T, VEC)
+        g6, acc = _rep_gate(x6, z6, acc, 6, N, T, VEC)
     if NREP_EFF > 7:
-        cols7 = 7 * (T * VEC) + tl.arange(0, T * VEC)
-        m7 = cols7 < N
-        g7 = tl.load(X + cols7, mask=m7, other=0.0).to(tl.float32)
-        z7 = tl.load(Z + cols7, mask=m7, other=0.0).to(tl.float32)
-        g7 *= z7 * tl.sigmoid(z7)
-        xb7 = tl.where(m7, g7, 0.)
-        p = xb7 * xb7
-        pe, po = tl.split(tl.reshape(p, [T, 4, 2]))
-        pee, peo = tl.split(tl.reshape(pe, [T, 2, 2]))
-        poe, poo = tl.split(tl.reshape(po, [T, 2, 2]))
-        p0, p4 = tl.split(pee)
-        p2, p6 = tl.split(peo)
-        p1, p5 = tl.split(poe)
-        p3, p7 = tl.split(poo)
-        acc = acc + p0
-        acc = acc + p1
-        acc = acc + p2
-        acc = acc + p3
-        acc = acc + p4
-        acc = acc + p5
-        acc = acc + p6
-        acc = acc + p7
+        x7, z7 = _rep_load(X, Z, 7, N, T, VEC)
+        g7, acc = _rep_gate(x7, z7, acc, 7, N, T, VEC)
     var = tl.sum(acc, axis=0) / N
     rstd = 1 / tl.sqrt(var + eps)
     # pass 2: the normalised kept values (element-wise; the unit weight is not multiplied: x * 1 = x)
     if NREP_EFF > 0:
-        _soma_store(Y, NOUT, cols0, m0, g0 * rstd, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, TH, GA, g0 * rstd, 0, N, T, VEC, KEEP)
     if NREP_EFF > 1:
-        _soma_store(Y, NOUT, cols1, m1, g1 * rstd, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, TH, GA, g1 * rstd, 1, N, T, VEC, KEEP)
     if NREP_EFF > 2:
-        _soma_store(Y, NOUT, cols2, m2, g2 * rstd, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, TH, GA, g2 * rstd, 2, N, T, VEC, KEEP)
     if NREP_EFF > 3:
-        _soma_store(Y, NOUT, cols3, m3, g3 * rstd, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, TH, GA, g3 * rstd, 3, N, T, VEC, KEEP)
     if NREP_EFF > 4:
-        _soma_store(Y, NOUT, cols4, m4, g4 * rstd, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, TH, GA, g4 * rstd, 4, N, T, VEC, KEEP)
     if NREP_EFF > 5:
-        _soma_store(Y, NOUT, cols5, m5, g5 * rstd, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, TH, GA, g5 * rstd, 5, N, T, VEC, KEEP)
     if NREP_EFF > 6:
-        _soma_store(Y, NOUT, cols6, m6, g6 * rstd, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, TH, GA, g6 * rstd, 6, N, T, VEC, KEEP)
     if NREP_EFF > 7:
-        _soma_store(Y, NOUT, cols7, m7, g7 * rstd, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, TH, GA, g7 * rstd, 7, N, T, VEC, KEEP)
+    if KEEP:                                             # after the row's stores (between the passes it costs 9 %)
+        tl.store(RSTD + row, rstd)
 
 
-# ------------------------------------------------------------------------------------------------ launcher
+# ------------------------------------------------------------------------------------------------ launchers
+def _launch(y2: torch.Tensor, z2: torch.Tensor, theta: torch.Tensor, gamma: torch.Tensor, eps: float, keep: bool):
+    """one launch of the row kernel (operands checked by the caller): the read-out (M, N) bf16 contiguous and, with
+    ``keep``, the norm n (M, N) bf16 it was formed from and the rows' rstd (M,) fp32 (else None, None)"""
+    M, N = (int(s) for s in y2.shape)
+    out = torch.empty((M, N), dtype=torch.bfloat16, device=y2.device)
+    n_out = torch.empty((M, N), dtype=torch.bfloat16, device=y2.device) if keep else None
+    rstd = torch.empty((M,), dtype=torch.float32, device=y2.device) if keep else None
+    with torch.cuda.device(y2.device.index):
+        _gated_norm_soma_kernel[(M,)](y2, z2, out, n_out if keep else out, rstd if keep else theta, theta, gamma,
+                                      y2.stride(0), z2.stride(0), out.stride(0), N, float(eps), VEC=VEC, T=THREADS,
+                                      NREP_EFF=triton.cdiv(N, THREADS * VEC), KEEP=bool(keep), num_warps=NUM_WARPS)
+    return out, n_out, rstd
+
+
 def _gated_norm_soma_fwd(y2: torch.Tensor, z2: torch.Tensor, theta: torch.Tensor, gamma: torch.Tensor,
                          eps: float, store_n: bool = False):
     """the read-out of fla ``layer_norm_fwd(y2, ones, None, eps, z=z2, group_size=N, norm_before_gate=False,
     is_rms_norm=True)[0]`` for the reproduced domain (operands checked by the caller); a contiguous (M, N) bf16 output,
     and with ``store_n`` also the norm n (M, N) bf16 that the read-out was formed from (for a stage-wise comparison)."""
-    M, N = (int(s) for s in y2.shape)
-    out = torch.empty((M, N), dtype=torch.bfloat16, device=y2.device)
-    n_out = torch.empty((M, N), dtype=torch.bfloat16, device=y2.device) if store_n else out
-    with torch.cuda.device(y2.device.index):
-        _gated_norm_soma_kernel[(M,)](y2, z2, out, n_out, theta, gamma, y2.stride(0), z2.stride(0), out.stride(0), N,
-                                      float(eps), VEC=VEC, T=THREADS, NREP_EFF=triton.cdiv(N, THREADS * VEC),
-                                      STORE_N=bool(store_n), num_warps=NUM_WARPS)
+    out, n_out, _ = _launch(y2, z2, theta, gamma, eps, bool(store_n))
     return (out, n_out) if store_n else out
+
+
+def gated_norm_soma_fwd(x: torch.Tensor, eps: float, z: torch.Tensor, theta: torch.Tensor, gamma: torch.Tensor):
+    """(x_soma (M, N) bf16, rstd (M,) fp32, n (M, N) bf16): the training forward of the gated norm + soma read-out,
+    internal to :class:`neuronspark.ops.dendritic_combined.DendriticChunkScanSomaFn` -- the kernel of
+    :func:`dendritic_gated_norm_soma` with n and rstd stored for the backward
+    (:func:`neuronspark.ops.triton.dendritic_soma.gated_norm_soma_bwd`).  x, z (M, N) bf16 rows with unit last
+    strides (z the strided gate slice of the projection; row offsets of any size), M >= 1, N <= 16384; theta / gamma
+    (N,) fp32 contiguous.  No autograd."""
+    require_cuda(x, "gated_norm_soma_fwd")
+    if (x.dim() != 2 or x.dtype != torch.bfloat16 or x.stride(1) != 1 or not isinstance(z, torch.Tensor)
+            or z.device != x.device or tuple(z.shape) != tuple(x.shape) or z.dtype != torch.bfloat16
+            or z.stride(1) != 1):
+        raise RuntimeError("neuronspark.gated_norm_soma_fwd: gated norm operands outside the supported form (bf16 "
+                           "(M, N) rows of one shape on one device, unit last strides)")
+    M, N = (int(s) for s in x.shape)
+    if M < 1 or not 1 <= N <= BLOCK_N:
+        raise RuntimeError(f"neuronspark.gated_norm_soma_fwd: rows M >= 1 and 1 <= N <= {BLOCK_N} expected, got "
+                           f"({M}, {N})")
+    for name, t in (("theta", theta), ("gamma", gamma)):
+        if (t.dtype != torch.float32 or t.dim() != 1 or int(t.shape[0]) != N or not t.is_contiguous()
+                or t.device != x.device):
+            raise RuntimeError(f"neuronspark.gated_norm_soma_fwd: {name} must be a contiguous float32 ({N},) tensor "
+                               f"on {x.device}, got {t.dtype} {tuple(t.shape)} {t.device}")
+    xo, n, rstd = _launch(x, z, theta, gamma, eps, True)
+    return xo, rstd, n
 
 
 @torch.library.custom_op("neuronspark::dendritic_gated_norm_soma", mutates_args=(),

@@ -1,15 +1,14 @@
 """dendritic-layer gated RMSNorm + soma read-out: the SSD output's gated norm (unit weight), the bipolar soft-threshold
-soma with its sigmoid surrogate, the axonal gain gamma and the bf16 rounding of W_out's input.  Training forward /
-backward.
+soma with its sigmoid surrogate, the axonal gain gamma and the bf16 rounding of W_out's input.  Training backward and
+the references of both directions.
+
+The training forward ``g = x * (z * sigmoid(z))`` (fp32), ``rstd = 1 / sqrt(sum_N g^2 / N + eps)`` per row, ``n = bf16(g
+* rstd)`` (stored), ``S = max(n - theta, 0) - max(-n - theta, 0)``, ``xo = bf16(S * gamma)`` is
+:func:`neuronspark.ops.triton.dendritic_gated_norm.gated_norm_soma_fwd` (the row kernel of the prefill read-out with n
+and rstd stored); its reference is :func:`gated_norm_soma_fwd_ref` below.
 
 Pieces:
 
-* ``gated_norm_soma_fwd(x, weight, eps, z, theta, gamma) -> (xo, rstd, n)`` (training forward, internal to
-  :class:`neuronspark.ops.dendritic_combined.DendriticChunkScanSomaFn`): ``g = x * (z * sigmoid(z))`` (fp32), ``rstd = 1
-  / sqrt(sum_N g^2 / N + eps)`` per row (per-lane sums over the chunks in order, then one row sum), ``n = bf16((g * rstd) * w)``
-  (stored), ``S = max(n - theta, 0) - max(-n - theta, 0)`` and ``xo = bf16(S * gamma)`` with IEEE single-rounding PTX
-  (sub.rn / max.f32 / mul.rn / cvt.rn.bf16).  x, z (M, N) bf16 rows with unit last stride (z the strided slice of the
-  projection), weight (N,) fp32 (the unit gated-norm weight), theta / gamma (N,) fp32; N a multiple of 1024.
 * ``gated_norm_soma_bwd(dxs, n, x, weight, rstd, z, dz, theta, gamma, alpha) -> (dy, dz, dtheta, dgamma)`` (training
   backward): the soma backward on the stored n -- ``gp = 1 / (1 + exp2(-(a alpha) log2 e))`` and ``gm`` likewise
   (approximate exp2, div.full, FMA), ``grad_n = bf16(g gamma (gp + gm))``, the theta / gamma gradients as fp32 partial
@@ -21,13 +20,13 @@ Pieces:
   the inference read-outs (the prefill one is fused into :mod:`neuronspark.ops.triton.dendritic_gated_norm`, the decode
   one into :mod:`neuronspark.ops.triton.dendritic_step`).
 
-Numerics: the gated norm forward / backward (gated RMSNorm, the gate applied before the norm) are fp32-reduction-order
-class (chunk lanes instead of one 16384-lane row); the soma forward is the torch chain's arithmetic exactly given n; the
-soma backward is fp32-rounding class (approximate exp2 / division, reordered parameter sums).  Checked with the
-per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the references below.
+Numerics: the gated norm backward (gated RMSNorm, the gate applied before the norm) is fp32-reduction-order class
+(chunk lanes instead of one 16384-lane row); the soma backward is fp32-rounding class (approximate exp2 / division,
+reordered parameter sums).  Checked with the per-operator tolerance rule of :mod:`neuronspark.utils.testing` against
+the references below.
 
-Launch constants: forward R 1 row / program, 16 warps, CH 1024 (two passes, NCH = N / CH), n stored for the backward; soma backward ROWS 128, BM 4, BC 1024, 4 warps, STAGES 4 (no masks on whole tiles), sum BR 32 BC 64 4 warps; gated norm backward
-R 1, 8 warps, CH 1024 (two passes).  The PTX helpers ``_sr_*`` are :mod:`neuronspark.ops.triton._ptx`'s.
+Launch constants: soma backward ROWS 128, BM 4, BC 1024, 4 warps, STAGES 4 (no masks on whole tiles), sum BR 32 BC 64
+4 warps; gated norm backward R 1, 8 warps, CH 1024 (two passes; N a multiple of 1024).
 """
 from __future__ import annotations
 
@@ -36,59 +35,19 @@ import triton
 import triton.language as tl
 
 from neuronspark.ops.triton import require_cuda
-from neuronspark.ops.triton._ptx import _sr_bf16_to_f32, _sr_f32_to_bf16, _sr_mul_rn, _sr_release
 
 __all__ = [
-    "SOMA_FWD_CFG", "SOMA_BWD_CFG", "SOMA_SUM_CFG", "NORM_BWD_CFG",
-    "gated_norm_soma_fwd", "gated_norm_soma_bwd", "soma_bwd", "gated_rmsnorm_bwd",
+    "SOMA_BWD_CFG", "SOMA_SUM_CFG", "NORM_BWD_CFG",
+    "gated_norm_soma_bwd", "soma_bwd", "gated_rmsnorm_bwd",
     "gated_norm_soma_fwd_ref", "gated_norm_soma_bwd_ref", "soma_bwd_ref", "gated_rmsnorm_bwd_ref",
     "dendritic_soma_readout_ref",
     "BipolarRelease", "bipolar_release",
 ]
 
 # ------------------------------------------------------------------------------------------------ launch constants
-SOMA_FWD_CFG = (1, 16, 1024)            # rows / program, num_warps, CH (chunk lanes; N = NCH x CH)
 SOMA_BWD_CFG = (128, 4, 1024, 4, 4)     # ROWS / program, BM rows / iteration, BC columns, num_warps, STAGES
 SOMA_SUM_CFG = (32, 64, 4)              # BR, BC, num_warps of the partial-sum reduction
 NORM_BWD_CFG = (1, 8, 1024)             # rows / program, num_warps, CH
-
-
-# ------------------------------------------------------------------------------------------------ forward kernel
-@triton.jit
-def _gated_norm_soma_fwd_kernel(X, XO, Y, W, Z, TH, GA, Rstd, sx, sxo, sy, sz, M, N, NCH, eps, R: tl.constexpr,
-                                CH: tl.constexpr, STORE_N: tl.constexpr):
-    """Gated norm + soma forward, R rows per program, two passes over the NCH chunks of CH columns: pass 1 acc += g * g
-    per lane (chunk order), rstd from one row sum / N; pass 2 reloads x / z and stores n (STORE_N) and x_soma."""
-    pid = tl.program_id(0)
-    rows = (pid * R + tl.arange(0, R)).to(tl.int64)            # int64: M rows x row stride may exceed 2^31
-    rv = rows < M
-    rm = rv[:, None]
-    cols = tl.arange(0, CH)[None, :]
-    px = X + rows[:, None] * sx + cols
-    pz = Z + rows[:, None] * sz + cols
-    acc = tl.zeros((R, CH), dtype=tl.float32)
-    for c in range(NCH):
-        x = tl.load(px + c * CH, mask=rm, other=0.).to(tl.float32)
-        z = tl.load(pz + c * CH, mask=rm, other=0.).to(tl.float32)
-        g = x * (z * tl.sigmoid(z))
-        acc += g * g
-    rstd = 1 / tl.sqrt(tl.sum(acc, axis=1) / N + eps)
-    tl.store(Rstd + rows, rstd, mask=rv)
-    r2 = rstd[:, None]
-    pxo = XO + rows[:, None] * sxo + cols
-    py = Y + rows[:, None] * sy + cols
-    for c in range(NCH):
-        x = tl.load(px + c * CH, mask=rm, other=0.).to(tl.float32)
-        z = tl.load(pz + c * CH, mask=rm, other=0.).to(tl.float32)
-        w = tl.load(W + c * CH + cols).to(tl.float32)
-        th = tl.load(TH + c * CH + cols)
-        ga = tl.load(GA + c * CH + cols)
-        y = ((x * (z * tl.sigmoid(z))) * r2) * w
-        if STORE_N:
-            tl.store(py + c * CH, y, mask=rm)
-        v = _sr_bf16_to_f32(_sr_f32_to_bf16(y))
-        sv, av, bv = _sr_release(v, th)
-        tl.store(pxo + c * CH, _sr_f32_to_bf16(_sr_mul_rn(sv, ga)), mask=rm)
 
 
 # ------------------------------------------------------------------------------------------------ kernels
@@ -209,24 +168,6 @@ def _soma_operands(x, weight, z, theta, gamma, what):
             raise RuntimeError(f"neuronspark.{what}: {name} must be a contiguous float32 ({N},) tensor on {x.device}, got "
                                f"{t.dtype} {tuple(t.shape)} {t.device}")
     return M, N
-
-
-def gated_norm_soma_fwd(x, weight, eps, z, theta, gamma):
-    """(x_soma (M, N) bf16, rstd (M,) fp32, n (M, N) bf16): see the module docstring."""
-    require_cuda(x, "gated_norm_soma_fwd")
-    M, N = _soma_operands(x, weight, z, theta, gamma, "gated_norm_soma_fwd")
-    R, nw, CH = SOMA_FWD_CFG
-    nch = N // CH
-    if N != nch * CH or nch < 1:
-        raise RuntimeError(f"neuronspark.gated_norm_soma_fwd: N = {N} is not NCH x CH with CH = {CH}")
-    xo = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
-    n = torch.empty((M, N), dtype=x.dtype, device=x.device)
-    rstd = torch.empty((M,), dtype=torch.float32, device=x.device)
-    with torch.cuda.device(x.device.index):
-        _gated_norm_soma_fwd_kernel[(triton.cdiv(M, R),)](
-            x, xo, n, weight, z, theta, gamma, rstd, x.stride(0), xo.stride(0), n.stride(0), z.stride(0), M, N, nch,
-            float(eps), R=R, CH=CH, STORE_N=True, num_warps=nw)
-    return xo, rstd, n
 
 
 def _soma_bwd(dx, n, theta, gamma, alpha, gn, gtheta, ggamma):

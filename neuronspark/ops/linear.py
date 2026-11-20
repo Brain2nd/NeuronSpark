@@ -30,6 +30,9 @@ Numerics contract (training, whole-row regime):
   accumulation stored as it is, no bf16 output widened by a second kernel; a GEMM with an fp32 result exists on CUDA
   only, elsewhere the bf16 product is widened).
 * first-order gradients only: the GEMMs with an fp32 result have no derivative of their own.
+* activation recomputation (``torch.utils.checkpoint``, non-reentrant): the second forward of a recomputed function
+  hands the saved operands to the node of the first forward.  :func:`linear_operands` saves them without the product,
+  for the function's last product (the backward reads a product's operands, not its output).
 * an output-feature count N that is not a multiple of 8 (the odd vocabulary of the tied readout, 151,669) runs the three
   GEMMs on a padded layout: P = N rounded up to a multiple of 128 (151,680), the bf16 weight
   ``wp = [weight.to(bf16); 0]`` (P, K) with zero pad rows; forward ``F.linear(xb, wp)`` (..., P) whose pad columns are
@@ -65,7 +68,9 @@ import torch.nn.functional as F
 
 __all__ = [
     "Fp32WgradLinearFn",
+    "LinearOperandsFn",
     "linear",
+    "linear_operands",
     "linear_ref",
     "cache_bf16_",
     "drop_bf16_",
@@ -297,6 +302,22 @@ def _train_bf16(weight: torch.Tensor) -> Optional[torch.Tensor]:
     return w
 
 
+def _operands(x: torch.Tensor, weight: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``(xb, wb)``: the bf16 operands of the training GEMMs, the two tensors the operator saves for its backward, in
+    this order: the input in bf16 and the weight's ``(padded_extent(N), K)`` bf16 operand."""
+    xb = x.to(torch.bfloat16)
+    n, k = int(weight.shape[0]), int(weight.shape[1])
+    p = padded_extent(n)
+    wb = _train_bf16(weight)                         # the (p, k) copy the weight's owner maintains, or None
+    if wb is None and p == n:
+        wb = weight.to(torch.bfloat16)
+    elif wb is None:
+        wb = torch.empty((p, k), dtype=torch.bfloat16, device=weight.device)
+        wb[:n].copy_(weight)                         # RNE fp32 -> bf16: the bits of weight.to(bf16)
+        wb[n:].zero_()
+    return xb, wb
+
+
 # ------------------------------------------------------------------------------------------------ autograd Function
 class Fp32WgradLinearFn(torch.autograd.Function):
     """``y = x @ W^T`` with bf16 operands, bf16 output, fp32 weight gradient, input gradient in ``x.dtype``.
@@ -308,16 +329,8 @@ class Fp32WgradLinearFn(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        xb = x.to(torch.bfloat16)
-        n, k = int(weight.shape[0]), int(weight.shape[1])
-        p = padded_extent(n)
-        wb = _train_bf16(weight)                     # the (p, k) copy the weight's owner maintains, or None
-        if wb is None and p == n:
-            wb = weight.to(torch.bfloat16)
-        elif wb is None:
-            wb = torch.empty((p, k), dtype=torch.bfloat16, device=weight.device)
-            wb[:n].copy_(weight)                     # RNE fp32 -> bf16: the bits of weight.to(bf16)
-            wb[n:].zero_()
+        xb, wb = _operands(x, weight)
+        n = int(weight.shape[0])
         out = F.linear(xb, wb)
         if out.dtype != torch.bfloat16:
             raise RuntimeError(f"neuronspark.ops.linear: the GEMM produced {out.dtype}, expected bf16 (an fp16 "
@@ -359,7 +372,36 @@ class Fp32WgradLinearFn(torch.autograd.Function):
         return dx, dw
 
 
-# ------------------------------------------------------------------------------------------------ public function
+class LinearOperandsFn(torch.autograd.Function):
+    """The tensors :class:`Fp32WgradLinearFn` saves for its backward, saved in the same order, without the product
+    (:func:`linear_operands`).  The output is an empty tensor; the node has no backward."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        xb, wb = _operands(x, weight)
+        ctx.save_for_backward(xb, wb)
+        return xb.new_empty(0)
+
+    @staticmethod
+    def backward(ctx, dy: torch.Tensor):
+        raise RuntimeError("neuronspark.ops.linear: linear_operands() forms no product and has no backward (it stands "
+                           "for linear() in the second forward of an activation recomputation only)")
+
+
+# ------------------------------------------------------------------------------------------------ public functions
+def linear_operands(x: torch.Tensor, weight: torch.Tensor) -> None:
+    """``linear(x, weight)`` in the second forward of an activation recomputation (``torch.utils.checkpoint`` with
+    ``use_reentrant=False``), for a product that no tensor saved by the recomputed function depends on (its last
+    operator, whose output only leaves the function): the backward node of the first forward reads the two operands,
+    which this call saves as :func:`linear` does (the same tensors in the same order; none when :func:`linear` would
+    run without autograd), and the GEMM is not run.  Returns nothing."""
+    _check(x, weight)
+    if torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad):
+        if weight.dtype != torch.float32:
+            raise RuntimeError(f"neuronspark.ops.linear: a trained weight must be fp32, got {weight.dtype}")
+        LinearOperandsFn.apply(x, weight)
+
+
 def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``x (..., K)`` fp32 / bf16, ``weight (N, K)`` fp32 -> ``(..., N)`` bf16.
 

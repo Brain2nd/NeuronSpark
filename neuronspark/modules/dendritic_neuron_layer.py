@@ -33,7 +33,8 @@ Regimes (the caller picks one per call; :class:`DendriticNeuronLayer` dispatches
   the (B * T, D) rows (one GEMM; a B-major stream makes the transposed view contiguous) -> ``dendritic_chunk_scan_soma``
   (conv, chunked scan, gated norm and soma in one autograd Function) -> ``linear`` with W_out -> the residual addition,
   or, when the next layer is a dendritic neuron layer, ``dendritic_resid_norm`` (the addition and the next layer's
-  pre-norm in one operator).
+  pre-norm in one operator).  The second forward of an activation recomputation (``recomputed=True``) ends when the
+  out-projection's operands are saved: no backward node reads its product or the layer's output.
 * prefill (inference, T >= 2, carried state): ``dendritic_prenorm_rows`` -> bf16 GEMM with W_in on the (B, T, D) view of
   the T-major stream -> ``dendritic_conv_silu_prefill`` from the carried conv tail -> ``dendritic_chunk_scan_prefill``
   from the carried state (the final state is written back in the cache's storage dtype) -> ``dendritic_gated_norm_soma``
@@ -80,6 +81,7 @@ import torch.nn.functional as F
 from neuronspark import ops as _ops
 from neuronspark.modules import mechanism_init_seed
 from neuronspark.modules.linear import Linear
+from neuronspark.ops.linear import linear_operands
 from neuronspark.utils.cache import DendriticState, WeightConstants, resolve_dendritic_state_dtype
 
 __all__ = [
@@ -120,10 +122,11 @@ class DendriticNeurons(nn.Module):
     dendritic membrane state, gated RMSNorm, bipolar soma, gamma, W_out, and the fp32 residual addition (see the module
     docstring).
 
-    ``forward(h, state=None, *, hn=None, next_norm_gain=None) -> (h_new, hn_next)``: ``state`` None runs the whole-row
-    regime (``hn_next`` is the bf16 pre-norm of ``h_new`` for the next dendritic neuron layer when ``next_norm_gain`` is
-    given, else None); with an :class:`DendriticState` it runs prefill (T >= 2) or the decode step (T == 1) and
-    ``hn_next`` is None.
+    ``forward(h, state=None, *, hn=None, next_norm_gain=None, recomputed=False) -> (h_new, hn_next)``: ``state`` None
+    runs the whole-row regime (``hn_next`` is the bf16 pre-norm of ``h_new`` for the next dendritic neuron layer when
+    ``next_norm_gain`` is given, else None; ``recomputed=True`` is the second forward of an activation recomputation,
+    see :meth:`forward_whole_row`); with an :class:`DendriticState` it runs prefill (T >= 2) or the decode step
+    (T == 1) and ``hn_next`` is None.
     """
 
     def __init__(
@@ -312,27 +315,38 @@ class DendriticNeurons(nn.Module):
 
     # ------------------------------------------------------------------------------------------------ regimes
     def forward(self, h: torch.Tensor, state: Optional[DendriticState] = None, *, hn: Optional[torch.Tensor] = None,
-                next_norm_gain: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                next_norm_gain: Optional[torch.Tensor] = None, recomputed: bool = False
+                ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if state is None:
-            return self.forward_whole_row(h, hn=hn, next_norm_gain=next_norm_gain)
-        if hn is not None or next_norm_gain is not None:
-            raise ValueError(f"DendriticNeurons (layer {self.layer_idx}): hn / next_norm_gain belong to the whole-row "
-                             "regime")
+            return self.forward_whole_row(h, hn=hn, next_norm_gain=next_norm_gain, recomputed=recomputed)
+        if hn is not None or next_norm_gain is not None or recomputed:
+            raise ValueError(f"DendriticNeurons (layer {self.layer_idx}): hn / next_norm_gain / recomputed belong to "
+                             "the whole-row regime")
         self._check_stream(h)
         if int(h.shape[0]) == 1:
             return self.step(h, state), None
         return self.forward_prefill(h, state), None
 
     def forward_whole_row(self, h: torch.Tensor, *, hn: Optional[torch.Tensor] = None,
-                          next_norm_gain: Optional[torch.Tensor] = None
-                          ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                          next_norm_gain: Optional[torch.Tensor] = None, recomputed: bool = False
+                          ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Whole-row regime: ``h`` (T, B, D) fp32 (unit last stride; B-major in training) -> ``(h_new, hn_next)``.
 
         ``hn``: this mixer's bf16 pre-norm of ``h`` (T, B, D) as returned by the previous dendritic neuron layer's join,
         else it is formed here.  ``next_norm_gain``: the pre-norm gain of the next layer's mixer when that layer is a
         dendritic layer (the join ``dendritic_resid_norm`` then returns ``hn_next``); None ends with ``h +
         upd.float()``.  Differentiable.
+
+        ``recomputed=True``: the second forward of an activation recomputation (``torch.utils.checkpoint`` around a
+        call with neither ``hn`` nor ``next_norm_gain``), whose saved tensors serve the backward nodes of the first.  It
+        runs the same operators on the same input up to the out-projection, whose operands are saved without the
+        product (:func:`neuronspark.ops.linear.linear_operands`; the reference implementation runs its product), and
+        returns ``(None, None)``: no backward node reads the product, the residual addition or the layer's output.
+        The probe is not read again.
         """
+        if recomputed and (hn is not None or next_norm_gain is not None):
+            raise ValueError(f"DendriticNeurons (layer {self.layer_idx}): a recomputed layer forms its own pre-norm and "
+                             "ends with the residual addition (no hn / next_norm_gain)")
         self._check_stream(h)
         self._check_params()
         T, B, Dm = (int(s) for s in h.shape)
@@ -350,6 +364,9 @@ class DendriticNeurons(nn.Module):
         zxbcdt = o.linear(hn.transpose(0, 1).reshape(B * T, Dm), self.in_proj.weight).view(B, T, self.proj_dim)
         xs = o.dendritic_chunk_scan_soma(zxbcdt, self.conv_weight, self.conv_bias, self.dt_bias, self.A(), self.D,
                                   self.theta(), self.gamma, alpha=self.surrogate_alpha, chunk_size=self.chunk_size)
+        if recomputed:
+            (linear_operands if self.impl == "kernel" else o.linear)(xs, self.W_out)
+            return None, None
         if self.probe is not None:
             self.probe.dendritic(self, zxbcdt, xs)
         upd = o.linear(xs, self.W_out).view(B, T, Dm).transpose(0, 1)                   # (T, B, D) bf16
@@ -428,10 +445,11 @@ class DendriticNeuronLayer(nn.Module):
     """A dendritic neuron layer of the stack (default configuration: 18 instances, ``layers.{i}`` for i not in (3, 7,
     ..., 23)): ``mixer_a`` and the fp32 residual addition.
 
-    ``forward(h, inference_params=None, *, hn=None, next_norm_gain=None) -> (h, hn_next | None)``:
+    ``forward(h, inference_params=None, *, hn=None, next_norm_gain=None, recomputed=False) -> (h, hn_next | None)``:
 
     * ``inference_params`` None: the whole-row regime of :meth:`DendriticNeurons.forward_whole_row` (``hn`` /
-      ``next_norm_gain`` thread the join between consecutive dendritic neuron layers);
+      ``next_norm_gain`` thread the join between consecutive dendritic neuron layers; ``recomputed=True`` is the second
+      forward of an activation recomputation and returns ``(None, None)``);
     * ``inference_params`` given: the layer's state ``inference_params.layers[layer_idx]`` (an :class:`DendriticState`)
       is read and advanced in place; T == 1 runs the decode step, T >= 2 the prefill; ``hn_next`` is None.
     """
@@ -472,12 +490,13 @@ class DendriticNeuronLayer(nn.Module):
         return self.mixer_a.linear_weights()
 
     def forward(self, h: torch.Tensor, inference_params=None, *, hn: Optional[torch.Tensor] = None,
-                next_norm_gain: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                next_norm_gain: Optional[torch.Tensor] = None, recomputed: bool = False
+                ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if inference_params is None:
-            return self.mixer_a.forward_whole_row(h, hn=hn, next_norm_gain=next_norm_gain)
-        if hn is not None or next_norm_gain is not None:
-            raise ValueError(f"DendriticNeuronLayer {self.layer_idx}: hn / next_norm_gain belong to the whole-row "
-                             "regime")
+            return self.mixer_a.forward_whole_row(h, hn=hn, next_norm_gain=next_norm_gain, recomputed=recomputed)
+        if hn is not None or next_norm_gain is not None or recomputed:
+            raise ValueError(f"DendriticNeuronLayer {self.layer_idx}: hn / next_norm_gain / recomputed belong to the "
+                             "whole-row regime")
         layers = getattr(inference_params, "layers", None)
         if layers is None or self.layer_idx not in layers:
             raise RuntimeError(f"DendriticNeuronLayer {self.layer_idx}: the inference cache holds no state for this "

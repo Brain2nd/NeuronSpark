@@ -35,7 +35,8 @@ Activation checkpointing (whole row with autograd): ``gradient_checkpointing = T
 neuron layer in backward, an integer ``k`` the first ``k`` dendritic neuron layers (the memory of the others stays
 resident: the setting between none and all that a memory budget allows), ``use_reentrant=False,
 preserve_rng_state=False``.  A checkpointed dendritic neuron layer forms its own pre-norm (the dendritic-layer ->
-dendritic-layer join, in which a layer prepares the next one's pre-norm, is not used into or out of it).  The
+dendritic-layer join, in which a layer prepares the next one's pre-norm, is not used into or out of it); its second
+forward ends when the out-projection's operands are saved, without the product (``recomputed=True`` of the layer).  The
 hippocampal layers stay resident unless ``hippocampal_checkpointing = True`` as well, with every dendritic neuron layer
 recomputed: then each hippocampal layer keeps only its inputs and is recomputed in backward (its pool attention's
 T x T probabilities are not held across the layers: long rows); the copy-switch operands are collected in the forward
@@ -288,7 +289,7 @@ class NeuronSparkModel(nn.Module):
                         x, carry = layer(x, lex=lex, ind=ind, copy=copy, carry=carry, aux_out=aux_out, calib=calib)
                     continue
                 if ckpt[i]:
-                    x, _ = checkpoint(layer, x, None, use_reentrant=False, preserve_rng_state=False)
+                    x = self._recomputed_dendritic(layer, x)
                     continue
                 nxt = self.layers[i + 1] if i + 1 < n_layers else None
                 joined = isinstance(nxt, DendriticNeuronLayer) and not ckpt[i + 1]
@@ -299,6 +300,21 @@ class NeuronSparkModel(nn.Module):
                                    "layer consumed")
             x = self.norm(x)
         return x.transpose(0, 1)                                             # (B, T, D)
+
+    @staticmethod
+    def _recomputed_dendritic(layer, x):
+        """A dendritic neuron layer under checkpoint: ``x`` -> the layer's output.  The checkpointed function is called
+        once here (the forward) and again by every backward (a recomputation: the layer's second forward, which stops
+        before the out-projection's product); what tells the two apart is set after the forward has returned, so the
+        function itself writes nothing."""
+        forward_done = [False]
+
+        def run(h):
+            return layer(h, recomputed=forward_done[0])
+
+        out, _ = checkpoint(run, x, use_reentrant=False, preserve_rng_state=False)
+        forward_done[0] = True
+        return out
 
     @staticmethod
     def _hippocampal_once(layer, lex, ind, copy, aux_out, calib):

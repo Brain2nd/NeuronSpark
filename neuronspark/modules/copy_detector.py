@@ -19,9 +19,11 @@ Numerics per regime: the score matrix is an fp32 einsum, so it runs in TF32 unde
 inside.  Inference keeps one ring of unit operands (:class:`~neuronspark.utils.cache.CopyState` ``u`` (B, W, 96)): a
 call writes its operands at slots ``(ring_ptr + t) % W`` and scores its queries against every slot whose event lies at
 a row position in ``[start_b, t - 2]`` (``start_b = ring_ptr - pos_b``, the row's first event: 0 for every row of a
-cache started with the batch).  A call (a prefill or one decode token) forms and reduces the scores with the operator
+cache started with the batch).  A prefill call (T >= 2) forms and reduces the scores with the operator
 ``copy_stats_prefill`` (:mod:`neuronspark.ops.triton.copy_stats`: one kernel, online max / logsumexp over ring tiles,
-the score dot at ``tf32x3`` precision; ``impl="ref"`` takes its torch chain).
+the score dot at ``tf32x3`` precision); a decode step (T == 1) runs ``copy_stats_step``
+(:mod:`neuronspark.ops.triton.copy_step`: the token's operand written and scored over ring tiles in parallel, the
+partial statistics merged).  ``impl="ref"`` takes their torch chains.
 """
 from __future__ import annotations
 
@@ -98,7 +100,8 @@ def copy_stats_session(lex_t: torch.Tensor, state: CopyState, ring_ptr: torch.Te
     the call's unit operands are written into ``state.u`` (B, W, d) at ``(ring_ptr + t) % W`` first.  ``ring_ptr``
     (1,) int64 and ``pos`` (B,) int64 are the counters at the start of the call (tokens consumed before it).  ``ops``:
     the operator namespace of the model (:func:`neuronspark.ops.namespace`; None = the kernels), whose
-    ``copy_stats_prefill`` forms and reduces the scores of the call (a prefill or one decode token)."""
+    ``copy_stats_prefill`` forms and reduces the scores of a call of T >= 2 tokens and whose ``copy_stats_step``
+    serves one decode token (the normalisation and the ring write included)."""
     ring = state.u
     B, Wr, d = (int(s) for s in ring.shape)
     if Wr != int(W):
@@ -113,13 +116,20 @@ def copy_stats_session(lex_t: torch.Tensor, state: CopyState, ring_ptr: torch.Te
         raise RuntimeError("copy_stats_session: ring_ptr must be a (1,) int64 device tensor")
     if tuple(pos.shape) != (B,):
         raise RuntimeError(f"copy_stats_session: pos must be ({B},), got {tuple(pos.shape)}")
+    o = namespace("kernel") if ops is None else ops
     with torch.autocast(z.device.type, enabled=False):
+        if T == 1:
+            # one decode token: the normalisation, the ring write, the scores and their reduction in one operator
+            z1 = z[0].float()
+            if z1.stride(-1) != 1:
+                z1 = z1.contiguous()
+            maximum, lse = o.copy_stats_step(z1, ring, ring_ptr, pos.to(torch.int64).contiguous())
+            return CopyStats(maximum, lse)
         u = F.normalize(z.float(), dim=-1)                                # the whole row's normalisation, per row
         steps = torch.arange(T, device=z.device, dtype=torch.int64)
         slots = (ring_ptr + steps) % Wr
         ring.index_copy_(1, slots, u.transpose(0, 1))
         # the scores and their reduction in one operator (online max / logsumexp over ring tiles)
-        o = namespace("kernel") if ops is None else ops
         maximum, lse = o.copy_stats_prefill(ring, ring_ptr, pos.to(torch.int64).contiguous(), T)
         return CopyStats(maximum, lse)
 

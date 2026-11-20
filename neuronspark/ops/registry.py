@@ -303,7 +303,7 @@ def check_all_signatures(names: Iterable[str] = ()) -> None:
 # mix), registered into OPS after the main table.
 _HIPPOCAMPAL_PREFILL_SPECS: List[OpSpec] = [
     _op("copy_stats_prefill", _T + "copy_stats", "ring ring_ptr pos T",
-        "(maximum, lse) each (T, B) fp32 contiguous; -inf where a query has no valid slot", "prefill decode",
+        "(maximum, lse) each (T, B) fp32 contiguous; -inf where a query has no valid slot", "prefill",
         doc="ring (B, W, 96) fp32 unit operands (the call's own written at (ring_ptr + t) % W), ring_ptr (1,) int64 "
             "pointer at the call's start, pos (B,) int64 tokens before the call, T the call's tokens"),
     _op("xq_queries_prefill", _T + "xq_query", "qs psi head_gain cos sin",
@@ -375,6 +375,10 @@ _DECODE_STEP_SPECS: List[OpSpec] = [
     _op("pkm_value_step", _T + "pkm_step", "w u values gain glog eps",
         "(B, 768) bf16", "decode",
         doc="w (B, 64) fp32, u (B, 64) int64, values (16384, 768) fp32, gain (768,) fp32, glog (B, 768) bf16, eps 1e-6"),
+    _op("copy_stats_step", _T + "copy_step", "z ring ring_ptr pos",
+        "(maximum, lse) each (1, B) fp32; -inf where the row has no valid slot", "decode", mutates="ring",
+        doc="z (B, 96) fp32 order-1 slice of the token's lexical vector, ring (B, W, 96) fp32 unit operands (the "
+            "token's written at ring_ptr % W), ring_ptr (1,) int64, pos (B,) int64 tokens before this one"),
     _op("lex_read_step", _T + "lex_read_step", "h q_raw k_raw o q_gain k_gain beta eps eps_z",
         "(h' (B, 1536) fp32, h' bf16, z (B, 1536) fp32 frozen norm of h', z bf16)", "decode",
         doc="h (B, 1536) fp32, q_raw / k_raw (B, 64) bf16, o (B, 1536) bf16, q_gain / k_gain (64,) fp32, beta (1,) "

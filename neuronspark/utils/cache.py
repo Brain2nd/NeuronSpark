@@ -44,6 +44,8 @@ __all__ = [
     "InductionState",
     "CopyState",
     "InferenceParams",
+    "WeightConstants",
+    "weight_constants",
     "resolve_dendritic_state_dtype",
     "announce_dendritic_state_dtype",
     "RING_MULTIPLE",
@@ -86,6 +88,44 @@ def announce_dendritic_state_dtype(dtype: torch.dtype) -> None:
 
 def _zeros(shape, dtype, device) -> torch.Tensor:
     return torch.zeros(shape, dtype=dtype, device=device)
+
+
+# ------------------------------------------------------------------------------------------------ weight constants
+class WeightConstants:
+    """Values of a module that depend on its parameters and buffers only (a gain ``exp(log_gain)``, a threshold
+    ``floor + softplus(rho)``), formed once per weight version for the decode step instead of once per token.
+
+    ``get(sources, build)`` returns ``build()`` (a tuple of tensors, evaluated without autograd) and keeps it until
+    the version counter, the storage or the device of one of ``sources`` changes.  A documented cache: a captured
+    decode step reads the kept tensors, so :class:`neuronspark.utils.generation.DecodeGraph` holds them
+    (:func:`weight_constants`) for as long as it holds the capture."""
+
+    __slots__ = ("_key", "_value")
+
+    def __init__(self) -> None:
+        self._key = None
+        self._value: Tuple[torch.Tensor, ...] = ()
+
+    def get(self, sources, build) -> Tuple[torch.Tensor, ...]:
+        key = tuple((int(t._version), int(t.data_ptr()), t.device) for t in sources)
+        if key != self._key:
+            with torch.no_grad():
+                self._value = tuple(build())
+            self._key = key
+        return self._value
+
+    def tensors(self) -> Tuple[torch.Tensor, ...]:
+        return self._value
+
+
+def weight_constants(model) -> List[torch.Tensor]:
+    """Every tensor currently kept by the :class:`WeightConstants` of ``model``'s modules."""
+    out: List[torch.Tensor] = []
+    for module in model.modules():
+        for value in vars(module).values():
+            if isinstance(value, WeightConstants):
+                out.extend(value.tensors())
+    return out
 
 
 # ------------------------------------------------------------------------------------------------ per-layer states

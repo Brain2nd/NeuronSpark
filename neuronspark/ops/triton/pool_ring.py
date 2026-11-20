@@ -25,13 +25,11 @@ Operators (each: private launcher, ``torch.library`` custom op with a fake, publ
     fp32 and rounded to bf16.  Only the row's live slots are read: the ``L = min(pos + 1, W)`` slots ending at this
     step's slot ``ring_ptr % W`` (every other slot has an infinite clock: weight 0 in the softmax).  Deterministic (fixed
     chunk order, no atomics). Compiled without FMA contraction. The hippocampal layer reads the ring with this kernel at
-    decode batch sizes 1 and 32 (``RING_READ_KERNEL_BATCHES``); at the other sizes it reads with the torch expression
-    chain (the module's own torch form), which ``ring_read_t1_ref`` evaluates.
+    every decode batch size; ``ring_read_t1_ref`` evaluates the torch expression chain of the read.
 ``xq_form_t1``  decode step: the last head's extra-query formation in one kernel per (row, query): the rank-r
     projection (bf16 operands, fp32 sum, bf16 result), SiLU (bf16 result), interleaved RoPE in bf16 arithmetic (each
     product and sum rounded to bf16), L2 normalisation, division and the gain ``exp(clamp(psi, -3, 3)) * head_gain`` in
-    fp32, one rounding to bf16 at the store.  The hippocampal layer uses it at the decode batch sizes whose ring read is
-    the torch chain.
+    fp32, one rounding to bf16 at the store (the rounding the ring read applies to its queries).
 ``ring_write_prefill``  prefill (T >= 2): the call's ring write as one kernel over the (t, b, h) rows: the k row's fp32
     norm (Triton's row sum of the squares, sqrt), ``max(norm, 1e-12)``, the fp32 division, one rounding to bf16 into
     ``pool_k``; the q row the same way times the head's fp32 gain, stored fp32 (the recall's query); the fp32 gate
@@ -72,21 +70,18 @@ from neuronspark.ops.triton._ptx import (  # noqa: F401  (Triton resolves the he
 )
 
 __all__ = [
-    "RING_READ_KERNEL_BATCHES", "RING2_QUERY_ROWS", "RING2_CONFIGS", "XQ_FORM_WARPS", "RING_WRITE_HEAD_DIM",
+    "RING2_QUERY_ROWS", "RING2_CONFIGS", "XQ_FORM_WARPS", "RING_WRITE_HEAD_DIM",
     "RING_WRITE_ROWS", "RING_WRITE_WARPS", "RECALL_BT", "RECALL_BT_SHORT", "RECALL_BW", "RECALL_WARPS",
     "RECALL_STAGES", "RECALL_STATS_SPLIT", "RECALL_STATS_WARPS", "RECALL_STATS_STAGES", "RECALL_VALUE_WARPS", "RECALL_VALUE_STAGES",
     "RECALL_VALUE_BDV",
-    "ring_read_t1_takes", "ring_read_t1", "ring_read_t1_ref",
+    "ring_read_t1", "ring_read_t1_ref",
     "xq_form_t1", "xq_form_t1_ref", "xq_weight_stack", "xq_head_gain",
     "ring_write_prefill", "ring_write_prefill_ref",
     "ring_recall_prefill", "ring_recall_prefill_ref",
 ]
 
 # ================================================================================================ fixed launch constants
-# Decode ring read (split-W): the decode batch sizes at which the hippocampal layer reads the ring with this kernel; at
-# every
-# other size it reads with the torch expression chain of the hippocampal layer.
-RING_READ_KERNEL_BATCHES = (1, 32)
+# Decode ring read (split-W).
 # query rows of a program's dot tile: row 0 the head's query, rows 1..M the extra queries of the last head (padded)
 RING2_QUERY_ROWS = 16
 # (largest decode batch, live slots per program, slots per tile, warps, stages); the first row with b <= its bound
@@ -334,11 +329,6 @@ def _ring_t1_partials2_fake(qb, qx, pool_k, pool_gv, pool_cum, cum_t, pos, ring_
     _, ns, _, nr = _ring2_shapes(B, H, W, int(mx))
     return (pool_k.new_empty((B, nr, ns, int(pool_gv.shape[-1])), dtype=torch.float32),
             pool_k.new_empty((B, nr, ns, 2), dtype=torch.float32))
-
-
-def ring_read_t1_takes(batch_size: int) -> bool:
-    """True at the decode batch sizes whose ring read is :func:`ring_read_t1` (``RING_READ_KERNEL_BATCHES``)."""
-    return int(batch_size) in RING_READ_KERNEL_BATCHES
 
 
 def _t1_matches(matches: Optional[Sequence[torch.Tensor]]) -> List[torch.Tensor]:

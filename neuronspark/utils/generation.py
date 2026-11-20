@@ -31,7 +31,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from neuronspark.utils.cache import InferenceParams, RING_MULTIPLE, resolve_dendritic_state_dtype
+from neuronspark.utils.cache import InferenceParams, RING_MULTIPLE, resolve_dendritic_state_dtype, weight_constants
 
 __all__ = ["DecodeOutput", "DecodeGraph", "PrefillGraph", "GenerationMixin", "decode", "next_tokens",
            "repetition_penalty_", "ring_capacity", "prepare_decode_graph", "prepare_prefill_graph"]
@@ -99,6 +99,7 @@ class DecodeGraph:
         self.tokens: Optional[torch.Tensor] = None     # static input (B, 1)
         self.logits: Optional[torch.Tensor] = None     # static output (B, 1, V)
         self.bf16_weights: list = []                    # the bf16 weight copies the graph reads, kept alive with it
+        self.constants: list = []                       # the modules' weight constants the graph reads, likewise
 
     @staticmethod
     def _weights(model) -> Tuple:
@@ -123,6 +124,7 @@ class DecodeGraph:
             self.pool = torch.cuda.graphs.graph_pool_handle()
             self._capture(model, int(warmup_steps))
             self.bf16_weights = [w for w in (getattr(p, "_ns_bf16", None) for p in model.parameters()) if w is not None]
+            self.constants = weight_constants(model)
             self.key = (device, dtype, int(batch_size), self._weights(model))
         self.params.reset()
         return self.params
@@ -131,6 +133,7 @@ class DecodeGraph:
         self.key = self.params = self.graph = self.pool = self.tokens = self.logits = None
         self.capacity = 0
         self.bf16_weights = []
+        self.constants = []
         gc.collect()
 
     @torch.no_grad()

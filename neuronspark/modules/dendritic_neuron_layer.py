@@ -41,7 +41,8 @@ Regimes (the caller picks one per call; :class:`DendriticNeuronLayer` dispatches
   ``dendritic_res_add``, the residual addition of the transposed GEMM output (the bf16 operand converted exactly to
   fp32, one row-coalesced kernel).
 * decode (inference, T == 1): ``dendritic_prenorm_rows`` -> bf16 GEMM -> ``dendritic_step_core`` (conv tail roll, state
-  update in the state's storage dtype, gated norm, soma) -> bf16 GEMM -> the residual addition.
+  update in the state's storage dtype, gated norm, soma) -> bf16 GEMM -> the residual addition; ``A`` and ``theta`` are
+  read from a per-weight-version cache (:class:`neuronspark.utils.cache.WeightConstants`).
 
 Every operator is taken from the namespace chosen at construction (``impl="kernel"`` the kernels, ``impl="ref"`` the
 pure-torch references with the same signatures).  The inference GEMMs go through :func:`neuronspark.ops.linear.linear`
@@ -77,7 +78,7 @@ import torch.nn.functional as F
 from neuronspark import ops as _ops
 from neuronspark.modules import mechanism_init_seed
 from neuronspark.modules.linear import Linear
-from neuronspark.utils.cache import DendriticState, resolve_dendritic_state_dtype
+from neuronspark.utils.cache import DendriticState, WeightConstants, resolve_dendritic_state_dtype
 
 __all__ = [
     "DendriticNeurons",
@@ -203,6 +204,7 @@ class DendriticNeurons(nn.Module):
         self.W_out = nn.Parameter(torch.empty(self.d_model, self.d_inner, **f32))
         self.register_buffer("norm_ones", torch.ones(self.d_inner, **f32), persistent=False)
         self.rho = nn.Parameter(torch.empty(self.d_inner, **f32))
+        self._step_constants = WeightConstants()         # (A, theta) of the decode step, per weight version
         if init == "launch":
             self.reset_parameters()
 
@@ -403,9 +405,9 @@ class DendriticNeurons(nn.Module):
             hc = hc.contiguous()
         hn = o.dendritic_prenorm_rows(hc, self.pre_norm_gain, self.norm_eps)                    # (B, D) bf16
         proj = o.linear(hn, self.in_proj.weight)                                         # (B, 18832) bf16
-        xs = o.dendritic_step_core(proj, state.conv, state.ssm, self.conv_weight, self.conv_bias, self.A(),
-                                   self.dt_bias,
-                            self.D, self.theta(), self.gamma, self.norm_eps)             # (B, 9216) bf16
+        A, theta = self._step_constants.get((self.A_log, self.rho), lambda: (self.A(), self.theta()))
+        xs = o.dendritic_step_core(proj, state.conv, state.ssm, self.conv_weight, self.conv_bias, A, self.dt_bias,
+                                   self.D, theta, self.gamma, self.norm_eps)             # (B, 9216) bf16
         out = hc + o.linear(xs, self.W_out).float()
         return out[None]
 

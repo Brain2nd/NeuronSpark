@@ -52,6 +52,7 @@ __all__ = [
     "cache_bf16_",
     "drop_bf16_",
     "has_bf16_cache",
+    "inference_weight",
     "padded_extent",
     "inference_extent",
 ]
@@ -147,6 +148,13 @@ def drop_bf16_(param: torch.Tensor) -> None:
 
 def has_bf16_cache(param: torch.Tensor) -> bool:
     return getattr(param, _CACHE_ATTR, None) is not None
+
+
+def inference_weight(weight: torch.Tensor) -> torch.Tensor:
+    """The operand an inference kernel reads for ``weight`` (N, K): the (N, K) view of its current bf16 copy (raises on
+    a stale copy, as :func:`linear` does), or ``weight`` itself when it has none (the kernel then rounds it)."""
+    w = _cached_bf16(weight)
+    return weight if w is None else w[:int(weight.shape[0])]
 
 
 # ------------------------------------------------------------------------------------------------ autograd Function

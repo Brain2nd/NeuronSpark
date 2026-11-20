@@ -335,10 +335,11 @@ del _hippocampal_spec
 # The operators of the single-token step (one kernel per torch expression chain of the decode forms), registered into OPS
 # after the main table.
 _DECODE_STEP_SPECS: List[OpSpec] = [
-    _op("plif_step", _T + "plif_step", "x zp w_eta b_eta v_th v out_dtype",
-        "spikes S (B, C) out_dtype", "decode", mutates="v",
-        doc="x (B, C) fp32|bf16, zp (B, C) bf16 eta projection, w_eta / b_eta / v_th (C,) fp32, v (B, C) fp32 carried "
-            "membrane"),
+    _op("plif_step", _T + "plif_step", "x eta_V eta_U w_eta b_eta v_th v out_dtype run_sum count",
+        "spikes S (B, C) out_dtype", "decode", mutates="v run_sum",
+        doc="x (B, C) fp32|bf16, eta_V (rank, C) / eta_U (C, rank) fp32 eta projection, w_eta / b_eta / v_th (C,) "
+            "fp32, v (B, C) fp32 carried membrane; the centred neuron: run_sum (B, C) fp32 carried input sum, count "
+            "(B,) int64 tokens before this one"),
     _op("centred_step", _T + "plif_step", "x run_sum count out_dtype",
         "(B, C) in out_dtype", "decode", mutates="run_sum",
         doc="x (B, C), run_sum (B, C) fp32 carried sum, count (B,) int64 tokens before this one"),

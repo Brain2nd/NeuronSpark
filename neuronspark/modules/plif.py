@@ -26,9 +26,9 @@ Forms (one per regime; the module picks the form from its arguments):
   store rounding) -> the two eta linears -> ``ops.plif_gate_prefill`` (a, drive; it reads the bf16 projection and
   widens it on load, exactly as an fp32 cast would) -> ``ops.plif_scan_prefill``, which carries the membrane
   ``state.v`` in place;
-* step (``state`` given, T == 1, no autograd): ``ops.centred_step`` over the carried input sum (centred neuron,
-  written in bf16) -> the two eta linears -> ``ops.plif_step`` (the gate chain, one leaky step, the release and the
-  soft reset in one kernel; the membrane ``state.v`` updated in place).
+* step (``state`` given, T == 1, no autograd): ``ops.plif_step`` (the centring over the carried input sum for the
+  centred neuron, the two eta projections, the gate chain, one leaky step, the release and the soft reset in one
+  kernel; the membrane ``state.v`` and the input sum updated in place).
 
 Parameters (state-dict keys): ``w`` (C,) frozen launch seed of the retention, ``v_th`` (C,), ``w_eta`` (C,), ``b_eta``
 (C,), ``eta_V`` (rank, C), ``eta_U`` (C, rank).  ``b_eta`` is computed from ``w`` in the constructor
@@ -269,10 +269,12 @@ class PLIFNeuron(nn.Module):
 
     def _forward_step(self, x: torch.Tensor, state: PLIFState, pos: Optional[torch.Tensor],
                       out_dtype: torch.dtype) -> torch.Tensor:
-        """Single-token form: the centring (centred neuron; bf16, the operand dtype of the first eta linear), the two
-        eta linears and ``ops.plif_step``; the membrane (and the input sum) updated in place."""
-        o = self._ops
+        """Single-token form: ``ops.plif_step`` (the centring of the centred neuron, the two eta projections, the gate
+        chain, the leaky step, the release and the reset in one kernel); the membrane (and the input sum) updated in
+        place."""
         x2 = x[0]                                                           # (B, C)
-        xc = o.centred_step(x2, state.xsum, pos, torch.bfloat16) if self.centred else x2
-        zp = self._eta_projection(xc, contiguous=False)                    # (B, C) bf16, widened in the kernel
-        return o.plif_step(x2, zp, self.w_eta, self.b_eta, self.v_th, state.v, out_dtype).unsqueeze(0)
+        if self.centred:
+            return self._ops.plif_step(x2, self.eta_V, self.eta_U, self.w_eta, self.b_eta, self.v_th, state.v,
+                                       out_dtype, state.xsum, pos).unsqueeze(0)
+        return self._ops.plif_step(x2, self.eta_V, self.eta_U, self.w_eta, self.b_eta, self.v_th, state.v,
+                                   out_dtype).unsqueeze(0)

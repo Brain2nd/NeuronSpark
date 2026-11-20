@@ -6,6 +6,10 @@ Numerics contract (training, whole-row regime):
   output.  These are the operands bf16 autocast gives ``F.linear`` (an fp32 operand is cast with ``.to(bf16)``, a bf16
   operand passes through), i.e. the GEMM of the model's autocast forward; the two casts are made once and the same
   tensors are saved for backward.  The op does not depend on the autocast state.
+* forward of a weight with a bf16 training copy (:func:`bind_train_bf16_`: an optimizer that writes the bf16 values of
+  its weights with every update): the copy is the GEMM's weight operand, forward and backward, and no cast is made.
+  The copy holds ``weight.to(bf16)`` (and zero pad rows, see below) whenever the operator runs: its owner keeps it so,
+  and a weight modified in place after the copy was bound raises at the next training call until it is bound again.
 * weight gradient: ``dW = torch.mm(dy2.t(), x2, out_dtype=torch.float32)`` with ``dy2`` / ``x2`` the row-major
   ``(rows, N)`` / ``(rows, K)`` bf16 views of ``dy`` / the saved input: one GEMM with bf16 operands, fp32 accumulation
   and an fp32 result.  It is returned as the weight's gradient (fp32 ``.grad`` through AccumulateGrad); nothing is
@@ -71,6 +75,8 @@ __all__ = [
     "stacked_bands",
     "bind_grad_",
     "unbind_grad_",
+    "bind_train_bf16_",
+    "unbind_train_bf16_",
     "padded_extent",
     "inference_extent",
 ]
@@ -78,6 +84,8 @@ __all__ = [
 _CACHE_ATTR = "_ns_bf16"
 _VERSION_ATTR = "_ns_bf16_version"
 _GRAD_ATTR = "_ns_grad_buffer"
+_TRAIN_ATTR = "_ns_train_bf16"
+_TRAIN_VERSION_ATTR = "_ns_train_bf16_version"
 # training GEMMs of an output-feature count that is not a multiple of ALIGN run on the extent rounded up to PAD_MULTIPLE
 # (the tied readout's vocabulary: 151,669 -> 151,680)
 ALIGN = 8
@@ -249,6 +257,46 @@ def _bound_grad(weight: torch.Tensor) -> Optional[torch.Tensor]:
     return g
 
 
+# ------------------------------------------------------------------------------------------------ bf16 training copy
+def bind_train_bf16_(param: torch.Tensor, copy: torch.Tensor) -> None:
+    """Attach the bf16 training copy of ``param`` that its owner maintains: a contiguous bf16 tensor of shape
+    ``(padded_extent(N), K)`` on the weight's device whose first N rows hold ``param.to(bf16)`` and whose other rows
+    are zero.  The training branch reads it in place of a cast (see the module docstring).  The parameter's version
+    is recorded: after an in-place modification of the parameter the training branch raises until the copy is
+    brought up to date and bound again (a write through ``.data`` or through another tensor on the weight's memory
+    leaves the parameter's version as it is: the owner follows such a write itself).  The values are the caller's
+    responsibility and are not checked here."""
+    if param.dim() != 2 or param.dtype != torch.float32:
+        raise RuntimeError(f"bind_train_bf16_: expected a 2-D fp32 weight, got {tuple(param.shape)} {param.dtype}")
+    want = (padded_extent(param.shape[0]), int(param.shape[1]))
+    if copy.dtype != torch.bfloat16 or tuple(copy.shape) != want or copy.device != param.device \
+            or not copy.is_contiguous() or copy.requires_grad:
+        raise RuntimeError(f"bind_train_bf16_: the copy of a weight {tuple(param.shape)} on {param.device} must be a "
+                           f"contiguous bf16 tensor {want} on that device, got {copy.dtype} {tuple(copy.shape)} on "
+                           f"{copy.device}")
+    setattr(param, _TRAIN_ATTR, copy)
+    setattr(param, _TRAIN_VERSION_ATTR, param._version)
+
+
+def unbind_train_bf16_(param: torch.Tensor) -> None:
+    """Remove the bf16 training copy of ``param`` (no-op without one): the training branch casts the weight again."""
+    for name in (_TRAIN_ATTR, _TRAIN_VERSION_ATTR):
+        if hasattr(param, name):
+            delattr(param, name)
+
+
+def _train_bf16(weight: torch.Tensor) -> Optional[torch.Tensor]:
+    """The bf16 training copy of ``weight`` or None; raises when the weight was modified after the copy was bound."""
+    w = getattr(weight, _TRAIN_ATTR, None)
+    if w is None:
+        return None
+    if getattr(weight, _TRAIN_VERSION_ATTR, None) != weight._version:
+        raise RuntimeError("neuronspark.ops.linear: the bf16 training copy of a weight is stale (the weight was "
+                           "modified in place after bind_train_bf16_()); its owner must refresh the copy and bind it "
+                           "again")
+    return w
+
+
 # ------------------------------------------------------------------------------------------------ autograd Function
 class Fp32WgradLinearFn(torch.autograd.Function):
     """``y = x @ W^T`` with bf16 operands, bf16 output, fp32 weight gradient, input gradient in ``x.dtype``.
@@ -263,9 +311,10 @@ class Fp32WgradLinearFn(torch.autograd.Function):
         xb = x.to(torch.bfloat16)
         n, k = int(weight.shape[0]), int(weight.shape[1])
         p = padded_extent(n)
-        if p == n:
+        wb = _train_bf16(weight)                     # the (p, k) copy the weight's owner maintains, or None
+        if wb is None and p == n:
             wb = weight.to(torch.bfloat16)
-        else:
+        elif wb is None:
             wb = torch.empty((p, k), dtype=torch.bfloat16, device=weight.device)
             wb[:n].copy_(weight)                     # RNE fp32 -> bf16: the bits of weight.to(bf16)
             wb[n:].zero_()
@@ -278,6 +327,8 @@ class Fp32WgradLinearFn(torch.autograd.Function):
         ctx.out_features = n
         # a bound weight is kept for the backward, which accumulates into the buffer bound to it then
         ctx.bound_weight = weight if weight.requires_grad and _bound_grad(weight) is not None else None
+        # the weight operand is saved as it is, the owner's copy too (no copy is made of it): a write of it by a torch
+        # operation between this call and the backward is refused by autograd as for any saved tensor
         ctx.save_for_backward(xb, wb)
         return out
 

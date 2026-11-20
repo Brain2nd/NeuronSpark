@@ -418,8 +418,10 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
         self.config = config
         self.impl = impl
         self.backbone = NeuronSparkModel(config, device=device, dtype=dtype, impl=impl, init=init)
-        # the captured decode step of neuronspark.utils.generation (None until the first graph decode)
+        # the captured decode step and the captured prefill of neuronspark.utils.generation (None until the first
+        # graph decode)
         self._decode_graph = None
+        self._prefill_graph = None
 
     @property
     def _o(self):
@@ -580,8 +582,9 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
         return self
 
     def release_inference(self) -> None:
-        """Drop the bf16 weight copies and the captured decode step (which reads those copies)."""
+        """Drop the bf16 weight copies and the captured decode step and prefill (which read those copies)."""
         self._decode_graph = None
+        self._prefill_graph = None
         for _, p in self.backbone.inference_linear_weights():
             drop_bf16_(p)
 

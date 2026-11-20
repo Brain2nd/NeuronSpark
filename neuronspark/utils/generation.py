@@ -1,5 +1,5 @@
-"""Generation: the prompt as one prefill call, then one token per step -- each step replayed from a captured CUDA graph
-(``cg=True``, the default) or run eagerly -- with greedy decoding or sampling.
+"""Generation: the prompt as one prefill call, then one token per step -- the prefill and each step replayed from
+captured CUDA graphs (``cg=True``, the default) or run eagerly -- with greedy decoding or sampling.
 
 Every row of a batch advances together, so the prompts of one call have equal length (B, T).  ``max_length`` counts the
 prompt and the new tokens; the hippocampal slot rings hold :func:`ring_capacity` ``(max_length)`` slots (a multiple of
@@ -9,6 +9,13 @@ CUDA-graph decoding keeps one :class:`DecodeGraph` on the model (``model._decode
 reads and writes, the memory pool of the capture and the captured single-token step.  Before each generation the cache
 is reset to the row start; the graph is captured again only when the batch size, the device, the dendritic-layer state
 dtype or a weight (its storage or version) changed, or when the rings must grow.
+
+The prefill of a CUDA-graph generation runs over the same cache.  One :class:`PrefillGraph` is kept on the model
+(``model._prefill_graph``): the prefill call of one prompt length, captured over the decode graph's cache.  A prompt
+length is run eagerly the first time it comes on a cache (that call compiles and builds what a capture must find
+ready), captured the next time the same length comes, and replayed from then on; another length, or a new cache of the
+decode graph, starts again with an eager call.  :func:`prepare_prefill_graph` captures a length at once (after its own
+warm-up calls).  A captured prefill keeps the memory of the call's intermediates for as long as it lives.
 
 Sampling (:func:`next_tokens`): ``top_k == 1`` is greedy (the first index on ties).  Otherwise the logits are divided by
 the temperature and filtered in this order -- the ``top_k`` largest (``top_k > 1``), the tokens whose probability is at
@@ -26,8 +33,8 @@ import torch
 
 from neuronspark.utils.cache import InferenceParams, RING_MULTIPLE, resolve_dendritic_state_dtype
 
-__all__ = ["DecodeOutput", "DecodeGraph", "GenerationMixin", "decode", "next_tokens", "repetition_penalty_",
-           "ring_capacity", "prepare_decode_graph"]
+__all__ = ["DecodeOutput", "DecodeGraph", "PrefillGraph", "GenerationMixin", "decode", "next_tokens",
+           "repetition_penalty_", "ring_capacity", "prepare_decode_graph", "prepare_prefill_graph"]
 
 
 # ================================================================================================ sampling
@@ -164,6 +171,119 @@ def prepare_decode_graph(model, batch_size: int, max_length: int, dendritic_stat
     return graph
 
 
+# ================================================================================================ CUDA-graph prefill
+class PrefillGraph:
+    """One captured prefill call (T >= 2 tokens) of a model over an inference cache (module docstring).
+
+    The graph reads the cache it was captured over wherever that cache stands (the counters are read on the device):
+    :meth:`replay` is a prefill of ``seq_len`` tokens from the row start or the continuation of earlier calls."""
+
+    def __init__(self) -> None:
+        self.params: Optional[InferenceParams] = None  # the cache the graph reads and writes
+        self.seq_len = 0                                # tokens of the captured call
+        self.graph: Optional[torch.cuda.CUDAGraph] = None
+        self.pool = None
+        self.tokens: Optional[torch.Tensor] = None     # static input (B, T)
+        self.logits: Optional[torch.Tensor] = None     # static output (B, 1, V)
+        self.bf16_weights: list = []                    # the bf16 weight copies the graph reads, kept alive with it
+        self._ran: Optional[Tuple[InferenceParams, int]] = None   # the (cache, length) of the last eager prefill
+
+    def holds(self, params: InferenceParams, seq_len: int) -> bool:
+        """Whether the captured call is the prefill of ``seq_len`` tokens over ``params``."""
+        return self.graph is not None and self.params is params and self.seq_len == int(seq_len)
+
+    def _drop(self) -> None:
+        held = self.graph is not None
+        self.params = self.graph = self.pool = self.tokens = self.logits = self._ran = None
+        self.seq_len = 0
+        self.bf16_weights = []
+        if held:
+            gc.collect()
+
+    @torch.no_grad()
+    def capture(self, model, params: InferenceParams, seq_len: int, warmup_calls: int = 2) -> None:
+        """Capture the prefill of ``seq_len`` tokens over ``params``; the cache is left as it was found.
+        ``warmup_calls`` eager calls come first; 0 when the caller has run this call eagerly on this cache."""
+        T = int(seq_len)
+        if T < 2:
+            raise ValueError(f"PrefillGraph: a prefill takes at least 2 tokens, got {T} (one token is the decode step)")
+        if params.pos.device.type != "cuda":
+            raise RuntimeError(f"PrefillGraph: a captured prefill needs a CUDA cache, got {params.pos.device}")
+        self._drop()
+        tokens = torch.zeros((params.max_batch_size, T), dtype=torch.long, device=params.pos.device)
+        if warmup_calls > 0:
+            start = params.snapshot()
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):               # first calls (kernel compilation, caches) outside the capture
+                for _ in range(int(warmup_calls)):
+                    params.restore(start)
+                    model(tokens, inference_params=params, num_last_tokens=1)
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+            params.restore(start)
+        offset = params.seqlen_offset
+        pool = torch.cuda.graphs.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph, pool=pool):    # recorded, not executed
+                logits = model(tokens, inference_params=params, num_last_tokens=1).logits
+        finally:
+            params.seqlen_offset = offset               # the host count the recorded call advanced
+        self.params, self.seq_len, self.graph, self.pool = params, T, graph, pool
+        self.tokens, self.logits = tokens, logits
+        self.bf16_weights = [w for w in (getattr(p, "_ns_bf16", None) for p in model.parameters()) if w is not None]
+
+    def replay(self, ids: torch.Tensor) -> torch.Tensor:
+        """Replay the prefill on ``ids`` (B, T): the cache advances in place; returns the last position's logits
+        (B, V)."""
+        if self.graph is None:
+            raise RuntimeError("PrefillGraph: no captured prefill (call capture, or prepare_prefill_graph)")
+        if tuple(ids.shape) != tuple(self.tokens.shape):
+            raise ValueError(f"PrefillGraph: the captured prefill takes ids {tuple(self.tokens.shape)}, got "
+                             f"{tuple(ids.shape)}")
+        self.params.check_room(self.seq_len)
+        self.tokens.copy_(ids)
+        self.graph.replay()
+        self.params.seqlen_offset += self.seq_len
+        return self.logits[:, -1].clone()
+
+    @torch.no_grad()
+    def prefill(self, model, params: InferenceParams, ids: torch.Tensor) -> torch.Tensor:
+        """The prefill of ``ids`` (B, T) over ``params``, the last position's logits (B, V): replayed when this
+        (cache, length) is captured, captured first when the previous call ran it eagerly, else run eagerly."""
+        T = int(ids.shape[1])
+        if not self.holds(params, T):
+            if T >= 2 and self._ran is not None and self._ran[0] is params and self._ran[1] == T:
+                self.capture(model, params, T, warmup_calls=0)
+            else:
+                self._drop()
+                self._ran = (params, T)
+                return model(ids, inference_params=params, num_last_tokens=1).logits[:, -1]
+        return self.replay(ids)
+
+
+def _prefill_graph(model) -> PrefillGraph:
+    graph = getattr(model, "_prefill_graph", None)
+    if graph is None:
+        graph = PrefillGraph()
+        model._prefill_graph = graph
+    return graph
+
+
+def prepare_prefill_graph(model, batch_size: int, seq_len: int, max_length: int,
+                          dendritic_state_dtype=None) -> PrefillGraph:
+    """``model._prefill_graph`` holding the captured prefill of ``seq_len`` tokens for ``batch_size`` rows of total
+    length ``max_length``, over the cache of the model's decode graph (``.params``, reset to the row start)."""
+    if int(seq_len) > int(max_length):
+        raise ValueError(f"prepare_prefill_graph: seq_len {seq_len} exceeds max_length {max_length}")
+    params = prepare_decode_graph(model, batch_size, max_length, dendritic_state_dtype).params
+    graph = _prefill_graph(model)
+    if not graph.holds(params, seq_len):
+        graph.capture(model, params, seq_len)
+    return graph
+
+
 # ================================================================================================ decode loop
 @dataclass
 class DecodeOutput:
@@ -183,7 +303,8 @@ def decode(input_ids: torch.Tensor, model, max_length: int, top_k: int = 1, top_
 
     ``input_ids`` (B, T) int64 prompts of equal length; ``max_length`` the total length (> T); ``eos_token_id``: stop
     once every row has produced it; ``teacher_outputs`` (B, >= max_length): take position t's token from it;
-    ``cg``: replay the steps from the captured graph; ``output_scores``: return the logits of every generated
+    ``cg``: replay the steps (and a prompt length that comes again, the prefill) from the captured graphs;
+    ``output_scores``: return the logits of every generated
     position; ``streamer``: an object with ``put(tokens)`` / ``end()``; ``dendritic_state_dtype``: the cache's
     dendritic-layer state storage (default ``config.inference_dendritic_state_dtype``).
     """
@@ -206,7 +327,10 @@ def decode(input_ids: torch.Tensor, model, max_length: int, top_k: int = 1, top_
     forced = int(teacher_outputs.shape[1]) if teacher_outputs is not None else 0
     pieces, scores = [input_ids], []
     seen = input_ids
-    logits = model(input_ids, inference_params=params, num_last_tokens=1).logits[:, -1]     # prefill
+    if graph is not None:                                                                   # prefill
+        logits = _prefill_graph(model).prefill(model, params, input_ids)
+    else:
+        logits = model(input_ids, inference_params=params, num_last_tokens=1).logits[:, -1]
     for pos in range(prompt_len, total):
         if output_scores:
             scores.append(logits.clone())

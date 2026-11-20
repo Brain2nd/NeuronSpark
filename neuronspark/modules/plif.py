@@ -5,7 +5,8 @@ Per channel c and row b, input x (T, B, C) (fp32 for the attention-side ``gate_n
 ``input_neuron2``, bf16 for the spiking FFN's gate / up neurons):
 
     xc   = x                                                  (plain neurons)
-         = (x_t - S_t / max(t, 1)) [t > 0],  S_t = sum_{j<t} x_j   (centred neuron, fp32, cast back to x.dtype)
+         = (x_t - S_t / max(t, 1)) [t > 0],  S_t = sum_{j<t} x_j   (centred neuron, fp32, stored in bf16: the
+                                                              operand of the first eta GEMM)
     zp   = bf16( bf16(xc @ eta_V^T) @ eta_U^T )               two bf16 GEMMs (rank 16)
     z    = (w_eta * f32(x) + b_eta) + f32(zp)                  fp32, one RN rounding per op
     eta  = sigmoid(z);  a = 1 - eta;  drive = eta * f32(x)
@@ -19,8 +20,9 @@ dS/dv_th = -(sigmoid(alpha (pre - v_th)) - sigmoid(alpha (-pre - v_th))).
 
 Forms (one per regime; the module picks the form from its arguments):
 
-* whole row (``state is None``): ``ops.plif_centred_input`` (centred neuron) -> the two eta linears ->
-  ``ops.plif_scan_train`` (forward kernel + backward kernel), from a zero membrane;
+* whole row (``state is None``): ``ops.plif_centred_input`` (centred neuron; written in bf16, the operand dtype of
+  the first eta linear) -> the two eta linears -> ``ops.plif_scan_train`` (forward kernel + backward kernel), from a
+  zero membrane;
 * prefill (``state`` given, T >= 2, no autograd): ``ops.centred_running`` over the carried input sum (centred
   neuron; written in bf16, the operand dtype of the first eta linear, so the linear's input cast is the kernel's
   store rounding) -> the two eta linears -> ``ops.plif_gate_prefill`` (a, drive; it reads the bf16 projection and
@@ -248,7 +250,8 @@ class PLIFNeuron(nn.Module):
         if int(x.shape[0]) < 2:
             raise RuntimeError("PLIFNeuron: the whole-row form needs T >= 2 (single tokens run through an inference "
                                "state)")
-        xc = self._ops.plif_centred_input(x) if self.centred else x
+        # the centred input in bf16: its only consumer is the bf16 eta projection, whose input cast is the same rounding
+        xc = self._ops.plif_centred_input(x, torch.bfloat16) if self.centred else x
         zp = self._eta_projection(xc, contiguous=True)
         S = self._ops.plif_scan_train(self.w_eta, self.b_eta, zp, x, self.v_th, alpha=self.alpha, out_dtype=x.dtype)
         return S.to(x.dtype)

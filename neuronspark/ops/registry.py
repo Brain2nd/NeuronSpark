@@ -206,9 +206,9 @@ _SPECS: List[OpSpec] = [
         doc="u (B, 256) bf16, wb (4, 256, 64) bf16, cos / sin (B, 128) bf16 (with pos (B,) int64: the (positions, "
             "128) table band, read at pos), psi (B, 4) bf16, head_gain (1,) fp32"),
     # ---------------------------------------------------------------------------------------------- PLIF
-    _op("plif_centred_input", _T + "plif", "x",
-        "x.dtype (T, B, C): x minus its running mean", "train",
-        doc="x (T, B, C) fp32"),
+    _op("plif_centred_input", _T + "plif", "x out_dtype",
+        "out_dtype (default x.dtype) (T, B, C): x minus its running mean", "train",
+        doc="x (T, B, C) fp32; out_dtype bf16 for the eta projection's operand"),
     _op("plif_scan_train", _T + "plif", "w_eta b_eta zp x v_th * alpha out_dtype",
         "spikes S (T, B, C) out_dtype; grads for w_eta, b_eta, zp, x, v_th", "train",
         doc="w_eta, b_eta (C,) fp32, zp (T, B, C) bf16 eta projection, x (T, B, C) fp32|bf16, v_th (C,) fp32; "

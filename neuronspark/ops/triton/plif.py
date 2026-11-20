@@ -29,7 +29,9 @@ Operators (regime: public function -> what runs):
   and added in x.dtype.
 * train   :func:`plif_centred_input` -> :class:`CentreFn` on ``ops.cumsum0``: the strictly-past centring of
   input_neuron2's projection input, xc_t = (x_t - (sum_{j<t} x_j) / max(t, 1)) * [t > 0], returned contiguous in
-  x.dtype; backward: A = g * [t > 0] on x, q_t = -g_{t+1} / (t + 1) (0 at t = T - 1) on the running sum.
+  x.dtype or in the requested ``out_dtype`` (bf16 for the eta projection: its operand rounding, made by the kernel's
+  store); backward: A = g * [t > 0] on x, q_t = -g_{t+1} / (t + 1) (0 at t = T - 1) on the running sum, from the fp32
+  or bf16 gradient.
 * prefill :func:`plif_gate_prefill` (custom op ``neuronspark::plif_gate_prefill``): (a, drive) fp32 from x, w_eta, b_eta
   and the projection, any T >= 1; :func:`plif_scan_prefill` (custom op ``neuronspark::plif_scan_prefill``, mutates
   ``v0``): the scan from the carried membrane v0, which it overwrites with the last membrane.
@@ -437,11 +439,13 @@ class CentreFn(torch.autograd.Function):
         return a, qs, None
 
 
-def plif_centred_input(x: torch.Tensor) -> torch.Tensor:
-    """``x_t - mean_{j<t} x_j`` (zero at t = 0) in x.dtype, contiguous: input_neuron2's projection input.
+def plif_centred_input(x: torch.Tensor, out_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    """``x_t - mean_{j<t} x_j`` (zero at t = 0), contiguous: input_neuron2's projection input.
 
-    ``x``: fp32 (or bf16) (T, B, C) CUDA tensor with a dense channel axis, T >= 2.  The running sum is ``ops.cumsum0``
-    of ``x.float()``; the centring and its backward are one kernel each (:class:`CentreFn`)."""
+    ``x``: fp32 (or bf16) (T, B, C) CUDA tensor with a dense channel axis, T >= 2.  ``out_dtype``: float32 or bfloat16,
+    default ``x.dtype``; the fp32 result is rounded once by the kernel's store (bf16: the operand a bf16 projection
+    would make of the fp32 result).  The running sum is ``ops.cumsum0`` of ``x.float()``; the centring and its backward
+    are one kernel each (:class:`CentreFn`)."""
     require_cuda(x, "plif_centred_input")
     _need(x.dim() == 3 and int(x.shape[0]) >= 2, f"x must be (T >= 2, B, C), got {tuple(x.shape)}")
     _need(x.dtype in (torch.float32, torch.bfloat16), f"x must be fp32 or bf16, got {x.dtype}")
@@ -449,7 +453,7 @@ def plif_centred_input(x: torch.Tensor) -> torch.Tensor:
     from neuronspark.ops.triton.cumsum import cumsum0
     xf = x.float()
     xsum = cumsum0(xf)
-    return CentreFn.apply(xf, xsum, _dtype_name(x.dtype))
+    return CentreFn.apply(xf, xsum, _dtype_name(x.dtype if out_dtype is None else out_dtype))
 
 
 # ================================================================================================ prefill
@@ -602,16 +606,16 @@ def plif_scan_train_ref(w_eta: torch.Tensor, b_eta: torch.Tensor, zp: torch.Tens
     return _PLIFScanRef.apply(w_eta, b_eta, zp, x, v_th, float(alpha), od)
 
 
-def plif_centred_input_ref(x: torch.Tensor) -> torch.Tensor:
+def plif_centred_input_ref(x: torch.Tensor, out_dtype: Optional[torch.dtype] = None) -> torch.Tensor:
     """Pure-torch reference of :func:`plif_centred_input`: the strictly-past centring with ATen's ``cumsum(dim=0)``,
-    cast to x.dtype, contiguous."""
+    cast to ``out_dtype`` (default x.dtype), contiguous."""
     T = int(x.shape[0])
     xf = x.float()
     xc = xf.cumsum(dim=0)
     xc = torch.cat([torch.zeros_like(xc[:1]), xc[:-1]], dim=0)
     xn = torch.arange(T, device=x.device, dtype=torch.float32).clamp_min(1.0).view(T, 1, 1)
     has_past = (torch.arange(T, device=x.device) > 0).view(T, 1, 1).to(torch.float32)
-    return ((xf - xc / xn) * has_past).to(x.dtype).contiguous()
+    return ((xf - xc / xn) * has_past).to(x.dtype if out_dtype is None else out_dtype).contiguous()
 
 
 def plif_gate_prefill_ref(x: torch.Tensor, w_eta: torch.Tensor, b_eta: torch.Tensor,

@@ -46,6 +46,7 @@ __all__ = [
     "InferenceParams",
     "WeightConstants",
     "weight_constants",
+    "drop_weight_constants",
     "resolve_dendritic_state_dtype",
     "announce_dendritic_state_dtype",
     "RING_MULTIPLE",
@@ -120,6 +121,19 @@ class WeightConstants:
 
     def tensors(self) -> Tuple[torch.Tensor, ...]:
         return self._value
+
+    def drop(self) -> None:
+        """Forget the kept value (formed again by the next ``get``)."""
+        self._key, self._value = None, ()
+
+
+def drop_weight_constants(model) -> None:
+    """Drop what the :class:`WeightConstants` of ``model``'s modules keep (the decode step's stacked projection
+    weights among them)."""
+    for module in model.modules():
+        for value in vars(module).values():
+            if isinstance(value, WeightConstants):
+                value.drop()
 
 
 def weight_constants(model) -> List[torch.Tensor]:

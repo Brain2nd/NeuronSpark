@@ -41,8 +41,8 @@ Regime differences kept explicitly in the code paths (each regime has its own nu
   W) and read the rings: prefill by ``ops.ring_write_prefill`` + ``ops.ring_recall_prefill`` (the induction term formed
   in-kernel from the matches), decode by ``ops.ring_write_step`` (the conv step, SiLU, RoPE, the unit keys and gained
   unit queries, the value-residual mix and GLU tail, the tagged values and the clocks in one kernel after the step's
-  projections), ``ops.xq_form_t1`` (the extra queries) and ``ops.ring_read_t1`` (every head's read and the extra
-  queries' reads) at every decode batch size;
+  projections; the six projections of z are one product over their stacked weights), ``ops.xq_form_t1`` (the extra
+  queries) and ``ops.ring_read_t1`` (every head's read and the extra queries' reads) at every decode batch size;
 * the pool clock: ``ops.clock_increments`` + ``ops.cumsum0`` (whole row), ``ops.exact_cumsum0`` over the carried
   clock (prefill), one add (decode); the value-residual running mean: ``ops.centred_past`` (whole row),
   ``ops.centred_running`` (prefill), ``ops.centred_step`` over the carried sum (decode);
@@ -75,6 +75,7 @@ from neuronspark.modules.linear import Linear, ShortConvWeight
 from neuronspark.modules.norms import RMSNorm
 from neuronspark.modules.plif import PLIFNeuron, forked_rng, linear_init
 from neuronspark.modules.rope import rope_head_band_tables
+from neuronspark.ops.linear import stacked_bands, stacked_inference_weight
 from neuronspark.utils.cache import HippocampalState, WeightConstants
 
 __all__ = [
@@ -309,6 +310,7 @@ class PoolAttentionMixin:
         self.register_buffer("rope_cos_bf16", rope_cos.to(torch.bfloat16), persistent=False)
         self.register_buffer("rope_sin_bf16", rope_sin.to(torch.bfloat16), persistent=False)
         self._pool_step_constants = WeightConstants()         # the decode step's constants, per weight version
+        self._pool_step_stack = WeightConstants()             # the decode step's stacked projections of z
 
     def _finish_pool_attention_init(self, out_std: float) -> None:
         """Launch draws taken after the FFN sub-block is built (global stream): qkv_proj Xavier-uniform, attn_out_proj
@@ -606,6 +608,14 @@ class PoolAttentionMixin:
                     torch.stack([w.detach().to(torch.bfloat16) for w in self.pool_xq_b], dim=0).contiguous())
         return self._pool_step_constants.get(sources, build)
 
+    def _step_projections(self) -> Tuple[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """The decode step's projections of z as one weight, per weight version: (the stacked bf16 weight of
+        ``qkv_proj``, ``pool_glu_a``, ``pool_glu_b``, ``W_decay``, ``pool_xq_a``, ``pool_xq_gain_proj``
+        (:func:`neuronspark.ops.linear.stacked_inference_weight`), the six weights in that order)."""
+        sources = (self.qkv_proj.weight, self.pool_glu_a, self.pool_glu_b, self.W_decay.weight, self.pool_xq_a,
+                   self.pool_xq_gain_proj)
+        return self._pool_step_stack.get(sources, lambda: (stacked_inference_weight(sources),))[0], sources
+
     def _attention_step(self, h: torch.Tensor, hb: torch.Tensor, z: torch.Tensor, zb: torch.Tensor, ind, carry,
                         st: HippocampalState, pos0: torch.Tensor, ptr0: torch.Tensor, W: int):
         """Single-token attention sub-block over the carried rings: (the bf16 output projection (1, B, D) before its
@@ -629,21 +639,24 @@ class PoolAttentionMixin:
                                    f"{None if carry is None else (tuple(carry.shape), carry.dtype)}")
             carry_in = carry[0]
         lam0, qgain, xq_gain, wbias, gains, rate, beta, xq_wb = self._step_constants()
+        # the six projections of z as one product over their stacked weights; each result is a column band of it
+        stack, sources = self._step_projections()
+        qkv, glu_a, glu_b, dlog, xq_u, xq_psi = stacked_bands(lin(zb, stack), sources)       # (B, n_i) bf16 views
         gl = lin(o.centred_step(z[0], st.vr_sum, pos0, torch.bfloat16), self.pool_vr_gate)   # (B, H) bf16
         gate = self.gate_neuron(z, st.gate_neuron, pos0)                                      # (1, B, D) fp32 spikes
         # the ring write: conv step, SiLU, RoPE, unit keys and gained unit queries, value-residual mix and GLU tail,
         # tagged values, clocks -- one kernel after the projections
-        q_h, v = o.ring_write_step(lin(zb, self.qkv_proj.weight), st.conv_hist, self.qkv_conv.weight,
+        q_h, v = o.ring_write_step(qkv, st.conv_hist, self.qkv_conv.weight,
                                    self.rope_cos_bf16, self.rope_sin_bf16, pos0, ptr0, gate[0], gl, lam0, carry_in,
-                                   lin(zb, self.pool_glu_a), lin(zb, self.pool_glu_b), self.pool_glu_u,
-                                   lin(zb, self.W_decay.weight), rate, self.hippocampal_base_decay, gains, qgain,
+                                   glu_a, glu_b, self.pool_glu_u,
+                                   dlog, rate, self.hippocampal_base_decay, gains, qgain,
                                    wbias, self.write_sparsity, st.pool_k, st.pool_gv, st.pool_cum, st.pool_run)
         carry_out = v.unsqueeze(0) if self.value_residual_first else carry
         # the last head's extra queries: the low-rank map and the gain projection, then one kernel (the M projections,
         # SiLU, RoPE on the head's band of the tables at the rows' positions, normalisation, gain; bf16, the rounding
         # the ring read applies)
-        xq = o.xq_form_t1(lin(zb, self.pool_xq_a), xq_wb, self._xq_band(self.rope_cos_bf16),
-                          self._xq_band(self.rope_sin_bf16), lin(zb, self.pool_xq_gain_proj), xq_gain, pos0)
+        xq = o.xq_form_t1(xq_u, xq_wb, self._xq_band(self.rope_cos_bf16),
+                          self._xq_band(self.rope_sin_bf16), xq_psi, xq_gain, pos0)
         # the ring kernel: every head's read and the extra queries' reads over the live slots (pos0 = tokens before
         # this step; ptr0 = this step's slot; the step's clocks are the carried clocks just advanced)
         red = o.ring_read_t1(q_h, xq, st.pool_run, st.pool_k, st.pool_gv, st.pool_cum, pos0, ptr0, matches, beta,

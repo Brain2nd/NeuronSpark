@@ -79,6 +79,7 @@ from neuronspark.utils.cache import (
     MAX_DECODE_BATCH,
     RING_MULTIPLE,
     InferenceParams,
+    drop_weight_constants,
     resolve_dendritic_state_dtype,
 )
 from neuronspark.utils.generation import GenerationMixin
@@ -584,9 +585,11 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
         return self
 
     def release_inference(self) -> None:
-        """Drop the bf16 weight copies and the captured decode step and prefill (which read those copies)."""
+        """Drop the bf16 weight copies, the captured decode step and prefill (which read those copies) and the values
+        kept per weight version (:class:`neuronspark.utils.cache.WeightConstants`)."""
         self._decode_graph = None
         self._prefill_graph = None
+        drop_weight_constants(self)
         for _, p in self.backbone.inference_linear_weights():
             drop_bf16_(p)
 

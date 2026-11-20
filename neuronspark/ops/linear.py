@@ -40,7 +40,7 @@ once to bf16; its gradients are float64 products delivered in the inputs' dtypes
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -53,6 +53,8 @@ __all__ = [
     "drop_bf16_",
     "has_bf16_cache",
     "inference_weight",
+    "stacked_inference_weight",
+    "stacked_bands",
     "padded_extent",
     "inference_extent",
 ]
@@ -148,6 +150,37 @@ def drop_bf16_(param: torch.Tensor) -> None:
 
 def has_bf16_cache(param: torch.Tensor) -> bool:
     return getattr(param, _CACHE_ATTR, None) is not None
+
+
+def stacked_inference_weight(weights: Sequence[torch.Tensor]) -> torch.Tensor:
+    """The bf16 inference weight of several projections of one input as one (P, K) weight: the rows of ``weights``
+    (each (N_i, K)) in order, each the RNE bf16 rounding its own inference product reads (its current bf16 copy when it
+    has one: a stale copy raises, as in :func:`linear`), and zero rows up to a multiple of ``PAD_MULTIPLE``.  The
+    product of an input with it holds every projection's result as a column band (:func:`stacked_bands`): one product
+    in place of ``len(weights)``."""
+    rows = [int(w.shape[0]) for w in weights]
+    k = int(weights[0].shape[1])
+    if any(w.dim() != 2 or int(w.shape[1]) != k or w.device != weights[0].device for w in weights):
+        raise RuntimeError("neuronspark.ops.linear: stacked weights must be (N_i, K) tensors of one K on one device")
+    n = sum(rows)
+    stack = torch.zeros(((n + PAD_MULTIPLE - 1) // PAD_MULTIPLE * PAD_MULTIPLE, k), dtype=torch.bfloat16,
+                        device=weights[0].device)
+    r = 0
+    for w, m in zip(weights, rows):
+        stack[r:r + m].copy_(inference_weight(w).detach())     # the bf16 copy, or RNE fp32 -> bf16 (w.to(bf16))
+        r += m
+    return stack
+
+
+def stacked_bands(out: torch.Tensor, weights: Sequence[torch.Tensor]) -> Tuple[torch.Tensor, ...]:
+    """The results of the projections ``weights`` inside ``out`` (..., P), the product with their
+    :func:`stacked_inference_weight`: views (..., N_i) with unit inner stride."""
+    bands, r = [], 0
+    for w in weights:
+        m = int(w.shape[0])
+        bands.append(out[..., r:r + m])
+        r += m
+    return tuple(bands)
 
 
 def inference_weight(weight: torch.Tensor) -> torch.Tensor:

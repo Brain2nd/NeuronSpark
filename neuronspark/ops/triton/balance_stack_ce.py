@@ -1,20 +1,20 @@
-"""Readout balance + cross entropy of the training loss for a balance stack of three or four widths.
+"""Readout balance + cross entropy of the training loss for a balance stack of one to four widths.
 
 The training loss of the readout is the per-token cross entropy of the balanced logits: per width ``w`` of the stack,
 in order, ``logits[r, v] = bf16(fp32(logits[r, v]) + fp32(c_w[r, v % w]))`` (one rounding per width), then
-``F.cross_entropy(balanced.float(), labels, ignore_index, reduction="none")``.  The stack of the default configuration,
-(16, 32), runs the fused kernels of :mod:`neuronspark.ops.triton.lm_tail`; a stack of three or four widths (a model
-scale whose readout balance has more projections, e.g. (4, 8, 32) or (4, 8, 128, 256)) runs the two kernels here,
-reached through the same operator ``balance_ce_per_token``.  The balanced logits are not materialised.
+``F.cross_entropy(balanced.float(), labels, ignore_index, reduction="none")``.  The operator ``balance_ce_per_token``
+of :mod:`neuronspark.ops.triton.lm_tail` runs the two kernels here for every stack: the default configuration's
+(16, 32) and the scales whose readout balance has more projections, e.g. (4, 8, 32) or (4, 8, 128, 256).  The
+balanced logits are not materialised.
 
-* forward (``_stack_fwd_kernel``, one program per row): every balanced value is formed on the fly (the fp32 add and
+* forward (``_stack_fwd_kernel``, one program per row, any number of rows): every balanced value is formed on the fly (the fp32 add and
   the RNE to bf16 per width, in order), then a per-lane-group online softmax over tiles of ``FWD_TILE_GROUPS`` groups
   of ``FWD_TILE_COLS`` consecutive columns, each group's running sum with compensated summation (a term is
   ``2^((x - group max) log2 e)``: the difference is formed first, so a group of -inf columns adds nothing).
   Outputs: the row max, ``logsum = log(sum 2^((x - max) log2 e))`` and the
   per-token loss ``-((x_t - max) - logsum)`` (+0 for an ignored row; an out-of-range target traps, as the
   reference's device assert).
-* backward (``_stack_bwd_kernel``, one program per row): each balanced value again, ``logp = (x - max) - logsum``,
+* backward (``_stack_bwd_kernel``, one program per row, any number of rows): each balanced value again, ``logp = (x - max) - logsum``,
   ``gI = gO - exp(logp) * sum(gO)`` with ``gO`` the nll gradient (``-g`` at the target), rounded to bf16 into a new
   dense gradient of row length ``P >= V`` (the columns from V on are zeros); and the gradient of every contribution,
   the sum over the columns ``v`` with ``v % w == c`` of that bf16 gradient: the row is accumulated in fp64 per lane
@@ -29,7 +29,7 @@ are the reference's sums in another order, with one bf16 rounding where the refe
 the tail.  The reference is ``balance_ce_per_token_ref`` of :mod:`neuronspark.ops.triton.lm_tail` (the torch chain);
 tests: the per-operator tolerance rule of :mod:`neuronspark.utils.testing`.
 
-Contract (anything else raises): 3 or 4 widths, each a power of two with ``4 <= w <= BWD_TILE``; the logits a CUDA
+Contract (anything else raises): 1 to 4 widths, each a power of two with ``4 <= w <= BWD_TILE``; the logits a CUDA
 bf16 (R, V) tensor with unit column stride and at least one forward tile of columns
 (``V >= FWD_TILE_GROUPS * FWD_TILE_COLS``: every lane group of the online softmax then holds a column of the first
 tile); every contribution a CUDA bf16 (R, w) tensor with unit column stride and
@@ -44,14 +44,13 @@ import triton.language as tl
 
 from neuronspark.ops.triton._ptx import _ex2ftz as _sc_ex2  # noqa: F401  (resolved through this module's globals)
 
-__all__ = ["STACK_MIN_WIDTHS", "STACK_MAX_WIDTHS", "FWD_TILE_GROUPS", "FWD_TILE_COLS", "FWD_WARPS", "BWD_TILE",
-           "BWD_WARPS", "check_stack", "stack_ce_fwd", "stack_ce_bwd"]
+__all__ = ["STACK_MAX_WIDTHS", "FWD_TILE_GROUPS", "FWD_TILE_COLS", "FWD_WARPS", "BWD_TILE", "BWD_WARPS", "check_stack",
+           "stack_ce_fwd", "stack_ce_bwd"]
 
 LOG2E = tl.constexpr(1.4426950408889634)
 
 # ================================================================================================ fixed launch constants
-#: widths of a stack this module takes
-STACK_MIN_WIDTHS = 3
+#: the most widths a stack has
 STACK_MAX_WIDTHS = 4
 #: forward: tiles of FWD_TILE_GROUPS lane groups x FWD_TILE_COLS consecutive columns, FWD_WARPS warps per row
 FWD_TILE_GROUPS = 128
@@ -74,8 +73,10 @@ def _sc_trap_if(flag):
 def _sc_bal(x, c0, c1, c2, c3, NW: tl.constexpr):
     """The balance chain per width: fp32 add, RNE to bf16, back to fp32."""
     x = (x + c0).to(tl.bfloat16, fp_downcast_rounding="rtne").to(tl.float32)
-    x = (x + c1).to(tl.bfloat16, fp_downcast_rounding="rtne").to(tl.float32)
-    x = (x + c2).to(tl.bfloat16, fp_downcast_rounding="rtne").to(tl.float32)
+    if NW > 1:
+        x = (x + c1).to(tl.bfloat16, fp_downcast_rounding="rtne").to(tl.float32)
+    if NW > 2:
+        x = (x + c2).to(tl.bfloat16, fp_downcast_rounding="rtne").to(tl.float32)
     if NW > 3:
         x = (x + c3).to(tl.bfloat16, fp_downcast_rounding="rtne").to(tl.float32)
     return x
@@ -102,8 +103,14 @@ def _stack_fwd_kernel(X, C0, C1, C2, C3, T, MX, LS, LOSS, SX, S0, S1, S2, S3, IG
     BLOCK: tl.constexpr = G * KV
     offs = tl.arange(0, G)[:, None] * KV + tl.arange(0, KV)[None, :]          # (G, KV) column offsets in a tile
     c0 = tl.load(C0 + r * S0 + (offs % W0)).to(tl.float32)                    # tile starts are multiples of BLOCK
-    c1 = tl.load(C1 + r * S1 + (offs % W1)).to(tl.float32)
-    c2 = tl.load(C2 + r * S2 + (offs % W2)).to(tl.float32)
+    if NW > 1:
+        c1 = tl.load(C1 + r * S1 + (offs % W1)).to(tl.float32)
+    else:
+        c1 = c0
+    if NW > 2:
+        c2 = tl.load(C2 + r * S2 + (offs % W2)).to(tl.float32)
+    else:
+        c2 = c0
     if NW > 3:
         c3 = tl.load(C3 + r * S3 + (offs % W3)).to(tl.float32)
     else:
@@ -139,8 +146,14 @@ def _stack_fwd_kernel(X, C0, C1, C2, C3, T, MX, LS, LOSS, SX, S0, S1, S2, S3, IG
     tgc = tl.where(valid & inb, tg, 0)
     xt = tl.load(xr + tgc).to(tl.float32)
     ct0 = tl.load(C0 + r * S0 + (tgc % W0)).to(tl.float32)
-    ct1 = tl.load(C1 + r * S1 + (tgc % W1)).to(tl.float32)
-    ct2 = tl.load(C2 + r * S2 + (tgc % W2)).to(tl.float32)
+    if NW > 1:
+        ct1 = tl.load(C1 + r * S1 + (tgc % W1)).to(tl.float32)
+    else:
+        ct1 = ct0
+    if NW > 2:
+        ct2 = tl.load(C2 + r * S2 + (tgc % W2)).to(tl.float32)
+    else:
+        ct2 = ct0
     if NW > 3:
         ct3 = tl.load(C3 + r * S3 + (tgc % W3)).to(tl.float32)
     else:
@@ -178,8 +191,14 @@ def _stack_bwd_kernel(X, C0, C1, C2, C3, T, MX, LS, G, DX, D0, D1, D2, D3, SX, S
     rd = r * SD
     ar = tl.arange(0, TILE)
     c0 = tl.load(C0 + r * S0 + (ar % W0)).to(tl.float32)                      # tile starts are multiples of TILE
-    c1 = tl.load(C1 + r * S1 + (ar % W1)).to(tl.float32)
-    c2 = tl.load(C2 + r * S2 + (ar % W2)).to(tl.float32)
+    if NW > 1:
+        c1 = tl.load(C1 + r * S1 + (ar % W1)).to(tl.float32)
+    else:
+        c1 = c0
+    if NW > 2:
+        c2 = tl.load(C2 + r * S2 + (ar % W2)).to(tl.float32)
+    else:
+        c2 = c0
     if NW > 3:
         c3 = tl.load(C3 + r * S3 + (ar % W3)).to(tl.float32)
     else:
@@ -210,22 +229,24 @@ def _stack_bwd_kernel(X, C0, C1, C2, C3, T, MX, LS, G, DX, D0, D1, D2, D3, SX, S
         tl.store(DX + rd + cols, gb, mask=cols < P)
         acc += gb.to(tl.float32).to(tl.float64)
     _sc_width_store(D0, r, acc, W0, TILE)
-    _sc_width_store(D1, r, acc, W1, TILE)
-    _sc_width_store(D2, r, acc, W2, TILE)
+    if NW > 1:
+        _sc_width_store(D1, r, acc, W1, TILE)
+    if NW > 2:
+        _sc_width_store(D2, r, acc, W2, TILE)
     if NW > 3:
         _sc_width_store(D3, r, acc, W3, TILE)
 
 
 # ================================================================================================ host side
 def check_stack(R: int, V: int, contribs: Sequence[torch.Tensor], widths: Sequence[int], device) -> None:
-    """Raise unless ``widths`` / ``contribs`` are a stack this module takes for (R, V) logits on ``device``."""
+    """Raise unless ``widths`` / ``contribs`` are a stack the kernels here take for (R, V) logits on ``device``."""
     widths = tuple(int(w) for w in widths)
-    if not STACK_MIN_WIDTHS <= len(widths) <= STACK_MAX_WIDTHS or len(contribs) != len(widths):
-        raise RuntimeError(f"balance_ce_per_token: a stack of {STACK_MIN_WIDTHS} to {STACK_MAX_WIDTHS} widths with one "
-                           f"contribution each is supported here, got widths {widths}, {len(contribs)} contributions")
+    if not 1 <= len(widths) <= STACK_MAX_WIDTHS or len(contribs) != len(widths):
+        raise RuntimeError(f"balance_ce_per_token: a stack of 1 to {STACK_MAX_WIDTHS} widths with one contribution "
+                           f"each is supported, got widths {widths}, {len(contribs)} contributions")
     if V < FWD_TILE_GROUPS * FWD_TILE_COLS:
-        raise RuntimeError(f"balance_ce_per_token: a stack of {len(widths)} widths needs at least "
-                           f"{FWD_TILE_GROUPS * FWD_TILE_COLS} columns (one forward tile), got V={V}")
+        raise RuntimeError(f"balance_ce_per_token: at least {FWD_TILE_GROUPS * FWD_TILE_COLS} columns (one forward "
+                           f"tile) are needed, got V={V}")
     for w, t in zip(widths, contribs):
         if w < 4 or w & (w - 1) or w > BWD_TILE:
             raise RuntimeError(f"balance_ce_per_token: width {w} of the stack {widths} must be a power of two with "

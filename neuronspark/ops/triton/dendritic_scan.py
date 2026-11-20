@@ -25,7 +25,9 @@ TMA descriptors: sm_90+.
 """
 from __future__ import annotations
 
+import contextlib
 import math
+from typing import Iterator
 
 import torch
 import torch.nn.functional as F
@@ -189,7 +191,8 @@ def chunk_scan_fwd_tma(cb, x, dt, dA_cumsum, C, states, D):
 # chunked scan in float64 between the kernels' rounding points, which they reproduce: the masked fp32 operand tile that
 # a kernel rounds to bf16 before its dot is evaluated in fp32 with the kernel's expression order (the decay ``tl.exp``
 # as ``exp2(t * log2 e)``, see ``dendritic_states._exp_f32``) and rounded the same way.  ``ssd_forward_ref`` is the
-# float32 differentiable whole-forward math without the kernels' internal roundings.
+# float32 differentiable whole-forward math without the kernels' internal roundings; its forward runs in IEEE float32
+# whatever the caller's autocast and TF32 settings.
 def _tril(chunk: int, device) -> torch.Tensor:
     i = torch.arange(chunk, device=device)
     return i[:, None] >= i[None, :]
@@ -274,7 +277,40 @@ def ssd_forward_ref(x, dt_raw, A, B, C, chunk_size, D, dt_bias):
     = dt A per step, chunked: intra-chunk y_diag[l] = sum_{s <= l} (C_l . B_s) exp(dA_cs[l] - dA_cs[s]) dt_s x_s, chunk
     states and their passing, the inter-chunk term exp(dA_cs[l]) C_l s_c^T, and D x. x (b, l, h, P), dt_raw (b, l, h), A
     / D / dt_bias (h,),
-    B / C (b, l, 1, N); returns y (b, l, h, P) in x's dtype."""
+    B / C (b, l, 1, N); returns y (b, l, h, P) in x's dtype.
+
+    The forward is IEEE float32 under any caller setting: it runs with autocast off (under bf16 autocast PyTorch casts
+    the operands of a CUDA ``einsum`` to bf16) and with ``torch.backends.cuda.matmul.allow_tf32`` off (the caller's
+    setting is put back before returning, also when the forward raises); one rounding to x's dtype at the end.  The
+    backward is autograd's and runs under the settings of the caller's ``backward()``."""
+    with _ieee_float32(x.device):
+        return _ssd_forward_f32(x, dt_raw, A, B, C, chunk_size, D, dt_bias)
+
+
+@contextlib.contextmanager
+def _ieee_float32(device: torch.device) -> Iterator[None]:
+    """Autocast off and IEEE float32 products (no TF32) inside; the caller's settings on exit.  The cuBLAS switch is
+    read and restored through ``allow_tf32``; a float32 matmul precision the caller chose by name (``"medium"`` /
+    ``"high"``: ``torch.set_float32_matmul_precision``) is set again by name, which ``allow_tf32 = True`` alone
+    would turn into ``"high"``."""
+    mm = torch.backends.cuda.matmul
+    saved_tf32 = mm.allow_tf32
+    try:
+        saved_name = torch.get_float32_matmul_precision()
+    except RuntimeError:                 # set through both interfaces: the name is not readable, the switch is
+        saved_name = None
+    mm.allow_tf32 = False
+    try:
+        with torch.autocast(device.type, enabled=False):
+            yield
+    finally:
+        mm.allow_tf32 = saved_tf32
+        if saved_name is not None:
+            torch.set_float32_matmul_precision(saved_name)
+
+
+def _ssd_forward_f32(x, dt_raw, A, B, C, chunk_size, D, dt_bias):
+    """:func:`ssd_forward_ref`'s expressions (float32 operands; the process settings are the caller's)."""
     batch, seqlen, nheads, headdim = x.shape
     nchunks = math.ceil(seqlen / chunk_size)
     L = nchunks * chunk_size

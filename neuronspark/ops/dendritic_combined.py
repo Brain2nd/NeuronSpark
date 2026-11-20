@@ -294,7 +294,8 @@ def dendritic_chunk_scan_soma_ref(zxbcdt: torch.Tensor, conv_w: torch.Tensor, co
                            A: torch.Tensor, D: torch.Tensor, theta: torch.Tensor, gamma: torch.Tensor, *,
                            alpha: float = 8.0, chunk_size: int = CHUNK_SIZE) -> torch.Tensor:
     """Pure torch (differentiable): the conv tap chain (``dendritic_conv_silu_ref``), the float32 chunked SSD forward
-    with the kernels' softplus form (``ssd_forward_ref``), the fp32 gated RMSNorm (unit weight, eps 1e-5) rounded to
+    with the kernels' softplus form (``ssd_forward_ref``: IEEE float32 under any caller setting of autocast and
+    TF32), the fp32 gated RMSNorm (unit weight, eps 1e-5) rounded to
     bf16, the bipolar release with the sigmoid surrogate (``bipolar_release``) times gamma, rounded to bf16. Storage
     roundings kept at the kernels' tensor boundaries (conv output, y, n, xs: bf16); no rounding inside the scan. The
     scan is the

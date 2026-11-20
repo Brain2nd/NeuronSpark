@@ -11,6 +11,16 @@ Numerics contract (training, whole-row regime):
   and an fp32 result.  It is returned as the weight's gradient (fp32 ``.grad`` through AccumulateGrad); nothing is
   rounded to bf16.  A weight used twice in one backward (the tied embedding: readout + lookup) receives the fp32
   sum of its contributions from autograd.
+* weight gradient of a weight bound with :func:`bind_grad_` (an optimizer that owns the weight's ``.grad`` buffer):
+  the same GEMM accumulates into ``weight.grad`` itself, ``grad = grad + dy2^T x2`` (``torch.addmm`` with ``out=`` the
+  buffer: beta 1, no temporary and no separate add), and autograd receives no gradient for the weight from this
+  operator.  What accumulates in the buffer is what AccumulateGrad would have added: several backwards accumulate,
+  and another use of the weight in the same backward (the tied embedding's lookup) adds its contribution through
+  autograd as before.  ``torch.autograd.grad`` with respect to a bound weight and tensor hooks on it do not see this
+  operator's contribution, and every backward that runs through the operator writes the buffer, also one asked for
+  other tensors only (``torch.autograd.grad`` with respect to an activation): bind only weights whose gradient is read
+  from ``.grad`` in a step made of ``backward()`` calls.  The bound buffer must stay the weight's ``.grad``: a
+  training call or a backward that finds another tensor there, or none, raises.
 * input gradient: ``dx = dy2 @ weight_bf16``, one GEMM with bf16 operands that writes the result in ``x.dtype``: bf16
   for a bf16 input, fp32 for an fp32 input (``torch.mm(dy2, weight_bf16, out_dtype=torch.float32)``: the fp32
   accumulation stored as it is, no bf16 output widened by a second kernel; a GEMM with an fp32 result exists on CUDA
@@ -59,12 +69,15 @@ __all__ = [
     "inference_weight",
     "stacked_inference_weight",
     "stacked_bands",
+    "bind_grad_",
+    "unbind_grad_",
     "padded_extent",
     "inference_extent",
 ]
 
 _CACHE_ATTR = "_ns_bf16"
 _VERSION_ATTR = "_ns_bf16_version"
+_GRAD_ATTR = "_ns_grad_buffer"
 # training GEMMs of an output-feature count that is not a multiple of ALIGN run on the extent rounded up to PAD_MULTIPLE
 # (the tied readout's vocabulary: 151,669 -> 151,680)
 ALIGN = 8
@@ -194,13 +207,56 @@ def inference_weight(weight: torch.Tensor) -> torch.Tensor:
     return weight if w is None else w[:int(weight.shape[0])]
 
 
+# ------------------------------------------------------------------------------------------------ bound gradient
+def bind_grad_(param: torch.Tensor) -> None:
+    """Make the training backward accumulate the weight gradient of ``param`` into its present ``param.grad`` (see
+    the module docstring).  ``param`` is a 2-D fp32 leaf whose ``.grad`` exists: a dense contiguous fp32 tensor of the
+    weight's shape on its device, kept by the caller (an optimizer's gradient buffer).  That tensor is the bound
+    buffer; it must stay the weight's ``.grad`` (zeroed in place, never replaced or removed) until
+    :func:`unbind_grad_` or the next ``bind_grad_``."""
+    if param.dim() != 2 or param.dtype != torch.float32 or not param.is_leaf:
+        raise RuntimeError(f"bind_grad_: expected a 2-D fp32 leaf weight, got {tuple(param.shape)} {param.dtype}"
+                           f"{'' if param.is_leaf else ' (not a leaf)'}")
+    g = param.grad
+    if g is None:
+        raise RuntimeError("bind_grad_: the weight has no .grad to bind")
+    if g.layout != torch.strided or g.dtype != torch.float32 or g.shape != param.shape or g.device != param.device \
+            or not g.is_contiguous() or g.requires_grad:
+        raise RuntimeError(f"bind_grad_: the .grad of a weight {tuple(param.shape)} on {param.device} must be a dense "
+                           f"contiguous fp32 tensor of that shape on that device without a graph, got {g.layout} "
+                           f"{g.dtype} {tuple(g.shape)} on {g.device}")
+    setattr(param, _GRAD_ATTR, g)
+
+
+def unbind_grad_(param: torch.Tensor) -> None:
+    """Undo :func:`bind_grad_`: the weight gradient is returned to autograd again (no-op when not bound)."""
+    if hasattr(param, _GRAD_ATTR):
+        delattr(param, _GRAD_ATTR)
+
+
+def _bound_grad(weight: torch.Tensor) -> Optional[torch.Tensor]:
+    """The gradient buffer bound to ``weight`` (:func:`bind_grad_`) or None; raises when the weight's ``.grad`` is no
+    longer that buffer."""
+    g = getattr(weight, _GRAD_ATTR, None)
+    if g is None:
+        return None
+    now = weight.grad
+    if now is not g and (now is None or now.data_ptr() != g.data_ptr() or now.shape != g.shape
+                         or now.dtype != g.dtype or not now.is_contiguous()):
+        raise RuntimeError("neuronspark.ops.linear: the gradient buffer of a weight bound with bind_grad_ was "
+                           f"{'removed' if now is None else 'replaced'} (its .grad is no longer the bound tensor); "
+                           "bind it again or unbind it")
+    return g
+
+
 # ------------------------------------------------------------------------------------------------ autograd Function
 class Fp32WgradLinearFn(torch.autograd.Function):
     """``y = x @ W^T`` with bf16 operands, bf16 output, fp32 weight gradient, input gradient in ``x.dtype``.
 
     The output has ``padded_extent(N)`` features: for an N that is not a multiple of 8 the pad columns are exactly 0 and
     :func:`linear` returns the (..., N) view; the gradient then reaches backward as the (..., P) tensor of the slice's
-    backward (pad columns 0)."""
+    backward (pad columns 0).  The weight gradient of a bound weight (:func:`bind_grad_`) is accumulated into its
+    ``.grad`` by the backward, which then returns none for it."""
 
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -220,6 +276,8 @@ class Fp32WgradLinearFn(torch.autograd.Function):
         ctx.input_dtype = x.dtype
         ctx.input_shape = x.shape
         ctx.out_features = n
+        # a bound weight is kept for the backward, which accumulates into the buffer bound to it then
+        ctx.bound_weight = weight if weight.requires_grad and _bound_grad(weight) is not None else None
         ctx.save_for_backward(xb, wb)
         return out
 
@@ -237,7 +295,11 @@ class Fp32WgradLinearFn(torch.autograd.Function):
                                    f"expected {int(wb.shape[0])}")
             if ctx.needs_input_grad[1]:
                 x2 = xb.reshape(-1, xb.shape[-1]).contiguous()
-                dw = torch.mm(dy2[:, :n].t(), x2, out_dtype=torch.float32)
+                g = None if ctx.bound_weight is None else _bound_grad(ctx.bound_weight)
+                if g is None:
+                    dw = torch.mm(dy2[:, :n].t(), x2, out_dtype=torch.float32)
+                else:
+                    torch.addmm(g, dy2[:, :n].t(), x2, out_dtype=torch.float32, out=g)
             if ctx.needs_input_grad[0]:
                 if ctx.input_dtype == torch.float32 and dy2.is_cuda:
                     dx = torch.mm(dy2, wb, out_dtype=torch.float32).reshape(ctx.input_shape)
@@ -252,7 +314,8 @@ def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
     With autograd (grad mode on and ``x`` or ``weight`` requiring grad) the :class:`Fp32WgradLinearFn` path runs and the
     weight must be fp32; for an N that is not a multiple of 8 the result is the (..., N) view of the padded (..., P)
-    output (row stride P, see the module docstring).  Otherwise the inference path runs: the current bf16 cache of the
+    output (row stride P, see the module docstring); a weight bound with :func:`bind_grad_` has its gradient
+    accumulated into ``weight.grad`` by the backward.  Otherwise the inference path runs: the current bf16 cache of the
     weight (see :func:`cache_bf16_`) or ``weight.to(bf16)``.
     """
     _check(x, weight)

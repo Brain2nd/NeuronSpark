@@ -3,7 +3,7 @@
 asynchronous tcgen05 MMAs into tensor memory), each with one load warp, one MMA warp and a default 4-warp compute
 partition holding one tile row per thread; P and dS enter their products as two bf16 pieces.
 
-* ``pool_read_dv_gluon`` -> dgv (T, B, H, dv) bf16: one CTA per (key tile of BNK rows, b, key head), longest first; per
+* ``pool_read_dv_gluon`` -> dgv (T, B, H, dv) fp32: one CTA per (key tile of BNK rows, b, key head), longest first; per
   step (a query tile of BMQ_V rows of one query head of the key head) S^T = K Q^T (one step ahead), P^T =
   exp(scale S^T + bias^T - lse) (the tile's bias from the id windows, the clock difference and the bf16 rounding; the
   causal mask on the diagonal steps), dV += P^T dO;
@@ -145,7 +145,7 @@ def _dv_compute(k_s, q_s, do_s, lse_s, cq_s, qt_s, p1_s, p2_s, st_tm, dv_tm, k_b
         fence_async_shared()
         gl.thread_barrier()
         mbarrier.arrive(p_ready)
-    # epilogue: dV in bf16
+    # epilogue: dV (fp32: the caller rounds it, after summing the key slots that share a head's values)
     mbarrier.wait(done, 0)
     _tc_fence(1, 4)
     LO: gl.constexpr = get_tmem_32x32b_reg_layout(BNK, 64, [BNK, 64], 4)
@@ -154,7 +154,7 @@ def _dv_compute(k_s, q_s, do_s, lse_s, cq_s, qt_s, p1_s, p2_s, st_tm, dv_tm, k_b
     for c in gl.static_range(DV // 64):
         g = dv_tm.slice(c * 64, 64).load(LO)
         ptr = orow[:, None] + (c * 64 + gl.arange(0, 64, layout=gl.SliceLayout(0, LO)))[None, :]
-        gl.store(DGV + ptr, g.to(gl.bfloat16), mask=(jo < T)[:, None])
+        gl.store(DGV + ptr, g, mask=(jo < T)[:, None])
 
 
 @gluon.jit
@@ -706,7 +706,7 @@ def _tile_desc(x: torch.Tensor, block_rows: int) -> TensorDescriptor:
 def pool_read_dv_gluon(q16: torch.Tensor, k16: torch.Tensor, do16: torch.Tensor, lse: torch.Tensor,
                        cum_t: torch.Tensor, qtok_t: torch.Tensor, ktok: torch.Tensor, slots: torch.Tensor,
                        ordmask: int, scale: float, dv: int) -> torch.Tensor:
-    """The tagged values' gradient (T, B, H, dv) bf16 of the pool read (see the module docstring): q16 (T, B, HQ, dk)
+    """The tagged values' gradient (T, B, H, dv) fp32 of the pool read (see the module docstring): q16 (T, B, HQ, dk)
     / k16 (T, B, H, dk) bf16, do16 (T, B, HQ, dv) bf16, lse (B, HQ, T) fp32, cum_t (B H, T) fp32, qtok_t (B n_max, T)
     int32, ktok (B, T, n_max) int32, slots (H, NB) fp32."""
     require_cuda(q16, "pool_read_dv_gluon")
@@ -722,7 +722,7 @@ def pool_read_dv_gluon(q16: torch.Tensor, k16: torch.Tensor, do16: torch.Tensor,
     if (tuple(do16.shape) != (T, B, HQ, dv) or tuple(lse.shape) != (B, HQ, T) or tuple(cum_t.shape) != (B * H, T)
             or tuple(qtok_t.shape) != (B * NMAX, T) or tuple(ktok.shape) != (B, T, NMAX) or T % 4 or dv % 64):
         raise RuntimeError("neuronspark.pool_read_dv_gluon: shapes")
-    dgv = torch.empty((T, B, H, dv), dtype=torch.bfloat16, device=q16.device)
+    dgv = torch.empty((T, B, H, dv), dtype=torch.float32, device=q16.device)
     kd = _tile_desc(k16, BNK)
     qd = _tile_desc(q16, BMQ_V)
     dod = _tile_desc(do16, BMQ_V)

@@ -5,17 +5,19 @@ Launchers (used by :mod:`neuronspark.ops.pool_attend` and :mod:`neuronspark.ops.
 
 * :func:`pack_heads_fwd`: for every head ``h < H`` (channels ``[h dk, (h + 1) dk)``) the unit keys
   ``k / max(|k|, eps)``, the gained unit queries ``(q / max(|q|, eps)) gain_h`` and the tagged values
-  ``bf16(sigmoid(gate + wbias_h - sparsity)) v``, each rounded once to bf16 and written into the contiguous
-  ``(T, B, H, dk)`` tensors the read's kernels take (the queries into slots ``0 .. H - 1`` of ``(T, B, HQ, dk)``); the
-  fp32 norms are kept for the backward.  One launch.
+  ``bf16(sigmoid(gate + wbias_h - sparsity)) v``, each rounded once to bf16 and written into slot ``h`` of the
+  contiguous ``(T, B, HQ, dk)`` tensors the read's kernels take, HQ = H + M; the last head's keys and tagged values
+  are also written into slots ``H .. HQ - 1``, one copy per extra query (see "Key slots" below); the fp32 norms are
+  kept for the backward.  One launch.
 * :func:`pack_xq_fwd`: the M extra queries of the last head, ``normalize(rope(silu(x_m))) exp(clamp(psi_m, -3, 3))
   gain_{H-1}``, written into slots ``H .. H + M - 1`` of the query tensor.  One launch.
-* :func:`pack_heads_bwd`: from the read's fp32 query / key gradients and bf16 value gradient, the gradients of q, k, v
-  (bf16), of the gate (fp32) and the per-program partial sums of the gain and write-bias gradients.  One launch.
+* :func:`pack_heads_bwd`: from the read's fp32 query / key / value gradients and clock gradient per slot, the gradients of q, k, v (bf16), of the gate (fp32), of the H clocks (fp32) and the per-program partial sums
+  of the gain and write-bias gradients; the last head's key, value and clock gradients are the sums over its slots.
+  One launch.
 * :func:`pack_xq_bwd`: the gradients of the M projections (bf16), of psi (bf16) and the partial sums of the last
   head's gain gradient.  One launch.
-* :func:`fold_gain_bias`: the gain gradient (bf16) and the write-bias gradient (fp32) from those partial sums.  One
-  launch.
+* :func:`fold_gain_bias`: the gain gradient (bf16) and the write-bias gradient (fp32) from those partial sums, and
+  the beta-slot sums of the H heads from the sums per slot.  One launch.
 * :func:`read_delta`: ``D[b, i, t] = sum_c dO[t, b, i, c] O[t, b, i, c]`` (the softmax backward's row term).  One
   launch.
 * :func:`read_unpack`: the bf16 reads (T, B, H + M, dv) as the H heads' fp32 (T, B, H dv) and the extra queries'
@@ -23,11 +25,19 @@ Launchers (used by :mod:`neuronspark.ops.pool_attend` and :mod:`neuronspark.ops.
 * :func:`read_delta_split`: the bf16 gradient of the reads from the gradients of those two tensors, with the row term.
   One launch.
 
+Key slots: the read's key-major backward kernels run one CTA per (key tile, row, key head) and step through the query
+heads that read that key head.  With the last head's keys in one slot its CTAs would serve 1 + M query heads and take
+1 + M times the steps of the others, and the kernel would last as long as its longest CTA.  With one key slot per
+query head every CTA serves one query head: the same work in CTAs of equal length (640 instead of 384 at T 1024, B 8,
+H 6, M 4), spread over the SMs.  The repeated keys and values are the same bf16 values, and the gradients of the
+slots are summed in fp32.
+
 Numerics: fp32 arithmetic on the widened bf16 operands; a value is rounded to bf16 where the torch chain holds a bf16
 tensor (the SiLU output, each product and the sum of the rotation, the sigmoid tag, the stored operands, the two terms
 and the sum of a normalisation's input gradient, the rotation's backward, each contribution to the gain's gradient
 and their accumulation).  The norms are in-kernel fp32 sums.  The
-rule of :mod:`neuronspark.utils.testing` against :func:`neuronspark.ops.pool_attend.pool_attend_ref`.
+products and sums are separate fp32 operations (no FMA contraction).  The rule of
+:mod:`neuronspark.utils.testing` against :func:`neuronspark.ops.pool_attend.pool_attend_ref`.
 """
 from __future__ import annotations
 
@@ -79,8 +89,9 @@ def _r16(x):
 @triton.jit
 def _heads_fwd_kernel(Q, K, G, V, GAIN, BIAS, QA, KA, GV, QN, KN, T, B, H, HQ, DK, SP, EPS,
                       qs0, qs1, qs2, ks0, ks1, ks2, gs0, gs1, gs2, vs0, vs1, vs2,
-                      BT: tl.constexpr, BD: tl.constexpr):
-    """head h, BT positions of one b: unit keys, gained unit queries, tagged values (bf16) and the two fp32 norms."""
+                      BT: tl.constexpr, BD: tl.constexpr, MAXM: tl.constexpr):
+    """head h, BT positions of one b: unit keys, gained unit queries, tagged values (bf16) into slot h of the
+    (T, B, HQ, dk) tensors (the last head's keys and values also into slots H .. HQ - 1) and the two fp32 norms."""
     b = tl.program_id(1).to(tl.int64)
     h = tl.program_id(2).to(tl.int64)
     t = (tl.program_id(0) * BT + tl.arange(0, BT)).to(tl.int64)
@@ -98,21 +109,30 @@ def _heads_fwd_kernel(Q, K, G, V, GAIN, BIAS, QA, KA, GV, QN, KN, T, B, H, HQ, D
     gain = _w(tl.load(GAIN + h))
     qo = (q / tl.maximum(qn, EPS)[:, None]) * gain
     ko = k / tl.maximum(kn, EPS)[:, None]
-    tl.store(QA + ((t[:, None] * B + b) * HQ + h) * DK + c[None, :], _n(qo), mask=m)
-    ho = ((t[:, None] * B + b) * H + h) * DK + c[None, :]
-    tl.store(KA + ho, _n(ko), mask=m)
+    row = (t[:, None] * B + b) * HQ
+    ho = (row + h) * DK + c[None, :]
+    tl.store(QA + ho, _n(qo), mask=m)
+    k16 = _n(ko)
+    tl.store(KA + ho, k16, mask=m)
     g = tl.load(G + (t[:, None] * gs0 + b * gs1 + ch[None, :] * gs2), mask=m, other=0.0)
     s = _w(_n(_sigmoid((g + tl.load(BIAS + h)) - SP)))
     v = _w(tl.load(V + (t[:, None] * vs0 + b * vs1 + ch[None, :] * vs2), mask=m, other=0.0))
-    tl.store(GV + ho, _n(s * v), mask=m)
+    gv16 = _n(s * v)
+    tl.store(GV + ho, gv16, mask=m)
+    for j in tl.static_range(MAXM):                      # the last head's keys and values, one slot per extra query
+        mx = m & ((h == H - 1) & (H + j < HQ))
+        hx = (row + (H + j)) * DK + c[None, :]
+        tl.store(KA + hx, k16, mask=mx)
+        tl.store(GV + hx, gv16, mask=mx)
 
 
 @triton.jit
-def _heads_bwd_kernel(DQ, DKK, DGV, Q, K, G, V, GAIN, BIAS, QN, KN, OQ, OK, OV, OG, PG, PB, T, B, H, HQ, DK, NP,
-                      SP, EPS, qs0, qs1, qs2, ks0, ks1, ks2, gs0, gs1, gs2, vs0, vs1, vs2,
-                      BT: tl.constexpr, BD: tl.constexpr):
+def _heads_bwd_kernel(DQ, DKK, DGV, DCUM, Q, K, G, V, GAIN, BIAS, QN, KN, OQ, OK, OV, OG, OCUM, PG, PB, T, B, H, HQ,
+                      DK, NP, SP, EPS, qs0, qs1, qs2, ks0, ks1, ks2, gs0, gs1, gs2, vs0, vs1, vs2,
+                      BT: tl.constexpr, BD: tl.constexpr, MAXM: tl.constexpr):
     """head h, BT positions of one b: the gradients of q, k, v (bf16) and of the gate (fp32) into contiguous
-    (T, B, H dk) tensors; PG[h, prog] = sum dq (q / d), PB[h, prog] = sum dgate."""
+    (T, B, H dk) tensors and of the clock into (T, B, H), from the read's gradients per slot (T, B, HQ, .) (the last
+    head: the fp32 sum over slots H - 1 .. HQ - 1); PG[h, prog] = sum dq (q / d), PB[h, prog] = sum dgate."""
     b = tl.program_id(1).to(tl.int64)
     h = tl.program_id(2).to(tl.int64)
     prog = tl.program_id(0) * B + tl.program_id(1)
@@ -123,8 +143,19 @@ def _heads_bwd_kernel(DQ, DKK, DGV, Q, K, G, V, GAIN, BIAS, QN, KN, OQ, OK, OV, 
     ch = h * DK + c
     ho = ((t[:, None] * B + b) * H + h) * DK + c[None, :]
     no = (t * B + b) * H + h
+    row = (t * B + b) * HQ
+    so = (row[:, None] + h) * DK + c[None, :]
+    gk = tl.load(DKK + so, mask=m, other=0.0)
+    dgv = tl.load(DGV + so, mask=m, other=0.0)
+    dc = tl.load(DCUM + (row + h), mask=tm, other=0.0)
+    for j in tl.static_range(MAXM):                      # the last head: the other slots of its keys
+        ex = (h == H - 1) & (H + j < HQ)
+        sx = (row[:, None] + (H + j)) * DK + c[None, :]
+        gk += tl.load(DKK + sx, mask=m & ex, other=0.0)
+        dgv += tl.load(DGV + sx, mask=m & ex, other=0.0)
+        dc += tl.load(DCUM + (row + (H + j)), mask=tm & ex, other=0.0)
+    tl.store(OCUM + no, dc, mask=tm)
     # keys: y = k / d, d = max(n, eps)
-    gk = tl.load(DKK + ho, mask=m, other=0.0)
     k = _w(tl.load(K + (t[:, None] * ks0 + b * ks1 + ch[None, :] * ks2), mask=m, other=0.0))
     kn = tl.load(KN + no, mask=tm, other=1.0)
     kd = tl.maximum(kn, EPS)
@@ -142,8 +173,9 @@ def _heads_bwd_kernel(DQ, DKK, DGV, Q, K, G, V, GAIN, BIAS, QN, KN, OQ, OK, OV, 
     sq = tl.where(qn >= EPS, dots * gain, 0.0) / qd
     tl.store(OQ + ho, _n(_r16((gq * gain) / qd[:, None]) - _r16(sq[:, None] * qh)), mask=m)
     tl.store(PG + (h * NP + prog), tl.sum(dots, axis=0))
-    # tagged values: gv = bf16(s16 v), s16 = bf16(s), s = sigmoid(gate + bias - sparsity)
-    dgv = _w(tl.load(DGV + ho, mask=m, other=0.0))
+    # tagged values: gv = bf16(s16 v), s16 = bf16(s), s = sigmoid(gate + bias - sparsity); the read's gradient of gv
+    # is rounded to bf16 once, after the sum over the slots
+    dgv = _r16(dgv)
     g = tl.load(G + (t[:, None] * gs0 + b * gs1 + ch[None, :] * gs2), mask=m, other=0.0)
     s = _sigmoid((g + tl.load(BIAS + h)) - SP)
     v = _w(tl.load(V + (t[:, None] * vs0 + b * vs1 + ch[None, :] * vs2), mask=m, other=0.0))
@@ -235,11 +267,19 @@ def _xq_bwd_kernel(DQ, X0, X1, X2, X3, X4, X5, X6, X7, PSI, GAIN, C, S, OX, OPSI
 
 
 @triton.jit
-def _fold_kernel(PG, PB, PX, DGAIN, DBIAS, H, M, NP, BLOCK: tl.constexpr, MAXM: tl.constexpr):
+def _fold_kernel(PG, PB, PX, DSL, DGAIN, DBIAS, OSL, H, M, NP, NB, BLOCK: tl.constexpr, MAXM: tl.constexpr,
+                 NBP: tl.constexpr):
     """head h: DBIAS[h] = sum PB[h] (fp32) and DGAIN[h] = bf16(sum PG[h]); for the last head the extra queries'
     contributions come first, each sum PX[m] rounded to bf16 and added in bf16 from the last query to the first (the
-    order in which the gain's gradient is accumulated), then the head's own."""
+    order in which the gain's gradient is accumulated), then the head's own.  OSL[h] = the beta-slot sums DSL of
+    slot h (the last head: summed over slots H - 1 .. H + M - 1)."""
     h = tl.program_id(0)
+    n = tl.arange(0, NBP)
+    nm = n < NB
+    sl = tl.load(DSL + (h * NB + n), mask=nm, other=0.0)
+    for j in tl.static_range(MAXM):
+        sl += tl.load(DSL + ((H + j) * NB + n), mask=nm & ((h == H - 1) & (j < M)), other=0.0)
+    tl.store(OSL + (h * NB + n), sl, mask=nm)
     i = tl.arange(0, BLOCK)
     ag = tl.zeros([BLOCK], dtype=tl.float32)
     ab = tl.zeros([BLOCK], dtype=tl.float32)
@@ -327,40 +367,49 @@ def _dims(q: torch.Tensor, H: int) -> Tuple[int, int, int]:
 
 
 def pack_heads_fwd(q, k, gate, v, gain, wbias, sparsity: float, q16, k16, gv) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Writes slots 0 .. H - 1 of q16 (T, B, HQ, dk), k16 and gv (T, B, H, dk) (contiguous bf16) from q, k, v
-    (T, B, H dk) bf16, gate (T, B, H dk) fp32, gain (H,) bf16, wbias (H,) fp32 (any strides for the 3-D operands);
-    returns the fp32 norms (qn, kn), (T, B, H) each."""
+    """Writes slots 0 .. H - 1 of q16 and every slot of k16 and gv (contiguous bf16 (T, B, HQ, dk); slots H .. HQ - 1
+    of k16 and gv repeat the last head) from q, k, v (T, B, H dk) bf16, gate (T, B, H dk) fp32, gain (H,) bf16, wbias
+    (H,) fp32 (any strides for the 3-D operands); returns the fp32 norms (qn, kn), (T, B, H) each."""
     H = int(gain.shape[0])
     T, B, dk = _dims(q, H)
     HQ = int(q16.shape[2])
+    if not 0 <= HQ - H <= MAX_M or k16.shape != q16.shape or gv.shape != q16.shape:
+        raise RuntimeError(f"neuronspark.pool_pack: {H} heads and up to {MAX_M} extra queries in (T, B, HQ, dk) "
+                           f"tensors, got {tuple(q16.shape)}, {tuple(k16.shape)}, {tuple(gv.shape)}")
     qn = torch.empty((T, B, H), dtype=torch.float32, device=q.device)
     kn = torch.empty((T, B, H), dtype=torch.float32, device=q.device)
     _heads_fwd_kernel[(triton.cdiv(T, PACK_BT), B, H)](
         q, k, gate, v, gain, wbias, q16, k16, gv, qn, kn, T, B, H, HQ, dk, float(sparsity), NORM_EPS,
-        *_s3(q), *_s3(k), *_s3(gate), *_s3(v), BT=PACK_BT, BD=_pow2(dk), num_warps=PACK_WARPS)
+        *_s3(q), *_s3(k), *_s3(gate), *_s3(v), BT=PACK_BT, BD=_pow2(dk), MAXM=MAX_M, num_warps=PACK_WARPS, enable_fp_fusion=False)
     return qn, kn
 
 
-def pack_heads_bwd(dq, dkk, dgv, q, k, gate, v, gain, wbias, sparsity: float, qn, kn):
-    """(dq_in, dk_in, dv_in bf16 (T, B, H dk), dgate fp32 (T, B, H dk), PG, PB (H, programs) fp32 partial sums of the
-    gain and write-bias gradients) from the read's dq (T, B, HQ, dk) fp32, dk (T, B, H, dk) fp32 and dgv bf16."""
+def pack_heads_bwd(dq, dkk, dgv, dcum, q, k, gate, v, gain, wbias, sparsity: float, qn, kn):
+    """(dq_in, dk_in, dv_in bf16 (T, B, H dk), dgate fp32 (T, B, H dk), dcum fp32 (T, B, H), PG, PB (H, programs)
+    fp32 partial sums of the gain and write-bias gradients) from the read's gradients per slot: dq, dk, dgv
+    (T, B, HQ, dk) fp32 and dcum (T, B, HQ) fp32."""
     H = int(gain.shape[0])
     T, B, dk = _dims(q, H)
     HQ = int(dq.shape[2])
+    if (tuple(dkk.shape) != (T, B, HQ, dk) or tuple(dgv.shape) != (T, B, HQ, dk) or tuple(dcum.shape) != (T, B, HQ)
+            or dgv.dtype != torch.float32 or not 0 <= HQ - H <= MAX_M):
+        raise RuntimeError(f"neuronspark.pool_pack: the read's gradients per slot ({T}, {B}, {HQ}, {dk}) required, "
+                           f"got {tuple(dkk.shape)}, {tuple(dgv.shape)}, {tuple(dcum.shape)}")
     dev = q.device
     oq = torch.empty((T, B, H * dk), dtype=torch.bfloat16, device=dev)
     ok = torch.empty((T, B, H * dk), dtype=torch.bfloat16, device=dev)
     ov = torch.empty((T, B, H * dk), dtype=torch.bfloat16, device=dev)
     og = torch.empty((T, B, H * dk), dtype=torch.float32, device=dev)
+    ocum = torch.empty((T, B, H), dtype=torch.float32, device=dev)
     npt = triton.cdiv(T, PACK_BT)
     NP = npt * B
     pg = torch.empty((H, NP), dtype=torch.float32, device=dev)
     pb = torch.empty((H, NP), dtype=torch.float32, device=dev)
     _heads_bwd_kernel[(npt, B, H)](
-        dq, dkk, dgv, q, k, gate, v, gain, wbias, qn, kn, oq, ok, ov, og, pg, pb, T, B, H, HQ, dk, NP,
+        dq, dkk, dgv, dcum, q, k, gate, v, gain, wbias, qn, kn, oq, ok, ov, og, ocum, pg, pb, T, B, H, HQ, dk, NP,
         float(sparsity), NORM_EPS, *_s3(q), *_s3(k), *_s3(gate), *_s3(v),
-        BT=PACK_BT, BD=_pow2(dk), num_warps=PACK_WARPS)
-    return oq, ok, ov, og, pg, pb
+        BT=PACK_BT, BD=_pow2(dk), MAXM=MAX_M, num_warps=PACK_WARPS, enable_fp_fusion=False)
+    return oq, ok, ov, og, ocum, pg, pb
 
 
 def _xq_operands(xq: Sequence[torch.Tensor], psi, cos, sin, T: int, B: int, dk: int) -> List[torch.Tensor]:
@@ -394,7 +443,7 @@ def pack_xq_fwd(xq: Sequence[torch.Tensor], psi, gain, cos, sin, q16) -> None:
     _xq_fwd_kernel[(triton.cdiv(T, PACK_BT), B, M)](
         *pad, psi, gain, cos, sin, q16, T, B, H, HQ, dk, NORM_EPS, PSI_CLAMP,
         int(xs[0].stride(0)), int(xs[0].stride(1)), *_s3(psi), int(cos.stride(0)), int(cos.stride(1)),
-        int(sin.stride(0)), int(sin.stride(1)), BT=PACK_BT, BD=_pow2(dk), num_warps=PACK_WARPS)
+        int(sin.stride(0)), int(sin.stride(1)), BT=PACK_BT, BD=_pow2(dk), num_warps=PACK_WARPS, enable_fp_fusion=False)
 
 
 def pack_xq_bwd(dq, xq: Sequence[torch.Tensor], psi, gain, cos, sin):
@@ -414,20 +463,26 @@ def pack_xq_bwd(dq, xq: Sequence[torch.Tensor], psi, gain, cos, sin):
     _xq_bwd_kernel[(npt, B, M)](
         dq, *pad, psi, gain, cos, sin, ox, opsi, px, T, B, H, HQ, M, dk, NP, NORM_EPS, PSI_CLAMP,
         int(xs[0].stride(0)), int(xs[0].stride(1)), *_s3(psi), int(cos.stride(0)), int(cos.stride(1)),
-        int(sin.stride(0)), int(sin.stride(1)), BT=PACK_BT, BD=_pow2(dk), num_warps=PACK_WARPS)
+        int(sin.stride(0)), int(sin.stride(1)), BT=PACK_BT, BD=_pow2(dk), num_warps=PACK_WARPS, enable_fp_fusion=False)
     return ox, opsi, px
 
 
-def fold_gain_bias(pg: torch.Tensor, pb: torch.Tensor, px=None) -> Tuple[torch.Tensor, torch.Tensor]:
-    """(the gain gradient (H,) bf16, the write-bias gradient (H,) fp32) from the partial sums PG, PB (H, programs) of
-    :func:`pack_heads_bwd` and PX (M, programs) of :func:`pack_xq_bwd` (``None`` without extra queries)."""
+def fold_gain_bias(pg: torch.Tensor, pb: torch.Tensor, px, dslots: torch.Tensor):
+    """(the gain gradient (H,) bf16, the write-bias gradient (H,) fp32, the beta-slot sums (H, NB) fp32) from the
+    partial sums PG, PB (H, programs) of :func:`pack_heads_bwd`, PX (M, programs) of :func:`pack_xq_bwd` (``None``
+    without extra queries) and the read's beta-slot sums per slot (H + M, NB)."""
     H, NP = int(pg.shape[0]), int(pg.shape[1])
     M = 0 if px is None else int(px.shape[0])
+    NB = int(dslots.shape[1])
+    if tuple(dslots.shape) != (H + M, NB) or dslots.dtype != torch.float32 or not dslots.is_contiguous():
+        raise RuntimeError(f"neuronspark.pool_pack: the beta-slot sums must be contiguous fp32 ({H + M}, NB), got "
+                           f"{dslots.dtype} {tuple(dslots.shape)}")
     d_gain = torch.empty((H,), dtype=torch.bfloat16, device=pg.device)
     d_bias = torch.empty((H,), dtype=torch.float32, device=pg.device)
-    _fold_kernel[(H,)](pg, pb, pg if px is None else px, d_gain, d_bias, H, M, NP, BLOCK=FOLD_BLOCK, MAXM=MAX_M,
-                       num_warps=FOLD_WARPS)
-    return d_gain, d_bias
+    oslots = torch.empty((H, NB), dtype=torch.float32, device=pg.device)
+    _fold_kernel[(H,)](pg, pb, pg if px is None else px, dslots, d_gain, d_bias, oslots, H, M, NP, NB,
+                       BLOCK=FOLD_BLOCK, MAXM=MAX_M, NBP=_pow2(NB), num_warps=FOLD_WARPS)
+    return d_gain, d_bias, oslots
 
 
 def read_delta(do16: torch.Tensor, out32: torch.Tensor) -> torch.Tensor:

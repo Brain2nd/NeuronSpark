@@ -23,6 +23,12 @@ clock's column sums and the beta sums (key-major), the queries' gradient (query-
 ``-(column sums)``: the row sums of dS vanish (softmax is invariant to a shift of a row) and are not formed.  No
 atomics: the results do not depend on the scheduling.
 
+Key slots: the kernels are launched with one key head per query head (:func:`key_slots`: the last head's keys, tagged
+values, clock and beta repeated for the query heads H .. HQ - 1; the same bf16 values, so the same read), and the
+gradients of the repeated slots are summed in fp32 (:func:`fold_key_slots`).  A CTA of a key-major backward kernel then
+serves one query head, and all CTAs of a key tile have the same length; with the last head's keys in one slot its CTAs
+would take HQ - H + 1 times the steps of the others and the kernel would last as long as they do.
+
 Numerics: bf16 q, k, v with fp32 accumulation; P and dS enter their products as two bf16 pieces (16 significant bits);
 the bias formed with the definition's fp32 operations and rounding point.  The per-operator rule of
 :mod:`neuronspark.utils.testing` against :func:`pool_read_ref`.  (The previous materialising chain rounded the bf16
@@ -41,7 +47,8 @@ from neuronspark.ops.gluon.pool_read_fwd import pool_read_fwd_gluon
 from neuronspark.ops.triton import require_cuda
 from neuronspark.ops.triton.pool_pack import read_delta
 
-__all__ = ["pool_read", "pool_read_ref", "PoolReadFn", "read_backward", "MAX_ORDER", "NB"]
+__all__ = ["pool_read", "pool_read_ref", "PoolReadFn", "read_backward", "key_slots", "fold_key_slots", "MAX_ORDER",
+           "NB"]
 
 MAX_ORDER = 4
 NB = MAX_ORDER + 1           # beta slots per head (slot n = order n; slot 0 unused)
@@ -62,33 +69,56 @@ def _by_head_row(x: torch.Tensor) -> torch.Tensor:
     return x.permute(1, 2, 0).reshape(B * n, T).contiguous()
 
 
+def key_slots(x: torch.Tensor, n: int, dim: int) -> torch.Tensor:
+    """``x`` with its last entry along ``dim`` repeated ``n`` more times: one key slot per query head (see the module
+    docstring)."""
+    if n == 0:
+        return x
+    shape = list(x.shape)
+    shape[dim] = n
+    return torch.cat([x, x.narrow(dim, int(x.shape[dim]) - 1, 1).expand(shape)], dim=dim)
+
+
+def fold_key_slots(g: torch.Tensor, H: int, dim: int) -> torch.Tensor:
+    """The gradient of the H key heads from the gradient per key slot: the slots H - 1 .. of the last head summed."""
+    n = int(g.shape[dim])
+    if n == H:
+        return g
+    return torch.cat([g.narrow(dim, 0, H - 1), g.narrow(dim, H - 1, n - H + 1).sum(dim=dim, keepdim=True)], dim=dim)
+
+
 class PoolReadFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, gv, cum, beta_slots, qtok, ktok, ordmask, scale):
+        H, M = int(k.shape[2]), int(q.shape[2]) - int(k.shape[2])
         q16 = q.to(torch.bfloat16).contiguous()
-        k16 = k.to(torch.bfloat16).contiguous()
-        cum_t = _by_head_row(cum)
+        k16 = key_slots(k.to(torch.bfloat16), M, 2).contiguous()
+        gv = key_slots(gv, M, 2)
+        cum_t = _by_head_row(key_slots(cum, M, 2))
+        beta_slots = key_slots(beta_slots, M, 0)
         ktok_t = _by_head_row(ktok.permute(1, 0, 2))
         out, out32, lse = pool_read_fwd_gluon(q16, k16, gv, cum_t, ktok_t, qtok, beta_slots, ordmask, scale)
         ctx.save_for_backward(q16, k16, gv, cum_t, beta_slots, qtok, ktok, ktok_t, out32, lse)
-        ctx.meta = (ordmask, float(scale), q.dtype, k.dtype)
+        ctx.meta = (ordmask, float(scale), q.dtype, k.dtype, H)
         return out
 
     @staticmethod
     def backward(ctx, dout):
         q16, k16, gv, cum_t, beta_slots, qtok, ktok, ktok_t, out32, lse = ctx.saved_tensors
-        ordmask, scale, q_dtype, k_dtype = ctx.meta
+        ordmask, scale, q_dtype, k_dtype, H = ctx.meta
         do16 = dout.to(torch.bfloat16).contiguous()
         dq, dk, dgv, dcum, dslots = read_backward(do16, read_delta(do16, out32), q16, k16, gv, cum_t, beta_slots, qtok,
                                                   ktok, ktok_t, lse, ordmask, scale)
-        return dq.to(q_dtype), dk.to(k_dtype), dgv, dcum, dslots, None, None, None, None
+        return (dq.to(q_dtype), fold_key_slots(dk, H, 2).to(k_dtype), fold_key_slots(dgv, H, 2).to(torch.bfloat16),
+                fold_key_slots(dcum, H, 2), fold_key_slots(dslots, H, 0), None, None, None, None)
 
 
 def read_backward(do16, delta, q16, k16, gv, cum_t, beta_slots, qtok, ktok, ktok_t, lse, ordmask: int, scale: float):
     """The read's backward from the contiguous bf16 output gradient ``do16``, the row term ``delta`` (B, HQ, T) =
     D = sum_j P dP = dO . (P V) formed from the unrounded output (the bf16 output's rounding would bias every dS) and
-    the forward's operands and results: (dq (T, B, HQ, dk) fp32, dk (T, B, H, dk) fp32, dgv (T, B, H, dv) bf16, dcum
-    (T, B, H) fp32, the beta-slot sums (H, NB) fp32)."""
+    the forward's operands and results, the keys, values, clock rows and beta slots with one slot per query head
+    (H = HQ): (dq, dk (T, B, HQ, dk) fp32, dgv (T, B, HQ, dv) fp32, dcum (T, B, HQ) fp32, the beta-slot sums (HQ, NB)
+    fp32), each per key slot."""
     qtok_t = _by_head_row(qtok.permute(1, 0, 2))
     dgv = pool_read_dv_gluon(q16, k16, do16, lse, cum_t, qtok_t, ktok, beta_slots, ordmask, scale,
                              int(gv.shape[-1]))

@@ -26,7 +26,9 @@ RoPE band of the last head, ``cum`` fp32 (T, B, H) clocks, ``beta`` (len(orders)
 
 One autograd Function: the formation kernels of :mod:`neuronspark.ops.triton.pool_pack` write the read's operands in
 its layouts, the Gluon read kernels follow; the backward hands the read's fp32 query / key gradients to the formation
-backward without an autograd edge (nothing is rounded in between).  :func:`pool_attend_ref` is the definition: the
+backward without an autograd edge (nothing is rounded in between).  The read runs with one key slot per query head
+(the last head's keys, tagged values, clock and beta repeated for its M extra queries; their gradients summed), which
+gives the key-major backward kernels CTAs of equal length.  :func:`pool_attend_ref` is the definition: the
 torch lines above and :func:`neuronspark.ops.pool_read.pool_read_ref`.  The rule of :mod:`neuronspark.utils.testing`.
 """
 from __future__ import annotations
@@ -62,20 +64,26 @@ class PoolAttendFn(torch.autograd.Function):
         H, M = int(gain.shape[0]), len(xq)
         dk = D // H
         dev = q.device
+        # one key slot per query head: the last head's keys, values, clock and beta repeated for its M extra queries
+        # (the key-major backward kernels then run CTAs of equal length; see neuronspark.ops.triton.pool_pack)
         q16 = torch.empty((T, B, H + M, dk), dtype=torch.bfloat16, device=dev)
-        k16 = torch.empty((T, B, H, dk), dtype=torch.bfloat16, device=dev)
-        gv = torch.empty((T, B, H, dk), dtype=torch.bfloat16, device=dev)
+        k16 = torch.empty((T, B, H + M, dk), dtype=torch.bfloat16, device=dev)
+        gv = torch.empty((T, B, H + M, dk), dtype=torch.bfloat16, device=dev)
         qn, kn = pack_heads_fwd(q, k, gate, v, gain, wbias, sparsity, q16, k16, gv)
         if M:
             pack_xq_fwd(xq, psi, gain, cos, sin, q16)
+            beta = torch.cat([beta, beta[:, H - 1:].expand(len(orders), M)], dim=1)
         n0, L = orders[0], len(orders)
         if orders == tuple(range(n0, n0 + L)):                               # beta per head and order slot
             slots = F.pad(beta.t(), (n0, NB - n0 - L))
         else:
-            slots = beta.new_zeros((H, NB), dtype=torch.float32)
+            slots = beta.new_zeros((H + M, NB), dtype=torch.float32)
             for i, n in enumerate(orders):
                 slots[:, n] = beta[i]
-        cum_t = _by_head_row(cum)
+        cum_t = cum.permute(1, 2, 0)                                         # (B, H, T): one row per (b, head)
+        if M:
+            cum_t = torch.cat([cum_t, cum_t[:, H - 1:].expand(B, M, T)], dim=1)
+        cum_t = cum_t.reshape(B * (H + M), T).contiguous()
         ktok_t = _by_head_row(ktok.permute(1, 0, 2))
         ordmask = _ordmask(orders)
         out, out32, lse = pool_read_fwd_gluon(q16, k16, gv, cum_t, ktok_t, qtok, slots, ordmask, scale)
@@ -99,12 +107,13 @@ class PoolAttendFn(torch.autograd.Function):
         do16, delta = read_delta_split(dheads, dxr, out32, H)
         dq, dkk, dgv, dcum, dslots = read_backward(do16, delta, q16, k16, gv, cum_t, slots, qtok, ktok, ktok_t, lse,
                                                    ordmask, scale)
-        oq, ok, ov, og, pg, pb = pack_heads_bwd(dq, dkk, dgv, q, k, gate, v, gain, wbias, sparsity, qn, kn)
+        oq, ok, ov, og, dcum, pg, pb = pack_heads_bwd(dq, dkk, dgv, dcum, q, k, gate, v, gain, wbias, sparsity, qn,
+                                                      kn)
         dpsi, px, dxs = None, None, ()
         if M:
             ox, dpsi, px = pack_xq_bwd(dq, xq, psi, gain, cos, sin)
             dxs = ox.unbind(0)
-        d_gain, d_wbias = fold_gain_bias(pg, pb, px)
+        d_gain, d_wbias, dslots = fold_gain_bias(pg, pb, px, dslots)
         n0, L = orders[0], len(orders)
         if orders == tuple(range(n0, n0 + L)):
             dbeta = dslots[:, n0:n0 + L].t()
@@ -145,9 +154,10 @@ def pool_attend(q: torch.Tensor, k: torch.Tensor, gate: torch.Tensor, v: torch.T
     orders = tuple(int(n) for n in orders)
     xq = tuple(xq)
     _check(q, k, gate, v, gain, wbias, xq, psi, cos, sin, cum, beta, qtok, ktok, orders)
-    return PoolAttendFn.apply(q, k, gate, v, gain.contiguous(), wbias.contiguous(), psi, cos, sin, cum.float(),
-                              beta.float(), qtok.contiguous(), ktok.contiguous(), float(sparsity), orders,
-                              float(scale), *xq)
+    heads, xreads, q_all, k_all = PoolAttendFn.apply(
+        q, k, gate, v, gain.contiguous(), wbias.contiguous(), psi, cos, sin, cum.float(), beta.float(),
+        qtok.contiguous(), ktok.contiguous(), float(sparsity), orders, float(scale), *xq)
+    return heads, xreads, q_all, k_all[:, :, :int(gain.shape[0])]
 
 
 def pool_attend_ref(q: torch.Tensor, k: torch.Tensor, gate: torch.Tensor, v: torch.Tensor, gain: torch.Tensor,

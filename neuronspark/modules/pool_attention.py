@@ -41,8 +41,8 @@ Regime differences kept explicitly in the code paths (each regime has its own nu
   W) and read the rings: prefill by ``ops.ring_write_prefill`` + ``ops.ring_recall_prefill`` (the induction term formed
   in-kernel from the matches), decode by the torch ring write, ``ops.xq_form_t1`` (the extra queries) and
   ``ops.ring_read_t1`` (every head's read and the extra queries' reads) at every decode batch size;
-* the pool clock: ``ops.cumsum0`` (whole row), ``ops.exact_cumsum0`` over the carried clock (prefill), one add
-  (decode); the value-residual running mean: ``ops.centred_past`` (whole row),
+* the pool clock: ``ops.clock_increments`` + ``ops.cumsum0`` (whole row), ``ops.exact_cumsum0`` over the carried
+  clock (prefill), one add (decode); the value-residual running mean: ``ops.centred_past`` (whole row),
   ``ops.centred_running`` (prefill), ``ops.centred_step`` over the carried sum (decode);
 * short conv: ``ops.short_conv_train`` / ``ops.short_conv_silu_prefill`` (T >= 3, the SiLU in the store; a 2-token call takes the depthwise
   ``F.conv1d`` over the carried history) / ``ops.short_conv_step``;
@@ -379,12 +379,6 @@ class PoolAttentionMixin:
         a = a * self.hippocampal_base_decay
         return a.to(torch.float32).unsqueeze(-1)
 
-    @staticmethod
-    def _trace_increments(a: torch.Tensor, T: int, B: int, gains: torch.Tensor) -> torch.Tensor:
-        """(T, B, H) fp32 gained clock increments gamma_h mean_c log(max(a, 1e-6)) of the H heads (whole row)."""
-        _a = a.reshape(T, B, -1).float().clamp_min(DECAY_FLOOR)
-        return _a.log().mean(dim=-1).unsqueeze(-1) * gains
-
     def _clock_increments(self, a: torch.Tensor, T: int, B: int, gains: Optional[torch.Tensor] = None) -> torch.Tensor:
         """(T, B, H) fp32 gained clock increments of every head (inference): the shared mean log decay times gamma_h
         (``gains`` = :meth:`pool_bias_gains` when the caller holds it: the decode step)."""
@@ -488,14 +482,14 @@ class PoolAttentionMixin:
         sin = self.rope_sin_bf16[:T]
         q = o.silu_rope(q, cos, sin)
         k = o.silu_rope(k, cos, sin)
-        # write gate, decay
+        # write gate; per-head pool constants; the H clocks: the gained mean log decay (one operator), one scan
         gate = self.gate_neuron(z)
-        a = self._memory_decay(lin(zc.view(T * B, D), self.W_decay.weight).view(T, B, -1))
-        # per-head pool constants and the H clocks (one scan)
         gains = self.pool_bias_gains()
         qgain = self.pool_query_gain(q.dtype)
         wbias = self.pool_write_bias_total()
-        cum = o.cumsum0(self._trace_increments(a, T, B, gains[:H]))
+        decay_logit = lin(zc.view(T * B, D), self.W_decay.weight).view(T, B, -1)
+        rate = torch.exp(self.decay_A_log).to(decay_logit.dtype)
+        cum = o.cumsum0(o.clock_increments(decay_logit, rate, gains[:H], self.hippocampal_base_decay, DECAY_FLOOR))
         # one operator for the layer's read: the head preparation (unit keys, gained unit queries, tagged values), the
         # last head's extra queries (its keys, tagged values, clock and induction term) and the pool read
         xq, psi = self._extra_query_projections(zc)
@@ -504,8 +498,8 @@ class PoolAttentionMixin:
                                                    qtok, ktok, self.induction_orders, self.match_scale)
         if self.probe is not None:                 # (the weights by distance, off the read's queries, keys and clocks)
             gn = [gate[..., i * dk:(i + 1) * dk] + wbias[i] for i in range(H)]
-            self.probe.attention(self, a, gn, gate, gains[:H], [q_all[:, :, i] for i in range(H)],
-                                 [k_all[:, :, i] for i in range(H)])
+            self.probe.attention(self, self._memory_decay(decay_logit, rate), gn, gate, gains[:H],
+                                 [q_all[:, :, i] for i in range(H)], [k_all[:, :, i] for i in range(H)])
             self.probe.pool_scores(self, q_all[:, :, :H], k_all, cum, self.induction_beta(), qtok, ktok,
                                    self.induction_orders, self.match_scale)
         if self.xq_count:                          # the last head's read plus its extra queries' addend

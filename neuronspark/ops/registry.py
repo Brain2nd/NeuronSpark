@@ -168,6 +168,10 @@ _SPECS: List[OpSpec] = [
             "bf16, gain (6,) bf16 match gain, wbias (6,) fp32, sparsity 2.0, xq 4 x (T, B, 256) bf16 extra-query "
             "projections, psi (T, B, 4) bf16, cos / sin (T, 128) bf16 last-head RoPE band, then the operands of "
             "pool_read: the head preparation, the tagged values, the extra queries and the read"),
+    _op("clock_increments", _T + "pool_clock", "logit rate gains base floor",
+        "(T, B, 6) fp32 = gains mean_c log(max(exp(-rate softplus(logit)) base, floor))", "train",
+        doc="logit (T, B, 256) bf16 decay projection, rate (256,) bf16, gains (6,) fp32 eligibility slopes, base the "
+            "base decay, floor the decay floor"),
     _op("pool_read", "neuronspark.ops.pool_read", "q k gv cum beta qtok ktok orders scale",
         "(T, B, 10, 256) bf16: the 6 heads' reads, then the last head's 4 extra-query reads", "train",
         doc="q (T, B, 10, 256) fp32 gained unit queries (6 heads, 4 extra queries), k (T, B, 6, 256) fp32 unit keys, "

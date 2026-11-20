@@ -18,7 +18,7 @@ Operators (regime: public function -> what runs):
   fused kernel); a gradient no input needs is dropped.
 * prefill :func:`pkm_weighted_sum` (custom op ``neuronspark::pkm_weighted_sum``): the forward sum for one (t, b) row
   per program and 256 columns, a sequential fma.rn chain over the 64 pairs from +0.
-* decode: the modules' torch gather + einsum in IEEE fp32 (no op here).
+* decode: :func:`neuronspark.ops.triton.pkm_step.pkm_value_step` (no op here).
 
 Numerics: exact fp32 products (no TF32 operand rounding) and fixed summation orders, an fp32 reduction-order
 difference from the float64 references.  Tests: the per-operator tolerance rule of :mod:`neuronspark.utils.testing`.

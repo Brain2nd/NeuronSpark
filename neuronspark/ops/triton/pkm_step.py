@@ -31,8 +31,10 @@ __all__ = ["PKM_SCORES_WARPS", "PKM_VALUE_WARPS", "pkm_scores_step", "pkm_scores
 
 # ================================================================================================ fixed constants
 #: scores: one program per (row, head, half), warps; value read: one program per row over the whole value width, warps
+#: (the M value rows are gathered from a table the step has not touched since its last token: the kernel's time is the
+#: number of loads a thread issues one after the other, so the tile is spread over as many threads as a block has)
 PKM_SCORES_WARPS = 4
-PKM_VALUE_WARPS = 8
+PKM_VALUE_WARPS = 32
 
 
 # ================================================================================================ kernels
@@ -51,15 +53,17 @@ def _pkm_scores_step_kernel(Q, KH, S, s_q, HA, N, DH, DB: tl.constexpr, NB: tl.c
 
 
 @triton.jit
-def _pkm_value_step_kernel(Wt, U, VALS, G1, GLOG, OUT, s_g, DV, eps, M: tl.constexpr, BD: tl.constexpr):
+def _pkm_value_step_kernel(Wt, U, VALS, G1, GLOG, OUT, s_g, DV, M, eps, MB: tl.constexpr, BD: tl.constexpr):
     b = tl.program_id(0).to(tl.int64)
     dd = tl.arange(0, BD)
     m = dd < DV
-    acc = tl.zeros([BD], tl.float32)
-    for j in tl.static_range(M):
-        w = tl.load(Wt + b * M + j)
-        u = tl.load(U + b * M + j)
-        acc += w * tl.load(VALS + u * DV + dd, mask=m, other=0.0)
+    mm = tl.arange(0, MB)
+    sel = mm < M
+    w = tl.load(Wt + b * M + mm, mask=sel, other=0.0)
+    u = tl.load(U + b * M + mm, mask=sel, other=0)
+    # the M selected value rows as one (MB, BD) tile: a thread issues its few loads of the cold table at once
+    rows = tl.load(VALS + (u * DV)[:, None] + dd[None, :], mask=sel[:, None] & m[None, :], other=0.0)
+    acc = tl.sum(w[:, None] * rows, axis=0)
     r = (acc * libdevice.rsqrt(tl.sum(acc * acc, axis=0) / DV + eps)) * tl.load(G1 + dd, mask=m, other=0.0)
     g = tl.load(GLOG + b * s_g + dd, mask=m, other=0.0).to(tl.float32)
     r = r * (1.0 / (1.0 + libdevice.exp(-g)))
@@ -104,8 +108,9 @@ def _pkm_value_step_fwd(w: torch.Tensor, u: torch.Tensor, values: torch.Tensor, 
     _need(tuple(glog.shape) == (B, dv) and glog.dtype == torch.bfloat16 and glog.stride(1) == 1,
           f"glog must be bf16 ({B}, {dv}) with unit inner stride, got {glog.dtype} {tuple(glog.shape)}")
     out = torch.empty((B, dv), dtype=torch.bfloat16, device=w.device)
-    _pkm_value_step_kernel[(B,)](w, u, values, gain, glog, out, int(glog.stride(0)), dv, float(eps), M=M,
-                                 BD=triton.next_power_of_2(dv), num_warps=PKM_VALUE_WARPS, enable_fp_fusion=False)
+    _pkm_value_step_kernel[(B,)](w, u, values, gain, glog, out, int(glog.stride(0)), dv, M, float(eps),
+                                 MB=triton.next_power_of_2(M), BD=triton.next_power_of_2(dv),
+                                 num_warps=PKM_VALUE_WARPS, enable_fp_fusion=False)
     return out
 
 

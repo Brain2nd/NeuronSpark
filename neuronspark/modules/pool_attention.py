@@ -577,10 +577,9 @@ class PoolAttentionMixin:
         # the reads in bf16: their only consumer is the bf16 pool_xq_out_in projection
         reads = o.ring_recall_prefill(xq, st.pool_k, st.pool_gv, st.pool_cum, None, ptr0, (matches, beta),
                                       self.match_scale, T, B, self.xq_count, W, dk, dv, torch.bfloat16, True, H - 1)
-        xq_add = lin(lin(reads, self.pool_xq_out_in), self.pool_xq_out)
-        last = (H - 1) * dv
-        attn = torch.cat([out[..., :last], out[..., last:] + xq_add], dim=-1)
-        return self._out_proj_centred(self._out_norm_gate_infer(attn, h)), carry_out
+        # the extra reads' projection added to the last head's channels in place (the bf16 operand converted exactly)
+        out[..., (H - 1) * dv:] += lin(lin(reads, self.pool_xq_out_in), self.pool_xq_out)
+        return self._out_proj_centred(self._out_norm_gate_infer(out, h)), carry_out
 
     # ------------------------------------------------------------------------------------------------ decode
     def _step_constants(self) -> Tuple[torch.Tensor, ...]:

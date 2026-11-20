@@ -34,6 +34,10 @@ returned for: (R, V) for dense logits; for logits that are the leading V columns
 padded output of the readout GEMM, :mod:`neuronspark.ops.linear`) the gradient is returned for that tensor, (R, P) with
 its columns V .. P - 1 written as zeros by the backward kernel's last (masked) period, so autograd has no slice to
 undo (no zero fill and no copy of the (R, V) gradient).  The launch configurations are the fixed constants below.
+
+Stacks: the two kernels here take one or two widths (the default configuration's (16, 32)).  A stack of three or four
+widths runs the kernel pair of :mod:`neuronspark.ops.triton.balance_stack_ce` behind the same operator (the same
+function, the same saved row max / logsum, the same gradient layouts).
 """
 from typing import List, Optional, Sequence, Tuple
 
@@ -43,6 +47,7 @@ import triton
 import triton.language as tl
 
 from neuronspark.ops.triton.balance_add import balance_add_ref
+from neuronspark.ops.triton.balance_stack_ce import STACK_MIN_WIDTHS, check_stack, stack_ce_bwd, stack_ce_fwd
 from neuronspark.ops.triton._ptx import (  # noqa: F401  (Triton resolves the helpers through this module's globals)
     _ex2ftz as _lf_ex2,
     _rn_add_f32 as _lt_add_rn,
@@ -622,10 +627,12 @@ def _check(logits, labels, contribs, widths) -> Tuple[int, int, Tuple[int, ...]]
     if R < 2 or R >= 2**31 - 1 or R * max(V, int(logits.stride(0))) >= 2**62:
         raise RuntimeError(f"balance_ce_per_token: unsupported size R={R} V={V}")
     widths = tuple(int(w) for w in widths)
-    if not 1 <= len(widths) <= 2 or len(contribs) != len(widths):
+    if len(widths) >= STACK_MIN_WIDTHS:
+        check_stack(R, V, contribs, widths, logits.device)
+    elif not 1 <= len(widths) <= 2 or len(contribs) != len(widths):
         raise RuntimeError(f"balance_ce_per_token: 1 or 2 width contributions are supported, got widths {widths}, "
                            f"{len(contribs)} contributions")
-    for w, t in zip(widths, contribs):
+    for w, t in zip(widths if len(widths) < STACK_MIN_WIDTHS else (), contribs):
         if w < 4 or w & (w - 1) or V // w < 2:
             raise RuntimeError(f"balance_ce_per_token: width {w} must be a power of two >= 4 with V // w >= 2")
         if (not isinstance(t, torch.Tensor) or t.dtype != torch.bfloat16 or t.device != logits.device
@@ -708,6 +715,8 @@ def _balance_ce_fwd(logits: torch.Tensor, labels: torch.Tensor, contribs: Sequen
                     widths: Sequence[int]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """-> (loss (R,) fp32, rowmax (R,) fp32, logsum (R,) fp32)."""
     R, V, widths = _check(logits, labels, contribs, widths)
+    if len(widths) >= STACK_MIN_WIDTHS:
+        return stack_ce_fwd(logits, labels, contribs, widths, IGNORE_INDEX)
     G, KV, WARPS = FWD_TILE_GROUPS, FWD_TILE_COLS, FWD_WARPS
     if (G * KV) % 32 or (G * KV) > V:
         raise RuntimeError(f"balance_ce_per_token: forward tile {G} x {KV} must be a multiple of 32 and <= V")
@@ -733,6 +742,8 @@ def _balance_ce_bwd(logits: torch.Tensor, labels: torch.Tensor, mx: torch.Tensor
     for name, t in (("rowmax", mx), ("logsum", ls)):
         if t.dtype != torch.float32 or tuple(t.shape) != (R,) or not t.is_contiguous():
             raise RuntimeError(f"balance_ce_per_token: the saved {name} must be a contiguous ({R},) fp32 tensor")
+    if len(widths) >= STACK_MIN_WIDTHS:
+        return stack_ce_bwd(logits, labels, mx, ls, g, contribs, widths, P, IGNORE_INDEX)
     TILE, UNR = BWD_TILE, BWD_UNROLL
     plan = _plan(R, V, widths, logits.device)
     if not row_len_fits(plan, V, P, TILE):
@@ -819,6 +830,8 @@ def _padded_base(logits: torch.Tensor, widths: Tuple[int, ...]) -> Optional[torc
     if (int(base.shape[0]) != R or P <= V or tuple(base.stride()) != (P, 1) or int(logits.stride(0)) != P
             or base.storage_offset() != logits.storage_offset()):
         return None
+    if len(widths) >= STACK_MIN_WIDTHS:
+        return base                                  # the stack's backward writes any row length P >= V
     return base if row_len_fits(_plan(R, V, widths, logits.device), V, P, BWD_TILE) else None
 
 
@@ -828,7 +841,8 @@ def balance_ce_per_token(logits: torch.Tensor, labels: torch.Tensor, contribs: S
 
     logits (R, V) bf16 (unit column stride, row stride >= V; R >= 2): the raw readout; labels (R,) int64 contiguous,
     -100 ignored (+0 loss), every other value in [0, V); contribs ((R, 16), (R, 32)) bf16 contiguous: the balance
-    contributions; widths (16, 32), in application order.  Differentiable in the logits and the contributions.  When
+    contributions; widths (16, 32), in application order (a stack of three or four widths: see the module
+    docstring).  Differentiable in the logits and the contributions.  When
     the logits are the leading columns of the readout GEMM's padded output, the gradient goes to that tensor directly
     (its pad columns zero), which is what the slice's backward would hand it."""
     widths = tuple(int(w) for w in widths)

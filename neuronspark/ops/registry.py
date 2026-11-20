@@ -251,11 +251,11 @@ _SPECS: List[OpSpec] = [
     _op("balance_ce_per_token", _T + "lm_tail", "logits labels contribs widths",
         "(R,) fp32 per-token cross entropy of the balanced logits", "train",
         doc="logits (R, V) bf16 dense, labels (R,) int64 (-100 ignored), contribs ((R, 16), (R, 32)) bf16, "
-            "widths (16, 32)"),
+            "widths (16, 32); a stack of three or four power-of-two widths up to 512: (R, w) bf16 per width"),
     _op("balance_add", _T + "balance_add", "logits contribs widths",
         "(R, V) bf16 dense balanced logits", "train prefill decode",
         doc="logits (R, 151669) bf16 readout (unit column stride), contribs ((R, 16), (R, 32)) bf16 contiguous, "
-            "widths (16, 32)"),
+            "widths (16, 32); one to four widths, (R, w) bf16 per width"),
 ]
 
 OPS: Dict[str, OpSpec] = {s.name: s for s in _SPECS}

@@ -8,7 +8,7 @@ The readout balance adds, per width ``w`` in order, the bf16 contribution ``c_w`
 The torch chain (:func:`balance_add_ref`) reads and writes the whole (R, V) tensor once per width.  Here one program
 covers ``BALANCE_ADD_BLOCK`` columns of one row: it reads the logits once, applies the widths in order with the same
 fp32 addition and bf16 rounding (round to nearest even) after each, and writes a new (R, V) tensor once.  The output
-equals the chain's.
+equals the chain's.  A stack has 1 to ``BALANCE_ADD_MAX_WIDTHS`` widths (the default configuration: (16, 32)).
 """
 from __future__ import annotations
 
@@ -20,18 +20,20 @@ import triton.language as tl
 
 from neuronspark.ops.triton import require_cuda
 
-__all__ = ["BALANCE_ADD_BLOCK", "BALANCE_ADD_WARPS", "balance_add", "balance_add_ref"]
+__all__ = ["BALANCE_ADD_BLOCK", "BALANCE_ADD_WARPS", "BALANCE_ADD_MAX_WIDTHS", "balance_add", "balance_add_ref"]
 
 # ================================================================================================ fixed constants
 #: columns per program, warps; grid (rows, column blocks)
 BALANCE_ADD_BLOCK = 1024
 BALANCE_ADD_WARPS = 4
+#: widths of one stack
+BALANCE_ADD_MAX_WIDTHS = 4
 
 
 # ================================================================================================ kernel
 @triton.jit
-def _balance_add_kernel(L, OUT, C0, C1, V, ld_l, W0: tl.constexpr, W1: tl.constexpr, NW: tl.constexpr,
-                        BLOCK: tl.constexpr):
+def _balance_add_kernel(L, OUT, C0, C1, C2, C3, V, ld_l, W0: tl.constexpr, W1: tl.constexpr, W2: tl.constexpr,
+                        W3: tl.constexpr, NW: tl.constexpr, BLOCK: tl.constexpr):
     r = tl.program_id(0).to(tl.int64)
     v = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     m = v < V
@@ -40,6 +42,12 @@ def _balance_add_kernel(L, OUT, C0, C1, V, ld_l, W0: tl.constexpr, W1: tl.conste
     x = (x + c).to(tl.bfloat16)
     if NW > 1:
         c = tl.load(C1 + r * W1 + (v % W1), mask=m, other=0.0).to(tl.float32)
+        x = (x.to(tl.float32) + c).to(tl.bfloat16)
+    if NW > 2:
+        c = tl.load(C2 + r * W2 + (v % W2), mask=m, other=0.0).to(tl.float32)
+        x = (x.to(tl.float32) + c).to(tl.bfloat16)
+    if NW > 3:
+        c = tl.load(C3 + r * W3 + (v % W3), mask=m, other=0.0).to(tl.float32)
         x = (x.to(tl.float32) + c).to(tl.bfloat16)
     tl.store(OUT + r * V + v, x, mask=m)
 
@@ -51,9 +59,9 @@ def _check(logits: torch.Tensor, contribs: Sequence[torch.Tensor], widths: Seque
         raise RuntimeError(f"neuronspark.balance_add: logits must be bf16 (R, V) with unit column stride, got "
                            f"{logits.dtype} {tuple(logits.shape)} strides {tuple(logits.stride())}")
     R, V = (int(s) for s in logits.shape)
-    if not 1 <= len(widths) <= 2 or len(contribs) != len(widths):
-        raise RuntimeError(f"neuronspark.balance_add: 1 or 2 widths with one contribution each, got widths "
-                           f"{tuple(widths)} and {len(contribs)} contributions")
+    if not 1 <= len(widths) <= BALANCE_ADD_MAX_WIDTHS or len(contribs) != len(widths):
+        raise RuntimeError(f"neuronspark.balance_add: 1 to {BALANCE_ADD_MAX_WIDTHS} widths with one contribution "
+                           f"each, got widths {tuple(widths)} and {len(contribs)} contributions")
     for c, w in zip(contribs, widths):
         require_cuda(c, "balance_add (contribution)")
         if tuple(c.shape) != (R, int(w)) or c.dtype != torch.bfloat16 or not c.is_contiguous() or not 0 < int(w) <= V:
@@ -63,14 +71,17 @@ def _check(logits: torch.Tensor, contribs: Sequence[torch.Tensor], widths: Seque
 
 
 def _balance_add_fwd(logits: torch.Tensor, contribs: List[torch.Tensor], widths: List[int]) -> torch.Tensor:
+    # a contribution that is a strided view (the output of a projection whose GEMM ran on a padded extent) is copied
+    contribs = [c if not isinstance(c, torch.Tensor) or c.is_contiguous() else c.contiguous() for c in contribs]
     R, V = _check(logits, contribs, widths)
     out = torch.empty((R, V), dtype=torch.bfloat16, device=logits.device)
     if R == 0:
         return out
-    c1 = contribs[1] if len(contribs) > 1 else contribs[0]
-    w1 = int(widths[1]) if len(widths) > 1 else 1
+    n = len(widths)
+    c = [contribs[i] if i < n else contribs[0] for i in range(BALANCE_ADD_MAX_WIDTHS)]     # unused operands alias
+    w = [int(widths[i]) if i < n else 1 for i in range(BALANCE_ADD_MAX_WIDTHS)]
     _balance_add_kernel[(R, triton.cdiv(V, BALANCE_ADD_BLOCK))](
-        logits, out, contribs[0], c1, V, int(logits.stride(0)), W0=int(widths[0]), W1=w1, NW=len(widths),
+        logits, out, c[0], c[1], c[2], c[3], V, int(logits.stride(0)), W0=w[0], W1=w[1], W2=w[2], W3=w[3], NW=n,
         BLOCK=BALANCE_ADD_BLOCK, num_warps=BALANCE_ADD_WARPS)
     return out
 
@@ -87,8 +98,8 @@ def _balance_add_fake(logits, contribs, widths):
 
 def balance_add(logits: torch.Tensor, contribs: Sequence[torch.Tensor], widths: Sequence[int]) -> torch.Tensor:
     """The balanced logits, a new dense (R, V) bf16 tensor: ``logits`` (R, V) bf16 with unit column stride (any row
-    stride), ``contribs`` one contiguous bf16 (R, w) contribution per width of ``widths`` (1 or 2 widths, applied in
-    order).  No autograd (inference and scoring)."""
+    stride), ``contribs`` one bf16 (R, w) contribution per width of ``widths`` (1 to 4 widths, applied in order; a
+    contribution that is not contiguous is copied).  No autograd (inference and scoring)."""
     return torch.ops.neuronspark.balance_add(logits, list(contribs), [int(w) for w in widths])
 
 

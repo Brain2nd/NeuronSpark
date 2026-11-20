@@ -7,8 +7,8 @@ over K (tiles of 256, 128 or 64 columns, then one tree sum per output), the resu
 in another order than cuBLAS's; the reference is :func:`linear_small_n_ref` (= :func:`neuronspark.ops.linear.linear_ref`:
 the bf16 operands multiplied in float64, one bf16 rounding).
 
-:func:`neuronspark.ops.linear.linear` routes its inference calls here when :func:`takes` holds (one row stays on cuBLAS:
-the single-row product is as fast there).
+:func:`neuronspark.ops.linear.linear` routes its inference calls here when :func:`takes` holds (one row runs in
+:func:`neuronspark.ops.triton.linear_row.linear_row`).
 """
 from __future__ import annotations
 

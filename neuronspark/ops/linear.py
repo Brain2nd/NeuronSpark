@@ -51,10 +51,11 @@ at least 16 output features whose count is not a multiple of 8 (the tied readout
 the training GEMMs: ``w`` holds ``padded_extent(N)`` rows, the pad rows zero, and the (..., N) view of the (..., P)
 product is returned (row stride P; the real columns are the same dot products of the same bf16 operands, and the
 aligned extent keeps cuBLAS off its unaligned kernel: 0.08 ms against 0.11 / 0.35 / 0.39 ms for the readout of 1 / 8 /
-32 rows on a B200).  A product of
-2 to 32 rows and fewer than 16 output features (the decode step's per-head projections) runs
-:func:`neuronspark.ops.triton.linear_small_n.linear_small_n` instead of cuBLAS's split-K GEMM and reduction: one kernel,
-fp32 accumulation, one bf16 rounding (the same reference).
+32 rows on a B200).  Two shapes of the decode step run in a kernel of their own instead of cuBLAS, each with fp32
+accumulation and one bf16 rounding (the same reference): a product of one row and up to 4,096 output features
+(:func:`neuronspark.ops.triton.linear_row.linear_row`: the projections of a step of one sequence), and a product of 2
+to 32 rows and fewer than 16 output features (:func:`neuronspark.ops.triton.linear_small_n.linear_small_n`: the step's
+per-head projections, a split-K GEMM and a reduction on cuBLAS).
 
 Pure-torch reference :func:`linear_ref`: the same bf16-rounded operands multiplied in float64, the output rounded
 once to bf16; its gradients are float64 products delivered in the inputs' dtypes.
@@ -409,7 +410,8 @@ def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     weight must be fp32; for an N that is not a multiple of 8 the result is the (..., N) view of the padded (..., P)
     output (row stride P, see the module docstring); a weight bound with :func:`bind_grad_` has its gradient
     accumulated into ``weight.grad`` by the backward.  Otherwise the inference path runs: the current bf16 cache of the
-    weight (see :func:`cache_bf16_`) or ``weight.to(bf16)``.
+    weight (see :func:`cache_bf16_`) or ``weight.to(bf16)``, multiplied by cuBLAS or, for the two shapes of the module
+    docstring, by ``linear_row`` / ``linear_small_n``.
     """
     _check(x, weight)
     if torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad):
@@ -426,11 +428,18 @@ def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if w is None:
         w = _inference_bf16(weight)
     xb = x.to(torch.bfloat16)
-    if n < INFERENCE_PAD_MIN and xb.is_cuda and xb.dim() >= 2:
-        from neuronspark.ops.triton.linear_small_n import linear_small_n, takes
-        x2 = xb.reshape(-1, int(xb.shape[-1]))
-        if takes(x2, w):
-            return linear_small_n(x2, w).view(*xb.shape[:-1], n)
+    k = int(xb.shape[-1])
+    if xb.is_cuda and k > 0:
+        if xb.numel() == k:                               # one row (a view: no copy when the route refuses it)
+            from neuronspark.ops.triton.linear_row import linear_row, takes_row
+            x2 = xb.reshape(1, k) if xb.stride(-1) == 1 else xb
+            if takes_row(x2, w, n):
+                return linear_row(x2, w, n).view(*xb.shape[:-1], n)
+        elif n < INFERENCE_PAD_MIN and xb.dim() >= 2:
+            from neuronspark.ops.triton.linear_small_n import linear_small_n, takes
+            x2 = xb.reshape(-1, k)
+            if takes(x2, w):
+                return linear_small_n(x2, w).view(*xb.shape[:-1], n)
     out = F.linear(xb, w)
     return out if int(out.shape[-1]) == n else out[..., :n]
 

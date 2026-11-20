@@ -222,20 +222,21 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
         z = rows_rmsnorm(o, h, self.norm_eps, out_dtype=h.dtype)
         if step:
             r, carry_out = self._attention_step(h, z, ind, carry, st, pos0, ptr0, W)
+            pi = self.copy_confidence(copy)
+            c = self.copy_novelty(z, r, lambda t: rows_rmsnorm(o, t, NOVELTY_RMS_EPS, out_dtype=torch.float32))
+            with torch.autocast(h.device.type, enabled=False):
+                f = self.read_gain_factor(pi, c)
+                rho = self.pkm_copy_rho(pi)
         else:
             r, carry_out = self._attention_prefill(h, z, ind, carry, st, pos0, ptr0, W)
-        pi = self.copy_confidence(copy)
-        c = self.copy_novelty(z, r, lambda t: rows_rmsnorm(o, t, NOVELTY_RMS_EPS, out_dtype=torch.float32))
+            f, rho = self.copy_factors_prefill(copy, z, r)        # the same factors, one operator after the products
         with torch.autocast(h.device.type, enabled=False):
-            f = self.read_gain_factor(pi, c)
             h = o.read_gain_residual(h, r, f)
         x_hat = rows_rmsnorm(o, h, self.ffn_norm.eps, weight=self.ffn_norm.weight, out_dtype=h.dtype)
         # the spikes in bf16: their only consumers are the FFN's bf16 projections (the rounding of their input cast)
         zs = self.input_neuron2(x_hat, st.input_neuron2, pos0, out_dtype=torch.bfloat16)
         ffn = o.linear(self.snn_ffn(zs, st.ffn_gate, st.ffn_up, pos0), self.ffn_out_proj.weight)
         y = self._pkm_read_step(x_hat) if step else self._pkm_read_prefill(x_hat)
-        with torch.autocast(h.device.type, enabled=False):
-            rho = self.pkm_copy_rho(pi)
         if T * B >= PKM_TAIL_MIN_ROWS:
             return o.pkm_tail(h, ffn, y, rho), carry_out
         with torch.autocast(h.device.type, enabled=False):

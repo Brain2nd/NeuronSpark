@@ -311,6 +311,10 @@ _HIPPOCAMPAL_PREFILL_SPECS: List[OpSpec] = [
         doc="v (T, B, 1536) bf16, carry (T, B, 1536) bf16 or None (hippocampal layer 0), gl (T, B, 6) bf16 gate "
             "projection, "
             "lam0 (1536,) fp32 contiguous static mix, glu_add (T, B, 256) fp32 GLU addend of the last head"),
+    _op("copy_gate_prefill", _T + "copy_gate", "maximum lse zw rv tau bias strength kappa",
+        "(f, rho): the read gain's factor and the PKM copy gate, (T, B) fp32 each", "prefill",
+        doc="maximum / lse (T, B) fp32 the copy detector's statistics, zw / rv (T, B) fp32 the novelty predictor's "
+            "products, tau / bias / strength one fp32 value each, kappa the read gain (4.0)"),
 ]
 for _hippocampal_spec in _HIPPOCAMPAL_PREFILL_SPECS:
     if _hippocampal_spec.name in OPS:

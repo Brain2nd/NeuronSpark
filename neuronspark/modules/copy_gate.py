@@ -36,6 +36,7 @@ import torch
 import torch.nn as nn
 
 from neuronspark.modules.copy_detector import CopyStats, copy_pi
+from neuronspark.modules.plif import rows_rmsnorm
 from neuronspark.utils.precision import regime_product
 
 __all__ = ["CopyGateMixin", "NOVELTY_RMS_EPS"]
@@ -105,6 +106,23 @@ class CopyGateMixin:
             if c is not None:
                 f = f * c
             return f
+
+    def copy_factors_prefill(self, copy_stats: Tuple[torch.Tensor, torch.Tensor], z: torch.Tensor,
+                             r: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(f, rho)`` of a prefill call, (T, B) fp32 each: :meth:`copy_confidence`, :meth:`copy_novelty`,
+        :meth:`read_gain_factor` and :meth:`pkm_copy_rho` after the predictor's two products and the residual's rms
+        norm as one operator (``ops.copy_gate_prefill``); no gradient."""
+        if not (isinstance(copy_stats, (tuple, list)) and len(copy_stats) == 2):
+            raise RuntimeError("hippocampal layer: the copy-detector statistics must be the pair (maximum, lse)")
+        if tuple(r.shape) != tuple(z.shape):
+            raise RuntimeError(f"novelty predictor: residual {tuple(r.shape)} does not match z {tuple(z.shape)}")
+        o = self._ops
+        with torch.no_grad(), torch.autocast(z.device.type, enabled=False):
+            zw = torch.matmul(z.float(), self.copy_novelty_w.float())
+            rf = rows_rmsnorm(o, r, NOVELTY_RMS_EPS, out_dtype=torch.float32)
+            rv = torch.matmul(rf, self.copy_novelty_v.float())
+            return o.copy_gate_prefill(copy_stats[0], copy_stats[1], zw, rv, self.pkm_copy_tau, self.copy_novelty_b,
+                                       self.pkm_copy_strength, self.read_copy_gain)
 
     def pkm_copy_rho(self, pi: torch.Tensor) -> torch.Tensor:
         """(T, B) fp32 rho = 2 sigmoid(-strength pi) of the PKM copy gate (no gradient: pi and the strength are

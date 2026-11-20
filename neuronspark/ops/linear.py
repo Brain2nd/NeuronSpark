@@ -11,7 +11,11 @@ Numerics contract (training, whole-row regime):
   and an fp32 result.  It is returned as the weight's gradient (fp32 ``.grad`` through AccumulateGrad); nothing is
   rounded to bf16.  A weight used twice in one backward (the tied embedding: readout + lookup) receives the fp32
   sum of its contributions from autograd.
-* input gradient: ``dx = (dy2 @ weight_bf16)`` (bf16 GEMM output) widened to ``x.dtype``.
+* input gradient: ``dx = dy2 @ weight_bf16``, one GEMM with bf16 operands that writes the result in ``x.dtype``: bf16
+  for a bf16 input, fp32 for an fp32 input (``torch.mm(dy2, weight_bf16, out_dtype=torch.float32)``: the fp32
+  accumulation stored as it is, no bf16 output widened by a second kernel; a GEMM with an fp32 result exists on CUDA
+  only, elsewhere the bf16 product is widened).
+* first-order gradients only: the GEMMs with an fp32 result have no derivative of their own.
 * an output-feature count N that is not a multiple of 8 (the odd vocabulary of the tied readout, 151,669) runs the three
   GEMMs on a padded layout: P = N rounded up to a multiple of 128 (151,680), the bf16 weight
   ``wp = [weight.to(bf16); 0]`` (P, K) with zero pad rows; forward ``F.linear(xb, wp)`` (..., P) whose pad columns are
@@ -235,7 +239,10 @@ class Fp32WgradLinearFn(torch.autograd.Function):
                 x2 = xb.reshape(-1, xb.shape[-1]).contiguous()
                 dw = torch.mm(dy2[:, :n].t(), x2, out_dtype=torch.float32)
             if ctx.needs_input_grad[0]:
-                dx = dy2.matmul(wb).reshape(ctx.input_shape).to(ctx.input_dtype)
+                if ctx.input_dtype == torch.float32 and dy2.is_cuda:
+                    dx = torch.mm(dy2, wb, out_dtype=torch.float32).reshape(ctx.input_shape)
+                else:
+                    dx = torch.mm(dy2, wb).reshape(ctx.input_shape).to(ctx.input_dtype)
         return dx, dw
 
 

@@ -22,11 +22,11 @@ Operators (regime: public function -> what runs):
 * train   :func:`plif_scan_train` -> :class:`PLIFScanFn`.  Forward: custom op ``neuronspark::plif_k1x_scan`` = the eta
   kernel (w_eta * x formed in registers, eta stored) followed by the scan forward (a / i formed in registers
   from eta and x; S, and the pre-release membrane ``pre`` when a backward will run).  Backward: custom op
-  ``neuronspark::plif_k1_bwd`` (one Gluon kernel: the adjoint scan and the gate backward, see
-  :mod:`neuronspark.ops.gluon.plif_k1_bwd`), then torch reductions: grad b_eta = gz.sum((0, 1)); grad w_eta =
-  (gz * xw).sum((0, 1)); grad v_th = the kernel's per-lane T sums (B, C) summed over B; x receives two gradients,
-  gz * w_eta (the multiply's edge, cast to x.dtype) and the kernel's drive-edge gradient (x.dtype), which autograd adds
-  (x is passed to the Function twice, as the multiply's and the drive's operand).
+  ``neuronspark::plif_k1_bwd`` (one Gluon kernel: the adjoint scan, the gate backward, the gradient of x and the
+  per-lane sums over T of the three parameter gradients, see :mod:`neuronspark.ops.gluon.plif_k1_bwd`), then one torch
+  reduction over B: grad b_eta = sum of gz, grad w_eta = sum of gz * xw, grad v_th = sum of dL/dth.  The gradient of x
+  is x.dtype(gz * w_eta) + x.dtype(dL/dpre * eta), the gate logit's multiply and the drive, each rounded to x.dtype
+  and added in x.dtype.
 * train   :func:`plif_centred_input` -> :class:`CentreFn` on ``ops.cumsum0``: the strictly-past centring of
   input_neuron2's projection input, xc_t = (x_t - (sum_{j<t} x_j) / max(t, 1)) * [t > 0], returned contiguous in
   x.dtype; backward: A = g * [t > 0] on x, q_t = -g_{t+1} / (t + 1) (0 at t = T - 1) on the running sum.
@@ -36,7 +36,7 @@ Operators (regime: public function -> what runs):
 * decode: :func:`neuronspark.ops.triton.plif_step.plif_step` (one kernel per token; its own module).
 
 Numerics.  The training forward S / pre are the operations of the eager gate chain and the sequential scan in the same
-order; gz / gzp / gx follow the phase-split backward above; the per-channel sums for b_eta, w_eta and v_th are
+order; gzp / gx follow the phase-split backward above; the per-channel sums for b_eta, w_eta and v_th are
 reassociated against autograd's (fp32 reduction-order class).  The prefill a / drive / S are the eager chain's
 operations.  Tests: the per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the references.
 
@@ -311,35 +311,27 @@ def _plif_k1x_scan_fake(w_eta, b_eta, zp, x, v_th, store_pre, out_dtype):
 
 # ================================================================================================ autograd (training scan)
 class PLIFScanFn(torch.autograd.Function):
-    """S of the PLIF population; gradients for w_eta, b_eta, zp, x (two edges: the multiply's ``xm`` and the drive's
-    ``x``, the same tensor) and v_th."""
+    """S of the PLIF population; gradients for w_eta, b_eta, zp, x and v_th."""
 
     @staticmethod
-    def forward(ctx, w_eta, b_eta, zp, xm, x, v_th, alpha: float, out_dtype: str):
+    def forward(ctx, w_eta, b_eta, zp, x, v_th, alpha: float, out_dtype: str):
         S, pre, eta = torch.ops.neuronspark.plif_k1x_scan(w_eta, b_eta, zp, x, v_th, True, out_dtype)
         ctx.set_materialize_grads(False)
-        ctx.save_for_backward(eta, x, v_th, pre, w_eta, xm)
+        ctx.save_for_backward(eta, x, v_th, pre, w_eta)
         ctx.alpha = float(alpha)
         return S
 
     @staticmethod
     def backward(ctx, gS):
-        eta, x, v_th, pre, w_eta, xm = ctx.saved_tensors
-        need_w, need_b, need_zp, need_xm, need_x, need_th = ctx.needs_input_grad[:6]
+        eta, x, v_th, pre, w_eta = ctx.saved_tensors
+        need_w, need_b, need_zp, need_x, need_th = ctx.needs_input_grad[:5]
         gS_ = pre.new_zeros(pre.shape) if gS is None else gS.contiguous()
         if gS_.dtype not in (torch.float32, torch.bfloat16):
             gS_ = gS_.float()
-        gz, gzp, gx, gth = torch.ops.neuronspark.plif_k1_bwd(eta, x, v_th, pre, gS_, ctx.alpha)
-        # the in-kernel multiply's autograd (zwx = w_eta.float() * xm.float()): grad w = sum over (T, B) of gz * xm,
-        # grad xm = gz * w (in xm's dtype)
-        gw = (gz * xm.to(torch.float32)).sum(dim=(0, 1)) if need_w else None
-        gxm = None
-        if need_xm:
-            gxm = gz * w_eta.to(torch.float32)
-            if xm.dtype != torch.float32:
-                gxm = gxm.to(xm.dtype)
-        return (gw, gz.sum(dim=(0, 1)) if need_b else None, gzp if need_zp else None, gxm,
-                gx if need_x else None, gth.sum(dim=0) if need_th else None, None, None)
+        gzp, gx, sums = torch.ops.neuronspark.plif_k1_bwd(eta, x, v_th, w_eta, pre, gS_, ctx.alpha)
+        gb, gw, gth = sums.sum(dim=1).unbind(0)           # the per-lane sums over T, summed over B: (3, C)
+        return (gw if need_w else None, gb if need_b else None, gzp if need_zp else None,
+                gx if need_x else None, gth if need_th else None, None, None)
 
 
 def plif_scan_train(w_eta: torch.Tensor, b_eta: torch.Tensor, zp: torch.Tensor, x: torch.Tensor,
@@ -359,7 +351,7 @@ def plif_scan_train(w_eta: torch.Tensor, b_eta: torch.Tensor, zp: torch.Tensor, 
     if grad:
         _need(gate_slope_ok(alpha), f"surrogate slope alpha must satisfy 0 < alpha < 64, got {alpha}")
         require_sm100(x.device, "plif_scan_train (backward)")
-        return PLIFScanFn.apply(w_eta, b_eta, zp, x, x, v_th, float(alpha), od)
+        return PLIFScanFn.apply(w_eta, b_eta, zp, x, v_th, float(alpha), od)
     S, _pre, _eta = torch.ops.neuronspark.plif_k1x_scan(w_eta, b_eta, zp, x, v_th, False, od)
     return S
 
@@ -554,15 +546,15 @@ def plif_scan_prefill(a: torch.Tensor, drive: torch.Tensor, v_th: torch.Tensor, 
 class _PLIFScanRef(torch.autograd.Function):
     """Pure-torch training scan: forward = the eager gate chain and the sequential scan with the bipolar release;
     backward = the training backward in torch (:func:`plif_k1_bwd_ref`: the phase-split adjoint
-    ``lam_{t-1} = (a (1 - g_mem)) lam_t + a (g_mem gS)`` sequential over t, then the gate backward) followed by the
-    op's torch reductions (grad w_eta = (gz * xm).sum((0, 1)), grad b_eta = gz.sum((0, 1)), grad v_th = the per-lane
-    T sums summed over B, grad xm = gz * w_eta, the drive edge's gx on x)."""
+    ``lam_{t-1} = (a (1 - g_mem)) lam_t + a (g_mem gS)`` sequential over t, then the gate backward, the gradient of x
+    as x.dtype(gz * w_eta) + x.dtype(dL/dpre * eta), the sums over T) followed by the op's sum over B (grad b_eta, grad
+    w_eta, grad v_th)."""
 
     @staticmethod
-    def forward(ctx, w_eta, b_eta, zp, xm, x, v_th, alpha: float, out_dtype: torch.dtype):
+    def forward(ctx, w_eta, b_eta, zp, x, v_th, alpha: float, out_dtype: torch.dtype):
         f32 = torch.float32
         T, B, C = (int(s) for s in x.shape)
-        z = w_eta.to(f32) * xm.to(f32) + b_eta.to(f32)
+        z = w_eta.to(f32) * x.to(f32) + b_eta.to(f32)
         z = z + zp.to(f32)
         eta = torch.sigmoid(z)
         a = 1.0 - eta
@@ -578,26 +570,21 @@ class _PLIFScanRef(torch.autograd.Function):
             spikes.append(s)
             pres.append(v_pre)
         ctx.set_materialize_grads(False)
-        ctx.save_for_backward(eta, x, v_th, torch.stack(pres, dim=0), w_eta, xm)
+        ctx.save_for_backward(eta, x, v_th, torch.stack(pres, dim=0), w_eta)
         ctx.alpha = float(alpha)
         return torch.stack(spikes, dim=0).to(out_dtype)
 
     @staticmethod
     def backward(ctx, gS):
-        eta, x, v_th, pre, w_eta, xm = ctx.saved_tensors
-        need_w, need_b, need_zp, need_xm, need_x, need_th = ctx.needs_input_grad[:6]
+        eta, x, v_th, pre, w_eta = ctx.saved_tensors
+        need_w, need_b, need_zp, need_x, need_th = ctx.needs_input_grad[:5]
         gS_ = pre.new_zeros(pre.shape) if gS is None else gS.contiguous()
         if gS_.dtype not in (torch.float32, torch.bfloat16):
             gS_ = gS_.float()
-        gz, gzp, gx, gth = plif_k1_bwd_ref(eta, x, v_th, pre, gS_, ctx.alpha)
-        gw = (gz * xm.to(torch.float32)).sum(dim=(0, 1)) if need_w else None
-        gxm = None
-        if need_xm:
-            gxm = gz * w_eta.to(torch.float32)
-            if xm.dtype != torch.float32:
-                gxm = gxm.to(xm.dtype)
-        return (gw, gz.sum(dim=(0, 1)) if need_b else None, gzp if need_zp else None, gxm,
-                gx if need_x else None, gth.sum(dim=0) if need_th else None, None, None)
+        gzp, gx, sums = plif_k1_bwd_ref(eta, x, v_th, w_eta, pre, gS_, ctx.alpha)
+        gb, gw, gth = sums.sum(dim=1).unbind(0)
+        return (gw if need_w else None, gb if need_b else None, gzp if need_zp else None,
+                gx if need_x else None, gth if need_th else None, None, None)
 
 
 def plif_scan_train_ref(w_eta: torch.Tensor, b_eta: torch.Tensor, zp: torch.Tensor, x: torch.Tensor,
@@ -610,9 +597,9 @@ def plif_scan_train_ref(w_eta: torch.Tensor, b_eta: torch.Tensor, zp: torch.Tens
     and the reductions of the op's autograd formula.  The kernel's adjoint is ``lam_{t-1} = RN(RN(a~ lam_t) + c~)``
     with ``a~ = a (1 - g_mem)``, ``c~ = a (g_mem gS)``; autograd through the eager chain rounds it as ``a (lam +
     g_mem (gS - lam))`` instead, a different rounding at every step of a chain as long as the slowest channel's memory.
-    x enters twice (the multiply's and the drive's operand), as in :func:`plif_scan_train`."""
+    The gradient of x is the sum of its two edges (the gate logit's multiply and the drive), each in x.dtype."""
     od = x.dtype if out_dtype is None else out_dtype
-    return _PLIFScanRef.apply(w_eta, b_eta, zp, x, x, v_th, float(alpha), od)
+    return _PLIFScanRef.apply(w_eta, b_eta, zp, x, v_th, float(alpha), od)
 
 
 def plif_centred_input_ref(x: torch.Tensor) -> torch.Tensor:

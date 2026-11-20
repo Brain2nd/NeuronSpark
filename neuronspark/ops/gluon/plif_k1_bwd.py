@@ -1,19 +1,23 @@
 """Gluon backward of the training PLIF population (:func:`neuronspark.ops.triton.plif.plif_scan_train`).
 
 One kernel per launch computes, for every lane (b, c) walking the tokens from t = T - 1 down in tiles of 16 (the next
-two tiles' loads issued ahead), the adjoint of the bipolar soft-reset scan and the backward of its gate chain:
+two tiles' loads issued ahead), the adjoint of the bipolar soft-reset scan, the backward of its gate chain and the
+per-lane sums of the parameter gradients:
 
     phase 1  a = 1 - eta; gp = sigmoid(alpha (pre - th)), gn = sigmoid(alpha (-pre - th)) (RN sigmoid);
              g_mem = gp + gn, g_th = gp - gn; a~ = a (1 - g_mem), c~ = a (g_mem gS)
     phase 2  the adjoint chain lam_{t-1} = a~_t lam_t + c~_t as an associative scan over the tile (combine
              x_cur = RN(RN(a~ x_next) + c~)); lam_t (= dL/dv_t) is the chain value before row t
-    phase 3  dL/dpre = lam + g_mem (gS - lam); dL/dth += g_th (lam - gS) (per-lane sum over T);
-             v_{t-1} from the stored pre_{t-1}; gA = dL/dpre v_{t-1}; g_eta = dL/dpre xw + (-gA);
-             gz = (g_eta (1 - eta)) eta; gzp = bf16(gz); gx = dL/dpre eta (stored in x.dtype)
+    phase 3  dL/dpre = lam + g_mem (gS - lam); v_{t-1} from the stored pre_{t-1}; gA = dL/dpre v_{t-1};
+             g_eta = dL/dpre xw + (-gA); gz = (g_eta (1 - eta)) eta; gzp = bf16(gz);
+             gx = x.dtype(gz w_eta) + x.dtype(dL/dpre eta): the gradient of x through the gate logit's multiply and
+             through the drive, each rounded to x.dtype and added in x.dtype;
+             per-lane sums over T: gz (b_eta), gz xw (w_eta), g_th (lam - gS) (v_th)
 
 Every arithmetic step is one RN inline-PTX operation (helpers in :mod:`neuronspark.ops.gluon._ptx`).  The membrane
-at t = -1 and the gradient of the last membrane are zero (whole rows), the kernel's HAS_V0 / HAS_GVLAST constexprs are
-0.  Launch: 32 lanes per program, 4 warps, grid cdiv(B * C, 32); requires compute capability 10.x.
+at t = -1 and the gradient of the last membrane are zero (whole rows).  The three sums are kept per thread (a thread
+holds 4 of a tile's 16 rows) and reduced over the tile's rows once, after the last tile.  Launch: 32 lanes per program,
+4 warps, grid cdiv(B * C, 32); requires compute capability 10.x.
 
 Public: :func:`plif_k1_bwd` (custom op ``neuronspark::plif_k1_bwd``) and the pure-torch :func:`plif_k1_bwd_ref`;
 the kernel is checked against the reference with the per-operator tolerance rule of :mod:`neuronspark.utils.testing`.
@@ -68,9 +72,9 @@ def _tb_ok(t: torch.Tensor) -> bool:
     return (tmaj or bmaj or B == 1) and T * B * C < 2 ** 31
 
 
-def _plif_k1_bwd(eta: torch.Tensor, x: torch.Tensor, v_th: torch.Tensor, pre: torch.Tensor, gS: torch.Tensor,
-                 alpha: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """(gz fp32, gzp bf16, gx x.dtype, gth (B, C) fp32 per-lane sums over T), all contiguous."""
+def _plif_k1_bwd(eta: torch.Tensor, x: torch.Tensor, v_th: torch.Tensor, w_eta: torch.Tensor, pre: torch.Tensor,
+                 gS: torch.Tensor, alpha: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """(gzp bf16, gx x.dtype, sums (3, B, C) fp32: per-lane sums over T for b_eta, w_eta, v_th), all contiguous."""
     require_cuda(pre, "plif_k1_bwd")
     _need(pre.dim() == 3, f"pre must be (T, B, C), got {tuple(pre.shape)}")
     T, B, C = (int(s) for s in pre.shape)
@@ -80,58 +84,58 @@ def _plif_k1_bwd(eta: torch.Tensor, x: torch.Tensor, v_th: torch.Tensor, pre: to
           "eta must be a contiguous fp32 tensor of pre's shape")
     _need(x.dtype in (torch.float32, torch.bfloat16) and tuple(x.shape) == (T, B, C) and _tb_ok(x),
           "x must be fp32 / bf16 (T, B, C) with channel stride 1 (T-major or a view of B-major storage)")
-    _need(v_th.dtype == torch.float32 and tuple(v_th.shape) == (C,) and v_th.is_contiguous(),
-          f"v_th must be a contiguous fp32 ({C},) tensor")
+    for name, t in (("v_th", v_th), ("w_eta", w_eta)):
+        _need(t.dtype == torch.float32 and tuple(t.shape) == (C,) and t.is_contiguous(),
+              f"{name} must be a contiguous fp32 ({C},) tensor")
     _need(gS.dtype in (torch.float32, torch.bfloat16) and tuple(gS.shape) == (T, B, C) and gS.is_contiguous(),
           "gS must be a contiguous fp32 / bf16 tensor of pre's shape")
     _need(gate_slope_ok(alpha), f"the surrogate slope must satisfy 0 < alpha < 64, got {alpha}")
-    for name, t in (("eta", eta), ("x", x), ("v_th", v_th), ("gS", gS)):
+    for name, t in (("eta", eta), ("x", x), ("v_th", v_th), ("w_eta", w_eta), ("gS", gS)):
         _need(t.device == pre.device, f"{name} is on {t.device}, pre on {pre.device}")
     require_sm100(pre.device, "plif_k1_bwd")
     dev = pre.device
-    gz = torch.empty((T, B, C), dtype=torch.float32, device=dev)
     gzp = torch.empty((T, B, C), dtype=torch.bfloat16, device=dev)
     gx = torch.empty((T, B, C), dtype=x.dtype, device=dev)
-    gth = torch.empty((B, C), dtype=torch.float32, device=dev)
-    gv0 = torch.empty((B, C), dtype=torch.float32, device=dev)          # written by the kernel, not returned
+    sums = torch.empty((3, B, C), dtype=torch.float32, device=dev)
     _k1_bwd_tt16_nw4_d2_kernel[(triton.cdiv(B * C, BWD_LANES),)](
-        eta, x, v_th, pre, gv0, gS, gv0, gz, gzp, gx, gth, gv0, float(alpha), T, B, C,
+        eta, x, v_th, w_eta, pre, gS, gzp, gx, sums, float(alpha), T, B, C,
         int(x.stride(0)), int(x.stride(1)),
-        BC=BWD_LANES, X_BF16=int(x.dtype == torch.bfloat16), HAS_V0=0, HAS_GVLAST=0, num_warps=BWD_WARPS)
-    return gz, gzp, gx, gth
+        BC=BWD_LANES, X_BF16=int(x.dtype == torch.bfloat16), num_warps=BWD_WARPS)
+    return gzp, gx, sums
 
 
 @torch.library.custom_op("neuronspark::plif_k1_bwd", mutates_args=())
-def _plif_k1_bwd_op(eta: torch.Tensor, x: torch.Tensor, v_th: torch.Tensor, pre: torch.Tensor, gS: torch.Tensor,
-                    alpha: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def _plif_k1_bwd_op(eta: torch.Tensor, x: torch.Tensor, v_th: torch.Tensor, w_eta: torch.Tensor, pre: torch.Tensor,
+                    gS: torch.Tensor, alpha: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """The training backward launcher (the autograd formula of the PLIF Function calls it)."""
-    return _plif_k1_bwd(eta, x, v_th, pre, gS, alpha)
+    return _plif_k1_bwd(eta, x, v_th, w_eta, pre, gS, alpha)
 
 
 @_plif_k1_bwd_op.register_fake
-def _plif_k1_bwd_fake(eta, x, v_th, pre, gS, alpha):
+def _plif_k1_bwd_fake(eta, x, v_th, w_eta, pre, gS, alpha):
     T, B, C = pre.shape
-    return (pre.new_empty((T, B, C), dtype=torch.float32), pre.new_empty((T, B, C), dtype=torch.bfloat16),
-            pre.new_empty((T, B, C), dtype=x.dtype), pre.new_empty((B, C), dtype=torch.float32))
+    return (pre.new_empty((T, B, C), dtype=torch.bfloat16), pre.new_empty((T, B, C), dtype=x.dtype),
+            pre.new_empty((3, B, C), dtype=torch.float32))
 
 
-def plif_k1_bwd(eta: torch.Tensor, x: torch.Tensor, v_th: torch.Tensor, pre: torch.Tensor, gS: torch.Tensor,
-                alpha: float = 8.0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def plif_k1_bwd(eta: torch.Tensor, x: torch.Tensor, v_th: torch.Tensor, w_eta: torch.Tensor, pre: torch.Tensor,
+                gS: torch.Tensor, alpha: float = 8.0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward of the PLIF population scan + gate for the upstream spike gradient ``gS``.
 
     ``eta`` / ``pre``: contiguous fp32 (T, B, C) from the forward (the gate and the pre-release membrane); ``x``: the
-    forward's input (fp32 / bf16, channel stride 1); ``v_th``: fp32 (C,); ``gS``: contiguous fp32 / bf16 (T, B, C).
-    Returns (gz fp32 = dL/dz of the gate logit, gzp = bf16(gz), gx = the drive edge's dL/dx in x.dtype, gth (B, C) fp32
-    = per-lane sums over T of dL/dth)."""
-    return torch.ops.neuronspark.plif_k1_bwd(eta, x, v_th, pre, gS, float(alpha))
+    forward's input (fp32 / bf16, channel stride 1); ``v_th`` / ``w_eta``: fp32 (C,); ``gS``: contiguous fp32 / bf16
+    (T, B, C).  Returns (gzp = bf16(dL/dz) of the gate logit; gx = dL/dx in x.dtype, the multiply's edge
+    ``x.dtype(gz w_eta)`` plus the drive's edge ``x.dtype(dL/dpre eta)``; sums (3, B, C) fp32 = per-lane sums over T
+    of gz (b_eta), gz * x (w_eta) and dL/dth (v_th): their sums over B are the three parameter gradients)."""
+    return torch.ops.neuronspark.plif_k1_bwd(eta, x, v_th, w_eta, pre, gS, float(alpha))
 
 
 @torch.no_grad()
-def plif_k1_bwd_ref(eta: torch.Tensor, x: torch.Tensor, v_th: torch.Tensor, pre: torch.Tensor, gS: torch.Tensor,
-                    alpha: float = 8.0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def plif_k1_bwd_ref(eta: torch.Tensor, x: torch.Tensor, v_th: torch.Tensor, w_eta: torch.Tensor, pre: torch.Tensor,
+                    gS: torch.Tensor, alpha: float = 8.0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Pure-torch reference of :func:`plif_k1_bwd`: the same recurrences in fp32, the adjoint chain sequential over t
     (the backward of the bipolar release surrogate, of the soft-reset scan and of the gate chain, in the form the kernel
-    evaluates)."""
+    evaluates); the two edges of x each cast to x.dtype and added in x.dtype; torch sums over T."""
     f32 = torch.float32
     T, B, C = (int(s) for s in pre.shape)
     xw = x.to(f32)
@@ -157,8 +161,9 @@ def plif_k1_bwd_ref(eta: torch.Tensor, x: torch.Tensor, v_th: torch.Tensor, pre:
     ga = grad_pre * v_prev
     g_eta = grad_pre * xw + (-ga)
     gz = (g_eta * (1.0 - eta)) * eta
-    gx = (grad_pre * eta).to(x.dtype)
-    return gz, gz.to(torch.bfloat16), gx, gth
+    gx = (gz * w_eta.to(f32)).to(x.dtype) + (grad_pre * eta).to(x.dtype)
+    sums = torch.stack([gz.sum(dim=0), (gz * xw).sum(dim=0), gth], dim=0)
+    return gz.to(torch.bfloat16), gx, sums
 
 
 # ================================================================================================ kernels
@@ -175,13 +180,22 @@ def _g_neg_f32(a):
 
 
 @gluon.jit
+def _g_bf16_rn(a):
+    """fp32 -> bf16 (cvt.rn, nearest even) -> fp32: the value a bf16 store of ``a`` holds."""
+    h = gl.inline_asm_elementwise(asm="cvt.rn.bf16.f32 $0, $1;", constraints="=h,f", args=[a], dtype=gl.bfloat16,
+                                  is_pure=True, pack=1)
+    return gl.inline_asm_elementwise(asm="cvt.f32.bf16 $0, $1;", constraints="=f,h", args=[h], dtype=gl.float32,
+                                     is_pure=True, pack=1)
+
+
+@gluon.jit
 def _k1_bwd_tt16_nw4_d2_kernel(
-    ETA, X, TH, PRE, V0, GS, GVLAST, GZ_OUT, GZP_OUT, GX_OUT, GTH_OUT, GV0_OUT,
+    ETA, X, TH, W, PRE, GS, GZP_OUT, GX_OUT, SUMS_OUT,
     ALPHA, T, B, DN, xs0, xs1,
-    BC: gl.constexpr, X_BF16: gl.constexpr, HAS_V0: gl.constexpr, HAS_GVLAST: gl.constexpr,
+    BC: gl.constexpr, X_BF16: gl.constexpr,
 ):
     """Phase-split backward of the PLIF scan and of the eta gate, TT=16 tokens per tile, 4 warps, loads DEPTH=2 tiles
-    ahead."""
+    ahead; SUMS_OUT (3, B, DN): the per-lane sums over T of gz, gz * xw and dL/dth."""
     P2: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])
     LANE: gl.constexpr = gl.SliceLayout(0, P2)
     ROW: gl.constexpr = gl.SliceLayout(1, P2)
@@ -200,21 +214,16 @@ def _k1_bwd_tt16_nw4_d2_kernel(
     lane2 = gl.expand_dims(lane, 0)
     lmask2 = gl.expand_dims(lmask, 0)
     th2 = gl.expand_dims(gl.load(TH + c_l, mask=lmask, other=0.0), 0)
-    if HAS_V0:
-        v0_2 = gl.expand_dims(gl.load(V0 + lane, mask=lmask, other=0.0), 0)
-    else:
-        v0_2 = gl.zeros([1, BC], gl.float32, P2)
-    QL: gl.constexpr = gl.SliceLayout(0, Q)
-    lane_q = pid * BC + gl.arange(0, BC, layout=QL)
-    lmask_q = lane_q < B * DN
+    w2 = gl.expand_dims(gl.load(W + c_l, mask=lmask, other=0.0), 0)
+    v0_2 = gl.zeros([1, BC], gl.float32, P2)
     rowq = gl.expand_dims(gl.arange(0, 16, layout=gl.SliceLayout(1, Q)), 1) + gl.zeros([16, BC], gl.int32, Q)
     first = rowq == 0
-    if HAS_GVLAST:
-        x = gl.expand_dims(gl.load(GVLAST + lane_q, mask=lmask_q, other=0.0), 0)
-    else:
-        x = gl.zeros([1, BC], gl.float32, Q)
+    x = gl.zeros([1, BC], gl.float32, Q)
     alpha = ALPHA.to(gl.float32)
-    gth_acc = gl.zeros([BC], gl.float32, LANE)
+    # per-thread partial sums over the tiles (each thread holds 4 of a tile's 16 rows); reduced after the last tile
+    acc_b = gl.zeros([16, BC], gl.float32, P2)
+    acc_w = gl.zeros([16, BC], gl.float32, P2)
+    acc_th = gl.zeros([16, BC], gl.float32, P2)
     tt0 = T - 1 - (0) - gl.expand_dims(rows, 1)
     mk0 = lmask2 & (tt0 >= 0)
     of0 = tt0 * (B * DN) + lane2
@@ -299,16 +308,18 @@ def _k1_bwd_tt16_nw4_d2_kernel(
         s_prev = _g_rn_sub(s_prev, gl.maximum(_g_rn_sub(-pre_prev, th_prev), 0.0))
         v_prev = gl.where(tt > 0, _g_rn_sub(pre_prev, s_prev), v0_2)
         ga = _g_rn_mul(grad_pre, v_prev)
-        gth_acc = _g_rn_add(gth_acc, gl.sum(gl.where(mk, gth, 0.0), axis=0))
         g_eta = _g_rn_add(_g_rn_mul(grad_pre, xw), _g_neg_f32(ga))      # neg.f32 (unary minus lowers to 0 - x: +0 for +0)
-        gz = _g_rn_mul(_g_rn_mul(g_eta, _g_rn_sub(1.0, e)), e)
-        gx = _g_rn_mul(grad_pre, e)
-        gl.store(GZ_OUT + of, gz, mask=mk)
+        gz = gl.where(mk, _g_rn_mul(_g_rn_mul(g_eta, _g_rn_sub(1.0, e)), e), 0.0)
+        acc_b = _g_rn_add(acc_b, gz)
+        acc_w = _g_rn_add(acc_w, _g_rn_mul(gz, xw))
+        acc_th = _g_rn_add(acc_th, gl.where(mk, gth, 0.0))
+        gxm = _g_rn_mul(gz, w2)
+        gxd = _g_rn_mul(grad_pre, e)
         gl.store(GZP_OUT + of, gz.to(gl.bfloat16), mask=mk)
         if X_BF16:
-            gl.store(GX_OUT + of, gx.to(gl.bfloat16), mask=mk)
+            gl.store(GX_OUT + of, _g_rn_add(_g_bf16_rn(gxm), _g_bf16_rn(gxd)).to(gl.bfloat16), mask=mk)
         else:
-            gl.store(GX_OUT + of, gx, mask=mk)
+            gl.store(GX_OUT + of, _g_rn_add(gxm, gxd), mask=mk)
         # rotate the register buffers
         pre0 = pre1
         gs0 = gs1
@@ -320,5 +331,6 @@ def _k1_bwd_tt16_nw4_d2_kernel(
         e1 = e2
         xw1 = xw2
         pp1 = pp2
-    gl.store(GV0_OUT + gl.expand_dims(lane_q, 0), x, mask=gl.expand_dims(lmask_q, 0))
-    gl.store(GTH_OUT + lane, gth_acc, mask=lmask)
+    gl.store(SUMS_OUT + lane, gl.sum(acc_b, axis=0), mask=lmask)
+    gl.store(SUMS_OUT + B * DN + lane, gl.sum(acc_w, axis=0), mask=lmask)
+    gl.store(SUMS_OUT + 2 * (B * DN) + lane, gl.sum(acc_th, axis=0), mask=lmask)

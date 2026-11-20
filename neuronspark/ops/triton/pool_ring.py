@@ -497,12 +497,16 @@ def _bf16(x):
 
 
 @triton.jit
-def _xq_form_kernel(U, WB, COS, SIN, PSI, HG, OUT,
+def _xq_form_kernel(U, WB, COS, SIN, PSI, HG, OUT, POS,
                     s_u_b, s_wb_m, s_cs_b, s_psi_b, s_out_b,
-                    M: tl.constexpr, R: tl.constexpr, DK: tl.constexpr, HALF: tl.constexpr):
+                    M: tl.constexpr, R: tl.constexpr, DK: tl.constexpr, HALF: tl.constexpr, HAS_POS: tl.constexpr):
     pid = tl.program_id(0)
     b = pid // M
     m = pid % M
+    if HAS_POS:
+        cs_row = tl.load(POS + b) * s_cs_b                 # the row's position in the tables
+    else:
+        cs_row = b * s_cs_b                                # the row's own table row (stride 0 = shared)
     offs_k = tl.arange(0, R)
     offs_i = tl.arange(0, HALF)
     # ---- the projection of the query's rank-R slice: q[n] = sum_k WB[m, n, k] u[b, m R + k]  (bf16 operands, fp32 sum)
@@ -516,8 +520,8 @@ def _xq_form_kernel(U, WB, COS, SIN, PSI, HG, OUT,
     q_e = _bf16(q_e * tl.sigmoid(q_e))
     q_o = _bf16(q_o * tl.sigmoid(q_o))
     # ---- interleaved RoPE in bf16 arithmetic: y_even = x_even cos - x_odd sin, y_odd = x_odd cos + x_even sin
-    c = tl.load(COS + b * s_cs_b + offs_i).to(tl.float32)                                  # the row's position (stride 0 = shared)
-    s = tl.load(SIN + b * s_cs_b + offs_i).to(tl.float32)
+    c = tl.load(COS + cs_row + offs_i).to(tl.float32)
+    s = tl.load(SIN + cs_row + offs_i).to(tl.float32)
     y_e = _bf16(_bf16(q_e * c) - _bf16(q_o * s))
     y_o = _bf16(_bf16(q_o * c) + _bf16(q_e * s))
     # ---- L2 normalisation (fp32 sum of squares, sqrt, floor 1e-12, division) and the gain
@@ -532,19 +536,24 @@ def _xq_form_kernel(U, WB, COS, SIN, PSI, HG, OUT,
     tl.store(out_row + 2 * offs_i + 1, o_o.to(tl.bfloat16))
 
 
-def _check_xq(u, wb, cos, sin, psi, head_gain) -> Tuple[int, int, int, int]:
+def _check_xq(u, wb, cos, sin, psi, head_gain, pos=None) -> Tuple[int, int, int, int]:
     for name, t in (("u", u), ("wb", wb), ("cos", cos), ("sin", sin), ("psi", psi), ("head_gain", head_gain)):
         require_cuda(t, f"xq_form_t1 ({name})")
     if wb.dim() != 3 or u.dim() != 2 or psi.dim() != 2 or cos.dim() != 2 or sin.dim() != 2:
         raise RuntimeError("xq_form_t1: u (B, M r), wb (M, dk, r), cos / sin (B, dk / 2), psi (B, M) are required")
     B = int(u.shape[0])
     M, dk, r = (int(x) for x in wb.shape)
+    rows = B
+    if pos is not None:
+        if tuple(pos.shape) != (B,) or pos.dtype != torch.int64 or not pos.is_contiguous() or pos.device != u.device:
+            raise RuntimeError(f"xq_form_t1: pos must be a contiguous ({B},) int64 tensor on the operands' device")
+        rows = int(cos.shape[0])                           # cos / sin are the tables: one row per position
     if u.dtype != torch.bfloat16 or wb.dtype != torch.bfloat16 or psi.dtype != torch.bfloat16:
         raise RuntimeError("xq_form_t1: u / wb / psi must be bf16")
     if cos.dtype != torch.bfloat16 or sin.dtype != torch.bfloat16:
         raise RuntimeError("xq_form_t1: cos / sin must be bf16 (the step's tables cast to the query dtype)")
-    if (tuple(u.shape) != (B, M * r) or tuple(psi.shape) != (B, M) or tuple(cos.shape) != (B, dk // 2)
-            or tuple(sin.shape) != (B, dk // 2)):
+    if (tuple(u.shape) != (B, M * r) or tuple(psi.shape) != (B, M) or tuple(cos.shape) != (rows, dk // 2)
+            or tuple(sin.shape) != (rows, dk // 2)):
         raise RuntimeError(f"xq_form_t1: shapes u {tuple(u.shape)} wb {tuple(wb.shape)} psi {tuple(psi.shape)} "
                            f"cos {tuple(cos.shape)} sin {tuple(sin.shape)}")
     if cos.stride(0) != sin.stride(0) or cos.stride(1) != 1 or sin.stride(1) != 1:
@@ -560,45 +569,48 @@ def _check_xq(u, wb, cos, sin, psi, head_gain) -> Tuple[int, int, int, int]:
 
 
 def _xq_form_t1_fwd(u: torch.Tensor, wb: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, psi: torch.Tensor,
-                    head_gain: torch.Tensor) -> torch.Tensor:
-    B, M, dk, r = _check_xq(u, wb, cos, sin, psi, head_gain)
+                    head_gain: torch.Tensor, pos: Optional[torch.Tensor]) -> torch.Tensor:
+    B, M, dk, r = _check_xq(u, wb, cos, sin, psi, head_gain, pos)
     out = torch.empty((B, M, dk), dtype=torch.bfloat16, device=u.device)
-    _xq_form_kernel[(B * M,)](u, wb, cos, sin, psi, head_gain, out,
+    _xq_form_kernel[(B * M,)](u, wb, cos, sin, psi, head_gain, out, pos if pos is not None else u,
                               u.stride(0), wb.stride(0), cos.stride(0), psi.stride(0), out.stride(0),
-                              M=M, R=r, DK=dk, HALF=dk // 2, num_warps=XQ_FORM_WARPS)
+                              M=M, R=r, DK=dk, HALF=dk // 2, HAS_POS=int(pos is not None), num_warps=XQ_FORM_WARPS)
     return out
 
 
 @torch.library.custom_op("neuronspark::xq_form_t1", mutates_args=())
 def _xq_form_t1_op(u: torch.Tensor, wb: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, psi: torch.Tensor,
-                   head_gain: torch.Tensor) -> torch.Tensor:
-    return _xq_form_t1_fwd(u, wb, cos, sin, psi, head_gain)
+                   head_gain: torch.Tensor, pos: Optional[torch.Tensor]) -> torch.Tensor:
+    return _xq_form_t1_fwd(u, wb, cos, sin, psi, head_gain, pos)
 
 
 @_xq_form_t1_op.register_fake
-def _xq_form_t1_fake(u, wb, cos, sin, psi, head_gain):
+def _xq_form_t1_fake(u, wb, cos, sin, psi, head_gain, pos):
     return u.new_empty((u.shape[0], wb.shape[0], wb.shape[1]), dtype=torch.bfloat16)
 
 
 def xq_form_t1(u: torch.Tensor, wb: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, psi: torch.Tensor,
-               head_gain: torch.Tensor) -> torch.Tensor:
+               head_gain: torch.Tensor, pos: Optional[torch.Tensor] = None) -> torch.Tensor:
     """The last head's M extra queries of a decode step.
 
     u (B, M r) bf16 (unit inner stride): the low-rank map of the normed input; wb (M, dk, r) bf16 contiguous: the
-    stacked per-query projections (:func:`xq_weight_stack`); cos / sin (B, dk / 2) bf16 with unit inner stride: the
-    last head's band of the step's RoPE tables per row (an expanded view with row stride 0 for a shared position);
-    psi (B, M) bf16: the gain projection (unclamped); head_gain (1,) fp32: the last head's dendritic query gain
-    (:func:`xq_head_gain`).  Returns (B, M, dk) bf16 contiguous: the gained unit queries (the read rounds them to bf16
-    in any case)."""
-    return torch.ops.neuronspark.xq_form_t1(u, wb, cos, sin, psi, head_gain)
+    stacked per-query projections (:func:`xq_weight_stack`); cos / sin bf16 with unit inner stride: the last head's
+    band of the RoPE tables, either per row, (B, dk / 2) (an expanded view with row stride 0 for a shared position),
+    or, with ``pos`` (B,) int64, the tables themselves, (positions, dk / 2), read at the rows' positions (a count
+    inside the tables); psi (B, M) bf16: the gain projection (unclamped); head_gain (1,) fp32: the last head's
+    dendritic query gain (:func:`xq_head_gain`).  Returns (B, M, dk) bf16 contiguous: the gained unit queries (the
+    read rounds them to bf16 in any case)."""
+    return torch.ops.neuronspark.xq_form_t1(u, wb, cos, sin, psi, head_gain, pos)
 
 
 def xq_form_t1_ref(u: torch.Tensor, wb: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, psi: torch.Tensor,
-                   head_gain: torch.Tensor) -> torch.Tensor:
+                   head_gain: torch.Tensor, pos: Optional[torch.Tensor] = None) -> torch.Tensor:
     """The inference forward's arithmetic of the extra-query loop with explicit dtypes: the projection (``torch.mm``,
     bf16 operands and output), SiLU and the interleaved RoPE as bf16 ops; the L2 normalisation, the division and the
     gain in fp32 with one rounding to bf16 at the stack.  Same arguments and output as :func:`xq_form_t1`."""
     M, dk, r = (int(x) for x in wb.shape)
+    if pos is not None:
+        cos, sin = cos[pos], sin[pos]
     with torch.autocast("cuda", enabled=False):
         psi32 = psi.to(torch.float32).clamp(-3.0, 3.0)
         c, s = cos.to(torch.bfloat16), sin.to(torch.bfloat16)

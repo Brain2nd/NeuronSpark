@@ -640,9 +640,10 @@ class PoolAttentionMixin:
                                    wbias, self.write_sparsity, st.pool_k, st.pool_gv, st.pool_cum, st.pool_run)
         carry_out = v.unsqueeze(0) if self.value_residual_first else carry
         # the last head's extra queries: the low-rank map and the gain projection, then one kernel (the M projections,
-        # SiLU, RoPE on the head's band, normalisation, gain; bf16, the rounding the ring read applies)
-        xq = o.xq_form_t1(lin(zb, self.pool_xq_a), xq_wb, self._xq_band(self.rope_cos_bf16)[pos0],
-                          self._xq_band(self.rope_sin_bf16)[pos0], lin(zb, self.pool_xq_gain_proj), xq_gain)
+        # SiLU, RoPE on the head's band of the tables at the rows' positions, normalisation, gain; bf16, the rounding
+        # the ring read applies)
+        xq = o.xq_form_t1(lin(zb, self.pool_xq_a), xq_wb, self._xq_band(self.rope_cos_bf16),
+                          self._xq_band(self.rope_sin_bf16), lin(zb, self.pool_xq_gain_proj), xq_gain, pos0)
         # the ring kernel: every head's read and the extra queries' reads over the live slots (pos0 = tokens before
         # this step; ptr0 = this step's slot; the step's clocks are the carried clocks just advanced)
         red = o.ring_read_t1(q_h, xq, st.pool_run, st.pool_k, st.pool_gv, st.pool_cum, pos0, ptr0, matches, beta,

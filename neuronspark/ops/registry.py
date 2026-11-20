@@ -193,9 +193,10 @@ _SPECS: List[OpSpec] = [
         "q xq cum_t pool_k pool_gv pool_cum pos ring_ptr matches beta gain",
         "(B, 1, 1536 + extra-query width) bf16", "decode",
         doc="q (B, 6, 256), xq (B, 4, 256), cum_t this step's clocks, rings, counters, induction matches, beta, gain"),
-    _op("xq_form_t1", _T + "pool_ring", "u wb cos sin psi head_gain",
+    _op("xq_form_t1", _T + "pool_ring", "u wb cos sin psi head_gain pos",
         "(B, 4, 256) bf16", "decode",
-        doc="u (B, 256) bf16, wb (4, 256, 64) bf16, cos / sin (B, 128) bf16, psi (B, 4) bf16, head_gain (1,) fp32"),
+        doc="u (B, 256) bf16, wb (4, 256, 64) bf16, cos / sin (B, 128) bf16 (with pos (B,) int64: the (positions, "
+            "128) table band, read at pos), psi (B, 4) bf16, head_gain (1,) fp32"),
     # ---------------------------------------------------------------------------------------------- PLIF
     _op("plif_centred_input", _T + "plif", "x",
         "x.dtype (T, B, C): x minus its running mean", "train",

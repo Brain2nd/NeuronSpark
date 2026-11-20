@@ -25,8 +25,6 @@ layer_idx)`` (PyTorch's default draws, then lex_q / lex_k Xavier-uniform, lex_o 
 """
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 
@@ -78,15 +76,6 @@ class LexicalReadMixin:
             raise RuntimeError("lexical read: the hippocampal layer needs the model-level lexical vector of this call, "
                                f"fp32 (or its bf16 rounding) (T, B, {self.lex_dim}) for h {tuple(h.shape)}, got "
                                f"{None if not isinstance(lex, torch.Tensor) else (tuple(lex.shape), lex.dtype)}")
-
-    def _lexical_gate(self, q_raw: torch.Tensor, k_raw: torch.Tensor) -> torch.Tensor:
-        """(T, B, 1) fp32 alpha from the bf16 q / k projections (the ZCN norms, the scaled dot, the bias, sigmoid)."""
-        qf = q_raw.float()
-        qf = qf * torch.rsqrt(qf.pow(2).mean(dim=-1, keepdim=True) + LEX_EPS) * (1.0 + self.lex_q_gain.float())
-        kf = k_raw.float()
-        kf = kf * torch.rsqrt(kf.pow(2).mean(dim=-1, keepdim=True) + LEX_EPS) * (1.0 + self.lex_k_gain.float())
-        return torch.sigmoid((qf * kf).sum(dim=-1, keepdim=True) / math.sqrt(self.lex_key_dim)
-                             + self.lex_beta.float())
 
     def _lexical_read_train(self, h: torch.Tensor, lex: torch.Tensor) -> torch.Tensor:
         """Whole-row form: h (T, B, D) fp32, lex (T, B, 160) fp32 -> h' fp32."""

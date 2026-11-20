@@ -10,9 +10,10 @@ Ops:
   dendritic-layer Function (:mod:`neuronspark.ops.dendritic_combined`) calls the launchers ``_conv_fwd`` / ``_conv_bwd``
   directly (its backward writes dx into the projection gradient).
 * prefill: ``dendritic_conv_silu_prefill(xBC, conv_w, conv_b, tail) -> (xbc, tail_new)`` with ``tail`` (B, C, 3) fp32 =
-  the three previous conv inputs (lags t-3, t-2, t-1; bf16-exact values): ``x_ext = cat([bf16(tail), xBC], time)``, the
-  training forward kernel on x_ext, the first three output rows dropped; ``xbc`` (B, T, C) bf16 contiguous, ``tail_new``
-  (B, C, 3) fp32 contiguous = the last three rows of x_ext.
+  the three previous conv inputs (lags t-3, t-2, t-1; bf16-exact values): the forward kernel on xBC with the tail as
+  the history of the row's first three positions (the convolution of ``cat([bf16(tail), xBC], time)`` at the positions
+  of xBC, without forming the concatenation); ``xbc`` (B, T, C) bf16 contiguous, ``tail_new`` (B, C, 3) fp32 contiguous
+  = the last three inputs.
 
 Numerics.  Forward, per element: ``pre = bias + w0 x[t-3]; pre += w1 x[t-2]; pre += w2 x[t-1]; pre += w3 x[t]`` in fp32
 (x[t < 0] = 0; Triton's FMA contraction), ``out = bf16(pre / (1 + exp(-pre)))``: the causal_conv1d 1.7.0 forward's
@@ -57,7 +58,8 @@ CONV_WIDTH = 4
 # the per-row taps are written out.
 # ================================================================================================================
 @triton.jit
-def _conv_silu_fwd_ls16(X, W, Bias, OUT, sxb, sxl, sob, sol, L, nseg, nprog_l, C, SPP, BC: tl.constexpr):
+def _conv_silu_fwd_ls16(X, W, Bias, OUT, TAIL, sxb, sxl, sob, sol, L, nseg, nprog_l, C, SPP, BC: tl.constexpr,
+                        HAS_TAIL: tl.constexpr):
     pid_c = tl.program_id(0)
     pid_bp = tl.program_id(1)
     b = pid_bp // nprog_l
@@ -71,6 +73,8 @@ def _conv_silu_fwd_ls16(X, W, Bias, OUT, sxb, sxl, sob, sol, L, nseg, nprog_l, C
     bias = tl.load(Bias + c, mask=cm, other=0.)
     xb = X + b.to(tl.int64) * sxb + c        # batch-row offsets in 64 bits; offsets within a row in 32 bits
     ob = OUT + b.to(tl.int64) * sob + c
+    if HAS_TAIL:
+        tb = TAIL + (b.to(tl.int64) * C + c) * 3        # the carried inputs of positions -3, -2, -1 (fp32, bf16 values)
     seg0 = q * SPP
     seg1 = tl.minimum(seg0 + SPP, nseg)
     for seg in range(seg0, seg1):
@@ -81,6 +85,10 @@ def _conv_silu_fwd_ls16(X, W, Bias, OUT, sxb, sxl, sob, sol, L, nseg, nprog_l, C
         xr1 = tl.load(xb + lx1 * sxl, mask=cm & (lx1 >= 0), other=0.).to(tl.float32)
         lx2 = l0 + (-1)
         xr2 = tl.load(xb + lx2 * sxl, mask=cm & (lx2 >= 0), other=0.).to(tl.float32)
+        if HAS_TAIL:                                    # before the row start: the tail's value (else the + 0 of the mask)
+            xr0 += tl.load(tb + (lx0 + 3), mask=cm & (lx0 < 0), other=0.)
+            xr1 += tl.load(tb + (lx1 + 3), mask=cm & (lx1 < 0), other=0.)
+            xr2 += tl.load(tb + (lx2 + 3), mask=cm & (lx2 < 0), other=0.)
         lx3 = l0 + (0)
         xr3 = tl.load(xb + lx3 * sxl, mask=cm & (lx3 < L), other=0.).to(tl.float32)
         lx4 = l0 + (1)
@@ -468,10 +476,15 @@ def _conv_check(x, weight, bias, *others):
     return B, C, L
 
 
-def _conv_fwd(x, weight, bias, out=None):
+def _conv_fwd(x, weight, bias, out=None, tail=None):
     """silu(causal depthwise conv1d) of a channel-last (B, C, L) view; ``out`` (new, contiguous (B, L, C) seen as
-    (B, C, L)) unless given."""
+    (B, C, L)) unless given; ``tail`` (B, C, 3) fp32 contiguous: the inputs of the three positions before the row
+    (zero history without it)."""
     B, C, L = _conv_check(x, weight, bias)
+    if tail is not None and (tuple(tail.shape) != (B, C, CONV_WIDTH - 1) or tail.dtype != torch.float32
+                             or not tail.is_contiguous() or tail.device != x.device):
+        raise RuntimeError(f"neuronspark.dendritic_conv: tail must be a contiguous fp32 ({B}, {C}, {CONV_WIDTH - 1}) "
+                           "tensor on x's device")
     LS, SPP, BC, nw = FWD_CFG
     if out is None:
         out = torch.empty((B, L, C), dtype=x.dtype, device=x.device).transpose(1, 2)
@@ -480,8 +493,9 @@ def _conv_fwd(x, weight, bias, out=None):
     nprog_l = math.ceil(nseg / SPP)
     grid = (math.ceil(C / BC), B * nprog_l)
     with torch.cuda.device(x.device.index):
-        _conv_silu_fwd_ls16[grid](x, weight, bias, out, x.stride(0), x.stride(2), out.stride(0), out.stride(2), L, nseg,
-                            nprog_l, C, SPP, BC=BC, num_warps=nw)
+        _conv_silu_fwd_ls16[grid](x, weight, bias, out, weight if tail is None else tail, x.stride(0), x.stride(2),
+                                  out.stride(0), out.stride(2), L, nseg, nprog_l, C, SPP, BC=BC,
+                                  HAS_TAIL=tail is not None, num_warps=nw)
     return out
 
 
@@ -573,10 +587,9 @@ def _prefill_alloc(xBC):
 def _dendritic_conv_silu_prefill_op(xBC, conv_w, conv_b, tail):
     """(xbc (B, T, C) bf16 contiguous, tail_new (B, C, 3) fp32 contiguous)"""
     k = CONV_WIDTH - 1
-    x_ext = torch.cat([tail.to(torch.bfloat16).transpose(1, 2), xBC], dim=1)          # (B, k + T, C) bf16
-    out = _conv_fwd(x_ext.transpose(1, 2), conv_w, conv_b)                             # (B, C, k + T) view
-    xbc = out.transpose(1, 2)[:, k:, :].contiguous()
-    tail_new = x_ext[:, -k:, :].transpose(1, 2).to(torch.float32).contiguous()
+    xbc = _conv_fwd(_ensure_stride(xBC).transpose(1, 2), conv_w, conv_b, tail=tail.contiguous()).transpose(1, 2)
+    last = xBC[:, -k:, :].transpose(1, 2).to(torch.float32)                           # (B, C, min(T, k))
+    tail_new = (last if int(last.shape[2]) == k else torch.cat([tail, last], dim=2)[:, :, -k:]).contiguous()
     return xbc, tail_new
 
 

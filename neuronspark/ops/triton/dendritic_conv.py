@@ -587,9 +587,14 @@ def _prefill_alloc(xBC):
 def _dendritic_conv_silu_prefill_op(xBC, conv_w, conv_b, tail):
     """(xbc (B, T, C) bf16 contiguous, tail_new (B, C, 3) fp32 contiguous)"""
     k = CONV_WIDTH - 1
+    B, T, C = (int(s) for s in xBC.shape)
     xbc = _conv_fwd(_ensure_stride(xBC).transpose(1, 2), conv_w, conv_b, tail=tail.contiguous()).transpose(1, 2)
-    last = xBC[:, -k:, :].transpose(1, 2).to(torch.float32)                           # (B, C, min(T, k))
-    tail_new = (last if int(last.shape[2]) == k else torch.cat([tail, last], dim=2)[:, :, -k:]).contiguous()
+    tail_new = torch.empty((B, C, k), dtype=torch.float32, device=xBC.device)
+    if T >= k:
+        tail_new.copy_(xBC[:, T - k:, :].transpose(1, 2))          # the last k inputs, widened: one kernel
+    else:
+        tail_new[:, :, :k - T].copy_(tail[:, :, T:])
+        tail_new[:, :, k - T:].copy_(xBC.transpose(1, 2))
     return xbc, tail_new
 
 

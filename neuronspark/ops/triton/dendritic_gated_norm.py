@@ -8,7 +8,7 @@ Op (registry name ``dendritic_gated_norm_soma``; no autograd)::
 
     g    = y * (z * sigmoid(z))                         fp32
     rstd = 1 / sqrt(sum_N g^2 / N + eps)                one row
-    n    = bf16((g * rstd) * 1)                         the unit weight of the dendritic-layer gated norm
+    n    = bf16(g * rstd)                               the dendritic-layer gated norm (unit weight)
     x    = bf16(S(n, theta) * gamma),  S(v, th) = max(v - th, 0) - max(-v - th, 0)
 
 ``y`` is the scan output (rows of B * T), ``z`` the gate slice of the in-projection read in place (a (M, N) view with
@@ -26,7 +26,7 @@ xor butterfly inside each warp, (3) the 8 warp partials combined by the same but
 ``tl.split`` and added in order 0..7 -- and hands the 256 partials to ``tl.sum`` on a [256] tensor with the same 8
 warps, which is stages (2) and (3) again.  The gated row of each rep stays in registers between the two passes (no
 second load or sigmoid).  The division, square root, sigmoid and the final cast are the same Triton expressions as
-fla's.  The weight operand is the unit vector (materialised per call), multiplied as in fla.  A narrower row
+fla's.  The norm's weight is the unit vector: the product with it is not formed (x * 1 = x).  A narrower row
 (2048 < N <= 8192: the model widths 512 and 1024, N = 3072 and 6144) runs the same kernel with fewer reps: the same
 function with this kernel's summation order (fla itself would choose a smaller block there).  Tests: the
 per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the reference.
@@ -79,7 +79,7 @@ def _soma_store(Y, NOUT, cols, m, y, TH, GA, STORE_N: tl.constexpr):
 
 
 @triton.jit
-def _gated_norm_soma_kernel(X, Z, W, Y, NOUT, TH, GA, sx, sz, sy, N, eps,
+def _gated_norm_soma_kernel(X, Z, Y, NOUT, TH, GA, sx, sz, sy, N, eps,
                             VEC: tl.constexpr, T: tl.constexpr, NREP_EFF: tl.constexpr, STORE_N: tl.constexpr):
     row = tl.program_id(0)
     X += row * sx
@@ -278,60 +278,36 @@ def _gated_norm_soma_kernel(X, Z, W, Y, NOUT, TH, GA, sx, sz, sy, N, eps,
         acc = acc + p7
     var = tl.sum(acc, axis=0) / N
     rstd = 1 / tl.sqrt(var + eps)
-    # pass 2: the normalised, weighted kept values (element-wise)
+    # pass 2: the normalised kept values (element-wise; the unit weight is not multiplied: x * 1 = x)
     if NREP_EFF > 0:
-        w0 = tl.load(W + cols0, mask=m0).to(tl.float32)
-        x_hat0 = g0 * rstd
-        y0 = x_hat0 * w0
-        _soma_store(Y, NOUT, cols0, m0, y0, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, cols0, m0, g0 * rstd, TH, GA, STORE_N)
     if NREP_EFF > 1:
-        w1 = tl.load(W + cols1, mask=m1).to(tl.float32)
-        x_hat1 = g1 * rstd
-        y1 = x_hat1 * w1
-        _soma_store(Y, NOUT, cols1, m1, y1, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, cols1, m1, g1 * rstd, TH, GA, STORE_N)
     if NREP_EFF > 2:
-        w2 = tl.load(W + cols2, mask=m2).to(tl.float32)
-        x_hat2 = g2 * rstd
-        y2 = x_hat2 * w2
-        _soma_store(Y, NOUT, cols2, m2, y2, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, cols2, m2, g2 * rstd, TH, GA, STORE_N)
     if NREP_EFF > 3:
-        w3 = tl.load(W + cols3, mask=m3).to(tl.float32)
-        x_hat3 = g3 * rstd
-        y3 = x_hat3 * w3
-        _soma_store(Y, NOUT, cols3, m3, y3, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, cols3, m3, g3 * rstd, TH, GA, STORE_N)
     if NREP_EFF > 4:
-        w4 = tl.load(W + cols4, mask=m4).to(tl.float32)
-        x_hat4 = g4 * rstd
-        y4 = x_hat4 * w4
-        _soma_store(Y, NOUT, cols4, m4, y4, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, cols4, m4, g4 * rstd, TH, GA, STORE_N)
     if NREP_EFF > 5:
-        w5 = tl.load(W + cols5, mask=m5).to(tl.float32)
-        x_hat5 = g5 * rstd
-        y5 = x_hat5 * w5
-        _soma_store(Y, NOUT, cols5, m5, y5, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, cols5, m5, g5 * rstd, TH, GA, STORE_N)
     if NREP_EFF > 6:
-        w6 = tl.load(W + cols6, mask=m6).to(tl.float32)
-        x_hat6 = g6 * rstd
-        y6 = x_hat6 * w6
-        _soma_store(Y, NOUT, cols6, m6, y6, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, cols6, m6, g6 * rstd, TH, GA, STORE_N)
     if NREP_EFF > 7:
-        w7 = tl.load(W + cols7, mask=m7).to(tl.float32)
-        x_hat7 = g7 * rstd
-        y7 = x_hat7 * w7
-        _soma_store(Y, NOUT, cols7, m7, y7, TH, GA, STORE_N)
+        _soma_store(Y, NOUT, cols7, m7, g7 * rstd, TH, GA, STORE_N)
 
 
 # ------------------------------------------------------------------------------------------------ launcher
-def _gated_norm_soma_fwd(y2: torch.Tensor, w: torch.Tensor, z2: torch.Tensor, theta: torch.Tensor, gamma: torch.Tensor,
+def _gated_norm_soma_fwd(y2: torch.Tensor, z2: torch.Tensor, theta: torch.Tensor, gamma: torch.Tensor,
                          eps: float, store_n: bool = False):
-    """the read-out of fla ``layer_norm_fwd(y2, w, None, eps, z=z2, group_size=N, norm_before_gate=False,
+    """the read-out of fla ``layer_norm_fwd(y2, ones, None, eps, z=z2, group_size=N, norm_before_gate=False,
     is_rms_norm=True)[0]`` for the reproduced domain (operands checked by the caller); a contiguous (M, N) bf16 output,
     and with ``store_n`` also the norm n (M, N) bf16 that the read-out was formed from (for a stage-wise comparison)."""
     M, N = (int(s) for s in y2.shape)
     out = torch.empty((M, N), dtype=torch.bfloat16, device=y2.device)
     n_out = torch.empty((M, N), dtype=torch.bfloat16, device=y2.device) if store_n else out
     with torch.cuda.device(y2.device.index):
-        _gated_norm_soma_kernel[(M,)](y2, z2, w, out, n_out, theta, gamma, y2.stride(0), z2.stride(0), out.stride(0), N,
+        _gated_norm_soma_kernel[(M,)](y2, z2, out, n_out, theta, gamma, y2.stride(0), z2.stride(0), out.stride(0), N,
                                       float(eps), VEC=VEC, T=THREADS, NREP_EFF=triton.cdiv(N, THREADS * VEC),
                                       STORE_N=bool(store_n), num_warps=NUM_WARPS)
     return (out, n_out) if store_n else out
@@ -340,9 +316,8 @@ def _gated_norm_soma_fwd(y2: torch.Tensor, w: torch.Tensor, z2: torch.Tensor, th
 @torch.library.custom_op("neuronspark::dendritic_gated_norm_soma", mutates_args=(),
                          schema="(Tensor y, Tensor z, Tensor theta, Tensor gamma, float eps) -> Tensor")
 def _dendritic_gated_norm_soma_op(y, z, theta, gamma, eps):
-    """x (M, N) bf16 contiguous; the unit weight is materialised here (N fp32 ones)"""
-    w = torch.ones((int(y.shape[1]),), dtype=torch.float32, device=y.device)
-    return _gated_norm_soma_fwd(y, w, z, theta, gamma, eps)
+    """x (M, N) bf16 contiguous"""
+    return _gated_norm_soma_fwd(y, z, theta, gamma, eps)
 
 
 @_dendritic_gated_norm_soma_op.register_fake

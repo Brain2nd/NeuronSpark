@@ -8,8 +8,6 @@ Operators (registry names):
 * ``centred_past(x)`` (training): the strictly-past running-mean centring of a whole row,
   ``c_t = bf16((x_t - S_t / max(t, 1)) * [t > 0])`` with ``S_t = sum_{s < t} x_s``, for an fp32 (T, B, C) tensor (the
   operand of the value-residual gate's projection), forward and backward one kernel each.
-* ``exact_cumsum0(x)`` (prefill, no autograd): ``torch.cumsum(x, dim=0)`` of an fp32 (T, ...) tensor with more than one
-  column, as ATen's outer-dim scan computes it.
 * ``centred_running(x, run_sum, count, out_dtype)`` (prefill, no autograd, T >= 2): the strictly-past running-mean
   centring ``c_t = (x_t - S_t / max(n + t, 1)) * [n + t > 0]`` with ``S`` the carried fp32 (B, C) sum (``run_sum``,
   advanced in place to the sum through the call's last token) and ``n = count`` (B,) int64 the row position of the
@@ -27,8 +25,6 @@ Numerics contract
 * Every form is deterministic: the same input gives the same output in every call.  (ATen scans a single column with
   cub's decoupled look-back scan, whose order of additions depends on the timing of the thread blocks: a (32768, 1)
   scan differs from call to call.)
-* ``exact_cumsum0``: the same IEEE fp32 operations as ``torch.cumsum`` in the same order (``add.rn``; the accumulator
-  from +0).
 * ``centred_past``: the tokens in tiles of CPAST_TT; a tile's prefix sums by a parallel scan plus the carried sum of
   the earlier tiles, the division by max(t, 1), the difference, the mask and one bf16 rounding (what the linear
   operator's cast of the fp32 result gives).  Backward: ``dx_s = w_s - sum_{t > s} w_t / t`` with ``w_t = g_t [t > 0]``,
@@ -39,8 +35,8 @@ Numerics contract
   chain's per-element ``div.rn`` by max(n + t, 1), the difference and the mask, the output cast fused (round to nearest
   even).
 
-Launchers are ``torch.library`` custom ops (``neuronspark::cumsum0``, ``::exact_cumsum0``, ``::centred_running``,
-the last declaring its in-place update of ``run_sum``) with fake implementations.  References: ``torch.cumsum``
+Launchers are ``torch.library`` custom ops (``neuronspark::cumsum0``, ``::centred_running``, the last declaring its
+in-place update of ``run_sum``) with fake implementations.  References: ``torch.cumsum``
 and the torch chain of the running-mean centring (:func:`centred_running_ref`).
 """
 from typing import Optional
@@ -60,7 +56,7 @@ from neuronspark.ops.triton._ptx import (  # noqa: F401  (jit helpers resolved t
 )
 
 __all__ = ["Cumsum0Fn", "cumsum0", "cumsum0_ref", "CentredPastFn", "centred_past", "centred_past_ref",
-           "exact_cumsum0", "exact_cumsum0_ref", "centred_running", "centred_running_ref"]
+           "centred_running", "centred_running_ref"]
 
 # ------------------------------------------------------------------------------------------------ fixed constants
 # Training: narrow widths take the sequential kernel, wide widths the chunked kernel.
@@ -68,8 +64,6 @@ NARROW_N = 32                          # widths up to 32 columns are "narrow"
 SEQ_BLOCK_N, SEQ_WARPS = 32, 1         # sequential kernel for the narrow scans (one warp, 32 columns per program)
 CHUNK_CH, CHUNK_BLOCK_N, CHUNK_WARPS, CHUNK_STAGES = 32, 32, 8, 4   # chunked kernel for the wide scans
 CPAST_TT, CPAST_BC, CPAST_WARPS = 128, 32, 4   # centred_past: tokens per tile, columns per program, warps
-# Prefill exact cumsum: one warp per program, one column per lane.
-PREFILL_BLOCK = 32
 # centred_running (TT tokens, BC columns, warps) by the call's width N = B * C: narrow (one prefill row) long tiles over few
 # columns, wide (eight rows) short tiles over more
 CENTRED_NARROW_N = 4096
@@ -664,89 +658,6 @@ def _centred_past_bwd_kernel(G, OUT, T, N, TT: tl.constexpr, BC: tl.constexpr):
 
 
 @triton.jit
-def _cum0_step(acc, x, OUT, off, m):
-    """one row of torch's outer-dim cumsum: acc = acc + x (fp32 RN), out = acc"""
-    nxt = _rn_add_f32(acc, x)
-    tl.store(OUT + off, nxt, mask=m)
-    return tl.where(m, nxt, acc)
-
-
-@triton.jit
-def _cumsum0_kernel(X, OUT, L, N, BLOCK: tl.constexpr):
-    """OUT[t, j] = ((0 + X[0, j]) + X[1, j]) + ... + X[t, j] in fp32 RN, sequentially over t, X / OUT (L, N) fp32
-    contiguous; 16 rows per tile, the next tile's loads issued before the current tile is summed"""
-    pid = tl.program_id(0)
-    cols = pid * BLOCK + tl.arange(0, BLOCK)
-    cm = cols < N
-    acc = tl.zeros([BLOCK], dtype=tl.float32)
-    x0 = tl.load(X + (0 + 0) * N + cols, mask=cm & (0 + 0 < L), other=0.0).to(tl.float32)
-    x1 = tl.load(X + (0 + 1) * N + cols, mask=cm & (0 + 1 < L), other=0.0).to(tl.float32)
-    x2 = tl.load(X + (0 + 2) * N + cols, mask=cm & (0 + 2 < L), other=0.0).to(tl.float32)
-    x3 = tl.load(X + (0 + 3) * N + cols, mask=cm & (0 + 3 < L), other=0.0).to(tl.float32)
-    x4 = tl.load(X + (0 + 4) * N + cols, mask=cm & (0 + 4 < L), other=0.0).to(tl.float32)
-    x5 = tl.load(X + (0 + 5) * N + cols, mask=cm & (0 + 5 < L), other=0.0).to(tl.float32)
-    x6 = tl.load(X + (0 + 6) * N + cols, mask=cm & (0 + 6 < L), other=0.0).to(tl.float32)
-    x7 = tl.load(X + (0 + 7) * N + cols, mask=cm & (0 + 7 < L), other=0.0).to(tl.float32)
-    x8 = tl.load(X + (0 + 8) * N + cols, mask=cm & (0 + 8 < L), other=0.0).to(tl.float32)
-    x9 = tl.load(X + (0 + 9) * N + cols, mask=cm & (0 + 9 < L), other=0.0).to(tl.float32)
-    x10 = tl.load(X + (0 + 10) * N + cols, mask=cm & (0 + 10 < L), other=0.0).to(tl.float32)
-    x11 = tl.load(X + (0 + 11) * N + cols, mask=cm & (0 + 11 < L), other=0.0).to(tl.float32)
-    x12 = tl.load(X + (0 + 12) * N + cols, mask=cm & (0 + 12 < L), other=0.0).to(tl.float32)
-    x13 = tl.load(X + (0 + 13) * N + cols, mask=cm & (0 + 13 < L), other=0.0).to(tl.float32)
-    x14 = tl.load(X + (0 + 14) * N + cols, mask=cm & (0 + 14 < L), other=0.0).to(tl.float32)
-    x15 = tl.load(X + (0 + 15) * N + cols, mask=cm & (0 + 15 < L), other=0.0).to(tl.float32)
-    for tile in range(0, L, 16):
-        n0 = tl.load(X + (tile + 16 + 0) * N + cols, mask=cm & (tile + 16 + 0 < L), other=0.0).to(tl.float32)
-        n1 = tl.load(X + (tile + 16 + 1) * N + cols, mask=cm & (tile + 16 + 1 < L), other=0.0).to(tl.float32)
-        n2 = tl.load(X + (tile + 16 + 2) * N + cols, mask=cm & (tile + 16 + 2 < L), other=0.0).to(tl.float32)
-        n3 = tl.load(X + (tile + 16 + 3) * N + cols, mask=cm & (tile + 16 + 3 < L), other=0.0).to(tl.float32)
-        n4 = tl.load(X + (tile + 16 + 4) * N + cols, mask=cm & (tile + 16 + 4 < L), other=0.0).to(tl.float32)
-        n5 = tl.load(X + (tile + 16 + 5) * N + cols, mask=cm & (tile + 16 + 5 < L), other=0.0).to(tl.float32)
-        n6 = tl.load(X + (tile + 16 + 6) * N + cols, mask=cm & (tile + 16 + 6 < L), other=0.0).to(tl.float32)
-        n7 = tl.load(X + (tile + 16 + 7) * N + cols, mask=cm & (tile + 16 + 7 < L), other=0.0).to(tl.float32)
-        n8 = tl.load(X + (tile + 16 + 8) * N + cols, mask=cm & (tile + 16 + 8 < L), other=0.0).to(tl.float32)
-        n9 = tl.load(X + (tile + 16 + 9) * N + cols, mask=cm & (tile + 16 + 9 < L), other=0.0).to(tl.float32)
-        n10 = tl.load(X + (tile + 16 + 10) * N + cols, mask=cm & (tile + 16 + 10 < L), other=0.0).to(tl.float32)
-        n11 = tl.load(X + (tile + 16 + 11) * N + cols, mask=cm & (tile + 16 + 11 < L), other=0.0).to(tl.float32)
-        n12 = tl.load(X + (tile + 16 + 12) * N + cols, mask=cm & (tile + 16 + 12 < L), other=0.0).to(tl.float32)
-        n13 = tl.load(X + (tile + 16 + 13) * N + cols, mask=cm & (tile + 16 + 13 < L), other=0.0).to(tl.float32)
-        n14 = tl.load(X + (tile + 16 + 14) * N + cols, mask=cm & (tile + 16 + 14 < L), other=0.0).to(tl.float32)
-        n15 = tl.load(X + (tile + 16 + 15) * N + cols, mask=cm & (tile + 16 + 15 < L), other=0.0).to(tl.float32)
-        acc = _cum0_step(acc, x0, OUT, (tile + 0) * N + cols, cm & (tile + 0 < L))
-        acc = _cum0_step(acc, x1, OUT, (tile + 1) * N + cols, cm & (tile + 1 < L))
-        acc = _cum0_step(acc, x2, OUT, (tile + 2) * N + cols, cm & (tile + 2 < L))
-        acc = _cum0_step(acc, x3, OUT, (tile + 3) * N + cols, cm & (tile + 3 < L))
-        acc = _cum0_step(acc, x4, OUT, (tile + 4) * N + cols, cm & (tile + 4 < L))
-        acc = _cum0_step(acc, x5, OUT, (tile + 5) * N + cols, cm & (tile + 5 < L))
-        acc = _cum0_step(acc, x6, OUT, (tile + 6) * N + cols, cm & (tile + 6 < L))
-        acc = _cum0_step(acc, x7, OUT, (tile + 7) * N + cols, cm & (tile + 7 < L))
-        acc = _cum0_step(acc, x8, OUT, (tile + 8) * N + cols, cm & (tile + 8 < L))
-        acc = _cum0_step(acc, x9, OUT, (tile + 9) * N + cols, cm & (tile + 9 < L))
-        acc = _cum0_step(acc, x10, OUT, (tile + 10) * N + cols, cm & (tile + 10 < L))
-        acc = _cum0_step(acc, x11, OUT, (tile + 11) * N + cols, cm & (tile + 11 < L))
-        acc = _cum0_step(acc, x12, OUT, (tile + 12) * N + cols, cm & (tile + 12 < L))
-        acc = _cum0_step(acc, x13, OUT, (tile + 13) * N + cols, cm & (tile + 13 < L))
-        acc = _cum0_step(acc, x14, OUT, (tile + 14) * N + cols, cm & (tile + 14 < L))
-        acc = _cum0_step(acc, x15, OUT, (tile + 15) * N + cols, cm & (tile + 15 < L))
-        x0 = n0
-        x1 = n1
-        x2 = n2
-        x3 = n3
-        x4 = n4
-        x5 = n5
-        x6 = n6
-        x7 = n7
-        x8 = n8
-        x9 = n9
-        x10 = n10
-        x11 = n11
-        x12 = n12
-        x13 = n13
-        x14 = n14
-        x15 = n15
-
-
-@triton.jit
 def _centred_tiled_kernel(X, S, CNT, OUT, L, N, C, sxt, sxb, sxc, sot, sob, soc, OUT_DTYPE: tl.constexpr,
                           TT: tl.constexpr, BC: tl.constexpr):
     """centred_running: BC columns (j = b * C + c of N = B * C) per program, the T tokens in tiles of TT; per tile the prefix
@@ -904,10 +815,6 @@ def centred_past_ref(x: torch.Tensor) -> torch.Tensor:
     return ((xf - xcum / n) * mask).to(torch.bfloat16)
 
 
-def _prefill_grid(n: int):
-    return (triton.cdiv(int(n), PREFILL_BLOCK),)
-
-
 def _dense(t: torch.Tensor) -> bool:
     """non-overlapping and dense: its strides are a permutation of a contiguous layout"""
     if t.is_contiguous():
@@ -921,44 +828,6 @@ def _dense(t: torch.Tensor) -> bool:
             return False
         expect *= int(t.shape[d])
     return True
-
-
-def _cumsum0_takes(x: torch.Tensor) -> bool:
-    """the inputs whose torch kernel is tensor_kernel_scan_outer_dim over dim 0 with fp32 accumulation: fp32 CUDA,
-    >= 2 dimensions, int32 offsets, and not a tensor whose elements all lie along dim 0 (torch sends numel == size(0)
-    to cub's parallel inclusive scan)"""
-    return (isinstance(x, torch.Tensor) and x.is_cuda and x.dtype == torch.float32 and x.dim() >= 2
-            and x.numel() > 0 and x.numel() != int(x.shape[0])
-            and x.numel() + 32 * (x.numel() // max(int(x.shape[0]), 1)) < 2 ** 31)
-
-
-@torch.library.custom_op("neuronspark::exact_cumsum0", mutates_args=(), schema="(Tensor x) -> Tensor")
-def _exact_cumsum0_op(x):
-    xc = x if x.is_contiguous() else x.contiguous()       # torch's scan_dim scans a contiguous copy
-    L = int(x.shape[0])
-    N = x.numel() // L
-    out = torch.empty(tuple(x.shape), dtype=x.dtype, device=x.device)
-    _cumsum0_kernel[_prefill_grid(N)](xc, out, L, N, BLOCK=PREFILL_BLOCK, num_warps=1, num_stages=1,
-                                      enable_fp_fusion=False)
-    return out
-
-
-@_exact_cumsum0_op.register_fake
-def _exact_cumsum0_fake(x):
-    return torch.empty(tuple(x.shape), dtype=x.dtype, device=x.device)
-
-
-def exact_cumsum0(x: torch.Tensor) -> torch.Tensor:
-    """``torch.cumsum(x, dim=0)`` for an fp32 CUDA (T, N...) tensor with at least two dimensions and more than one
-    column, one kernel (prefill regime, no autograd); returns a contiguous fp32 tensor."""
-    if not _cumsum0_takes(x):
-        raise RuntimeError(f"neuronspark.exact_cumsum0: an fp32 CUDA tensor of >= 2 dimensions with more than one "
-                           f"column is required, got {getattr(x, 'dtype', None)} {tuple(getattr(x, 'shape', ()))}")
-    return _exact_cumsum0_op(x)
-
-
-def exact_cumsum0_ref(x: torch.Tensor) -> torch.Tensor:
-    return torch.cumsum(x, dim=0)
 
 
 def _centred_out(x: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:

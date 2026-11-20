@@ -43,8 +43,9 @@ Regime differences kept explicitly in the code paths (each regime has its own nu
   unit queries, the value-residual mix and GLU tail, the tagged values and the clocks in one kernel after the step's
   projections; the six projections of z are one product over their stacked weights), ``ops.xq_form_t1`` (the extra
   queries) and ``ops.ring_read_t1`` (every head's read and the extra queries' reads) at every decode batch size;
-* the pool clock: ``ops.clock_increments`` + ``ops.cumsum0`` (whole row), ``ops.exact_cumsum0`` over the carried
-  clock (prefill), one add (decode); the value-residual running mean: ``ops.centred_past`` (whole row),
+* the pool clock: ``ops.clock_increments`` + ``ops.cumsum0`` (whole row), ``ops.pool_clock_prefill`` (prefill: the
+  decay, its mean log, the gained cumulative sum from the carried clock and the write of the clock rings in one
+  operator), one add (decode); the value-residual running mean: ``ops.centred_past`` (whole row),
   ``ops.centred_running`` (prefill), ``ops.centred_step`` over the carried sum (decode);
 * short conv: ``ops.short_conv_train`` / ``ops.short_conv_silu_prefill`` (T >= 3, the SiLU in the store; a 2-token call takes the depthwise
   ``F.conv1d`` over the carried history) / inside ``ops.ring_write_step`` (decode);
@@ -558,7 +559,6 @@ class PoolAttentionMixin:
         q = o.rope_interleaved(q, cos, sin)
         k = o.rope_interleaved(k, cos, sin)
         gate = self.gate_neuron(z, st.gate_neuron, pos0)
-        a = self._memory_decay(lin(zb, self.W_decay.weight), rate)
         # ring write of the call's events (unit keys, tagged values); the gained unit queries (fp32 gain)
         q_h = q.reshape(T, B, H, dk)
         k_h = k.reshape(T, B, H, dk)
@@ -566,15 +566,12 @@ class PoolAttentionMixin:
         g_h = gate.reshape(T, B, H, dk)
         qn = o.ring_write_prefill(k_h, q_h, g_h, v_h, qgain, wbias, self.write_sparsity, st.pool_k, st.pool_gv, ptr0,
                                   T, B, H, W)
-        # absolute clocks: the sequential cumulative sum from the carried clock
-        la = self._clock_increments(a, T, B, bias_gains)
-        run = torch.cat([st.pool_run.unsqueeze(0), la], dim=0)
-        cum_abs = o.exact_cumsum0(run.reshape(T + 1, B * H)).view(T + 1, B, H)[1:]
-        slots = (ptr0 + torch.arange(T, device=h.device, dtype=torch.int64)) % W
-        st.pool_cum.index_copy_(2, slots, cum_abs.permute(1, 2, 0).contiguous())
-        out = o.ring_recall_prefill(qn.permute(1, 2, 0, 3), st.pool_k, st.pool_gv, st.pool_cum, cum_abs.permute(1, 2, 0),
-                                    ptr0, (matches, beta), self.match_scale, T, B, H, W, dk, dv, h.dtype, False, 0)
-        st.pool_run.copy_(cum_abs[-1])
+        # absolute clocks (B, H, T): the decay of the bf16 decay logit, its mean log times the heads' slopes, the
+        # cumulative sum from the carried clock; written to the clock rings, the carried clock advanced
+        cum = o.pool_clock_prefill(lin(zb, self.W_decay.weight), rate, self.hippocampal_base_decay, DECAY_FLOOR,
+                                   bias_gains, st.pool_run, st.pool_cum, ptr0)
+        out = o.ring_recall_prefill(qn.permute(1, 2, 0, 3), st.pool_k, st.pool_gv, st.pool_cum, cum, ptr0,
+                                    (matches, beta), self.match_scale, T, B, H, W, dk, dv, h.dtype, False, 0)
         # extra queries of the last head over its ring
         xq = self._xq_queries_prefill(zb, cos, sin, xq_gain)
         # the reads in bf16: their only consumer is the bf16 pool_xq_out_in projection

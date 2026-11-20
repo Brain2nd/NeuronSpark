@@ -154,9 +154,6 @@ _SPECS: List[OpSpec] = [
     _op("centred_past", _T + "cumsum", "x",
         "(T, B, C) bf16 contiguous: x minus the mean of the earlier tokens", "train",
         doc="x (T, B, C) fp32"),
-    _op("exact_cumsum0", _T + "cumsum", "x",
-        "(T, N) fp32", "prefill",
-        doc="x (T, N) fp32: sequential RN additions"),
     _op("centred_running", _T + "cumsum", "x run_sum count out_dtype",
         "(T, B, C) in out_dtype", "prefill", mutates="run_sum",
         doc="x (T, B, C), run_sum (B, C) fp32 carried sum, count (B,) int64 tokens before this call"),
@@ -343,6 +340,11 @@ _HIPPOCAMPAL_PREFILL_SPECS: List[OpSpec] = [
         "(f, rho): the read gain's factor and the PKM copy gate, (T, B) fp32 each", "prefill",
         doc="maximum / lse (T, B) fp32 the copy detector's statistics, zw / rv (T, B) fp32 the novelty predictor's "
             "products, tau / bias / strength one fp32 value each, kappa the read gain (4.0)"),
+    _op("pool_clock_prefill", _T + "pool_clock_prefill", "decay_logit rate base_decay floor gains run cum_ring ptr",
+        "(B, 6, T) fp32 contiguous clocks of the call's tokens", "prefill", mutates="run cum_ring",
+        doc="decay_logit (T, B, 256) bf16 decay projection, rate (256,) bf16 decay rate, base_decay / floor the "
+            "decay's factor and lower clamp, gains (6,) fp32 eligibility slopes, run (B, 6) fp32 carried clocks, "
+            "cum_ring (B, 6, W) fp32 clock rings (written at (ptr + t) % W), ptr (1,) int64 ring pointer"),
 ]
 for _hippocampal_spec in _HIPPOCAMPAL_PREFILL_SPECS:
     if _hippocampal_spec.name in OPS:

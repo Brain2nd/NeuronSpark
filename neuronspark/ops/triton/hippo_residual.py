@@ -2,16 +2,17 @@
 
 Operators (registry names):
 
-* ``value_residual(v, lam, carry, glu_add)``: the value residual and the GLU tail of the last head::
+* ``value_residual(v, lam0, gate, carry, glu_add)``: the values' SiLU, the value residual with its mix and the GLU
+  tail of the last head, one forward and one backward kernel::
 
-      v' = bf16(float(v) * (1 + lam))           (hippocampal layer 0: carry is None)
-      v' = bf16(float(v) + lam * float(carry))  (later layers: carry = layer 0's value stream)
-      out = cat([v'[..., :C - d], bf16(float(v'[..., C - d:]) + glu_add)], -1)    (d = glu_add.shape[-1])
+      s    = silu(v)                                                 (bf16)
+      lam  = lam0[c] + tanh(float(gate[t, b, c // (C / H)]))         (fp32; H = gate.shape[-1] heads)
+      v'   = bf16(float(s) * (1 + lam))           (hippocampal layer 0: carry is None)
+      v'   = bf16(float(s) + lam * float(carry))  (later layers: carry = layer 0's s)
+      out  = cat([v'[..., :C - d], bf16(float(v'[..., C - d:]) + float(glu_add))], -1)    (d = glu_add.shape[-1])
 
-  ``v`` bf16 (T, B, C), ``lam`` fp32 broadcastable to (T, B, C), ``carry`` bf16 (T, B, C) or None, ``glu_add`` fp32
-  (T, B, d).
-* ``zc_center(z, zcum)``: ``((z - zcum / max(t, 1)) * (t > 0)).contiguous()`` for fp32 (T, B, C) ``z`` and its
-  strictly-past running sum ``zcum`` (the value-residual gate's centred input).
+  ``v`` bf16 (T, B, C), ``lam0`` fp32 (C,), ``gate`` bf16 (T, B, H), ``carry`` bf16 (T, B, C) or None, ``glu_add``
+  bf16 (T, B, d).  Returns ``(out, s)`` for hippocampal layer 0 and ``(out, None)`` for the later layers.
 * ``centre_rows(r)``: ``r - mean_c(r)`` for the bf16 (T, B, C) output projection of the attention sub-block (bf16
   mean and difference), forward and backward one kernel each.
 * ``read_gain_residual(h, r, f)``: ``h + bf16(float(r) * (1 + f))`` for fp32 ``h`` (T, B, C), the centred bf16
@@ -26,19 +27,27 @@ Forwards: the same IEEE operations at the same rounding points as the torch line
 .rn.f32``, exact conversions, no FMA contraction, ``enable_fp_fusion=False``); ``pkm_tail``'s bf16 mean is formed in
 ATen's ``reduce_kernel`` order (one warp per row), so the forwards follow the eager chain's order of operations.
 Backwards: the autograd chain's roundings (the bf16 casts, the "+ 0" of zero-filled slice gradients), with the row
-sums of the (T, B, 1) factors formed in registers (fp32 reduction-order class); ``value_residual`` / ``zc_center``
-backwards are elementwise.  ``read_gain_residual``'s factor gradient takes the bf16 gradient of ``rg`` that autograd
+sums of the (T, B, 1) factors formed in registers (fp32 reduction-order class).  ``value_residual`` is fp32
+arithmetic on the widened operands with one bf16 rounding where the torch chain holds a bf16 tensor (the SiLU output,
+the mixed value before and after the GLU addend, each gradient), products and sums as separate fp32 operations (no
+FMA contraction); one program is one head's channels at VRES_TILE /
+head-width positions, so the gate logit's gradient is a row sum in registers and the static mix's gradient per-program
+column sums reduced by one torch sum (fp32 reduction-order class); the mix (T, B, C) is not materialised.  ``read_gain_residual``'s factor gradient takes the bf16 gradient of ``rg`` that autograd
 delivers for the fp32 add.
 
-Launchers are ``torch.library`` custom ops (``neuronspark::hippo_*``) with fake implementations of the same layouts.
-Pure-torch references ``*_ref`` (same parameters): the torch lines of the centring, the value residual and GLU tail,
-the read gain and the PKM tail.
+The read gain's and the PKM tail's launchers are ``torch.library`` custom ops (``neuronspark::hippo_*``) with fake
+implementations of the same layouts; the value residual's and the row centring's kernels are launched by their
+autograd Functions.
+Pure-torch references ``*_ref`` (same parameters): the torch lines of the SiLU, the mix, the value residual and GLU
+tail, the row centring, the read gain and the PKM tail.
 """
 from typing import Optional
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from neuronspark.ops.triton import require_cuda
 from neuronspark.ops.triton.hippo_norms import (  # noqa: F401  (jit helpers resolved through this module's globals)
@@ -66,15 +75,14 @@ from neuronspark.ops.triton.hippo_norms import (  # noqa: F401  (jit helpers res
 
 __all__ = [
     "ValueResidualFn", "value_residual", "value_residual_ref",
-    "ZcCenterFn", "zc_center", "zc_center_ref",
     "CentreRowsFn", "centre_rows", "centre_rows_ref",
     "ReadGainFn", "read_gain_residual", "read_gain_residual_ref",
     "PkmTailFn", "pkm_tail", "pkm_tail_ref", "PKM_TAIL_MIN_ROWS",
 ]
 
 # ------------------------------------------------------------------------------------------------ fixed constants
-VRES_BT, VRES_BC, VRES_WARPS = 64, 64, 4   # value_residual (t tile, channel tile, warps)
-FLAT_BLOCK, FLAT_WARPS = 1024, 4           # flat elementwise kernels (zc_center, the read-gain forward)
+VRES_TILE, VRES_WARPS = 4096, 4            # value_residual (elements per program: one head's channels x positions)
+FLAT_BLOCK, FLAT_WARPS = 1024, 4           # flat elementwise kernel (the read-gain forward)
 ROW_BR, ROW_WARPS = 4, 8                   # row kernels of the backwards (read gain, PKM tail)
 CENTRE_BR, CENTRE_WARPS = 4, 8             # centre_rows forward / backward (rows per program, warps)
 PKT_FWDX_ROWS, PKT_FWDX_WARPS = 1, 4       # PKM tail fused forward (exact-order bf16 mean)
@@ -82,105 +90,89 @@ PKT_FWDX_ROWS, PKT_FWDX_WARPS = 1, 4       # PKM tail fused forward (exact-order
 
 # ================================================================================================ kernels
 @triton.jit
-def _vres_fwd_kernel(V, XC, LAM, GV, O, T, B, D, DT,
-                     vs0, vs1, vs2, xs0, xs1, xs2, ls0, ls1, ls2, gs0, gs1, gs2, os0, os1, os2,
-                     FIRST: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr):
-    """out = v' (channels < D - DT) | bf16(float(v') + gv) (the last DT channels), v' = bf16(v + lam xc) or
-    bf16(v (1 + lam)); program (t tile, b, c tile)."""
-    t = tl.program_id(0) * BT + tl.arange(0, BT)
+def _silu16(x):
+    """bf16(silu(x)) as an fp32 value."""
+    return _g_r16(x / (1.0 + tl.exp(-x)))
+
+
+@triton.jit
+def _vres_lam(GATE, LAM0, t, tm, b, h, c, cm, DV, gs0, gs1, gs2):
+    """(tanh of the head's gate logit per position, the mix lam0[c] + tanh) of one head's (BT, BD) tile."""
+    th = libdevice.tanh(_g_w(tl.load(GATE + (t * gs0 + b * gs1 + h * gs2), mask=tm, other=0.0)))
+    lam = tl.load(LAM0 + (h * DV + c), mask=cm, other=0.0)[None, :] + th[:, None]
+    return th, lam
+
+
+@triton.jit
+def _vres_fwd_kernel(V, XC, GATE, LAM0, GV, O, VS, T, B, D, DV, DT,
+                     vs0, vs1, vs2, xs0, xs1, xs2, gs0, gs1, gs2, as0, as1, as2,
+                     FIRST: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr):
+    """head h (channels [h DV, (h + 1) DV)), BT positions of one b: s = bf16(silu(v)), v' = bf16(s (1 + lam)) (FIRST;
+    s also written to VS) or bf16(s + lam xc), out = v' or bf16(v' + gv) on the last DT channels; O, VS contiguous
+    (T, B, D)."""
     b = tl.program_id(1).to(tl.int64)
-    c = tl.program_id(2) * BC + tl.arange(0, BC)
-    t2 = t.to(tl.int64)[:, None]
-    c2 = c.to(tl.int64)[None, :]
-    m = (t < T)[:, None] & (c < D)[None, :]
-    vf = _g_w(tl.load(V + (t2 * vs0 + b * vs1 + c2 * vs2), mask=m, other=0.0))
-    lam = tl.load(LAM + (t2 * ls0 + b * ls1 + c2 * ls2), mask=m, other=0.0)
+    h = tl.program_id(2).to(tl.int64)
+    t = (tl.program_id(0) * BT + tl.arange(0, BT)).to(tl.int64)
+    tm = t < T
+    c = tl.arange(0, BD).to(tl.int64)
+    cm = c < DV
+    m = tm[:, None] & cm[None, :]
+    ch = h * DV + c
+    off = (t[:, None] * B + b) * D + ch[None, :]
+    s = _silu16(_g_w(tl.load(V + (t[:, None] * vs0 + b * vs1 + ch[None, :] * vs2), mask=m, other=0.0)))
+    th, lam = _vres_lam(GATE, LAM0, t, tm, b, h, c, cm, DV, gs0, gs1, gs2)
     if FIRST:
-        val = _g_r16(_g_mul(vf, _g_add(1.0, lam)))
+        tl.store(VS + off, _g_n(s), mask=m)
+        val = _g_r16(s * (1.0 + lam))
     else:
-        xf = _g_w(tl.load(XC + (t2 * xs0 + b * xs1 + c2 * xs2), mask=m, other=0.0))
-        val = _g_r16(_g_add(vf, _g_mul(lam, xf)))
-    tail = (c2 >= D - DT) & m
-    gv = tl.load(GV + (t2 * gs0 + b * gs1 + (c2 - (D - DT)) * gs2), mask=tail, other=0.0)
-    val = tl.where(tail, _g_add(val, gv), val)
-    tl.store(O + (t2 * os0 + b * os1 + c2 * os2), _g_n(val), mask=m)
+        xc = _g_w(tl.load(XC + (t[:, None] * xs0 + b * xs1 + ch[None, :] * xs2), mask=m, other=0.0))
+        val = _g_r16(s + lam * xc)
+    ct = ch - (D - DT)
+    tail = m & (ct >= 0)[None, :]
+    gv = _g_w(tl.load(GV + (t[:, None] * as0 + b * as1 + ct[None, :] * as2), mask=tail, other=0.0))
+    tl.store(O + off, _g_n(tl.where(tail, val + gv, val)), mask=m)
 
 
 @triton.jit
-def _vres_bwd_kernel(G, V, XC, LAM, GVO, GXC, GL, GGV, T, B, D, DT,
-                     gs0, gs1, gs2, vs0, vs1, vs2, xs0, xs1, xs2, ls0, ls1, ls2,
-                     as0, as1, as2, cs0, cs1, cs2, ps0, ps1, ps2, qs0, qs1, qs2,
-                     FIRST: tl.constexpr, BT: tl.constexpr, BC: tl.constexpr):
-    """gv's gradient float(g) of the tail; v''s gradient canon(g) (the two slice gradients summed, -0 -> +0); v's
-    float(canon(g)) cast back (later layers) or bf16(gf (1 + lam)) (layer 0); the carry's bf16(gf lam); lam's gf xc
-    (layer 0: gf v)."""
-    t = tl.program_id(0) * BT + tl.arange(0, BT)
+def _vres_bwd_kernel(G, GC, V, XC, GATE, LAM0, GVO, GXC, GGATE, GGV, PL, T, B, D, DV, DT, H,
+                     vs0, vs1, vs2, xs0, xs1, xs2, gs0, gs1, gs2,
+                     FIRST: tl.constexpr, HAS_GC: tl.constexpr, BT: tl.constexpr, BD: tl.constexpr):
+    """head h, BT positions of one b, from out's gradient G (and, FIRST with HAS_GC, the gradient GC of s that the later
+    layers' carries accumulated), contiguous bf16 (T, B, D): the GLU addend's gradient (G on the last DT channels), s's
+    gradient ds = G (later layers) or bf16(GC + bf16(G (1 + lam))) (FIRST), v's gradient bf16(ds silu'(v)), the
+    carry's bf16(G lam), the gate logit's bf16(sum_c(dlam) (1 - tanh^2)) and PL[prog, channel] = sum_t dlam with
+    dlam = G xc (FIRST: G s)."""
     b = tl.program_id(1).to(tl.int64)
-    c = tl.program_id(2) * BC + tl.arange(0, BC)
-    t2 = t.to(tl.int64)[:, None]
-    c2 = c.to(tl.int64)[None, :]
-    m = (t < T)[:, None] & (c < D)[None, :]
-    gf = _g_w(tl.load(G + (t2 * gs0 + b * gs1 + c2 * gs2), mask=m, other=0.0))
-    tail = (c2 >= D - DT) & m
-    tl.store(GGV + (t2 * qs0 + b * qs1 + (c2 - (D - DT)) * qs2), gf, mask=tail)    # gv: float(g) of the tail
-    g2 = _g_r16(_g_add(gf, 0.0))                       # v''s gradient: the two slice gradients summed (canon)
-    lam = tl.load(LAM + (t2 * ls0 + b * ls1 + c2 * ls2), mask=m, other=0.0)
-    vf = _g_w(tl.load(V + (t2 * vs0 + b * vs1 + c2 * vs2), mask=m, other=0.0))
+    h = tl.program_id(2).to(tl.int64)
+    prog = (tl.program_id(0) * B + tl.program_id(1)).to(tl.int64)
+    t = (tl.program_id(0) * BT + tl.arange(0, BT)).to(tl.int64)
+    tm = t < T
+    c = tl.arange(0, BD).to(tl.int64)
+    cm = c < DV
+    m = tm[:, None] & cm[None, :]
+    ch = h * DV + c
+    off = (t[:, None] * B + b) * D + ch[None, :]
+    g16 = tl.load(G + off, mask=m, other=0.0)
+    g = _g_w(g16)
+    ct = ch - (D - DT)
+    tl.store(GGV + (t[:, None] * B + b) * DT + ct[None, :], g16, mask=m & (ct >= 0)[None, :])
+    x = _g_w(tl.load(V + (t[:, None] * vs0 + b * vs1 + ch[None, :] * vs2), mask=m, other=0.0))
+    sg = 1.0 / (1.0 + tl.exp(-x))
+    th, lam = _vres_lam(GATE, LAM0, t, tm, b, h, c, cm, DV, gs0, gs1, gs2)
     if FIRST:
-        tl.store(GVO + (t2 * as0 + b * as1 + c2 * as2), _g_n(_g_mul(g2, _g_add(1.0, lam))), mask=m)
-        tl.store(GL + (t2 * ps0 + b * ps1 + c2 * ps2), _g_mul(g2, vf), mask=m)
+        ds = _g_r16(g * (1.0 + lam))
+        if HAS_GC:
+            ds = _g_r16(_g_w(tl.load(GC + off, mask=m, other=0.0)) + ds)
+        dlam = g * _silu16(x)
     else:
-        xf = _g_w(tl.load(XC + (t2 * xs0 + b * xs1 + c2 * xs2), mask=m, other=0.0))
-        tl.store(GVO + (t2 * as0 + b * as1 + c2 * as2), _g_n(g2), mask=m)
-        tl.store(GXC + (t2 * cs0 + b * cs1 + c2 * cs2), _g_n(_g_mul(g2, lam)), mask=m)
-        tl.store(GL + (t2 * ps0 + b * ps1 + c2 * ps2), _g_mul(g2, xf), mask=m)
-
-
-@triton.jit
-def _zc_fwd_kernel(Z, ZC, O, N, S0, S1, T0, zs0, zs1, zs2, cs0, cs1, cs2, os0, os1, os2, TAX: tl.constexpr,
-                   BLOCK: tl.constexpr):
-    """o = (z - zcum / max(t, 1)) * (t > 0) over flat elements (TAX = the position of the time axis in the order)."""
-    lin = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    m = lin < N
-    i0 = lin % S0
-    rr = lin // S0
-    i1 = rr % S1
-    i2 = rr // S1
-    if TAX == 0:
-        t = i0
-    elif TAX == 1:
-        t = i1
-    else:
-        t = i2
-    tf = (t + T0).to(tl.float32)
-    zn = _g_max(tf, 1.0)                                  # arange(T).clamp_min(1.0)
-    mk = tl.where(t + T0 > 0, 1.0, 0.0)                   # (arange(T) > 0).to(fp32)
-    zv = tl.load(Z + (i0 * zs0 + i1 * zs1 + i2 * zs2), mask=m, other=0.0)
-    cv = tl.load(ZC + (i0 * cs0 + i1 * cs1 + i2 * cs2), mask=m, other=0.0)
-    tl.store(O + (i0 * os0 + i1 * os1 + i2 * os2), _g_mul(_g_sub(zv, _g_div(cv, zn)), mk), mask=m)
-
-
-@triton.jit
-def _zc_bwd_kernel(G, GZ, GC, N, S0, S1, T0, gs0, gs1, gs2, as0, as1, as2, cs0, cs1, cs2, TAX: tl.constexpr,
-                   BLOCK: tl.constexpr):
-    """gz = g * mask (MulBackward0, passed on by SubBackward0); gc = (-(g * mask)) / zn (DivBackward0)."""
-    lin = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    m = lin < N
-    i0 = lin % S0
-    rr = lin // S0
-    i1 = rr % S1
-    i2 = rr // S1
-    if TAX == 0:
-        t = i0
-    elif TAX == 1:
-        t = i1
-    else:
-        t = i2
-    zn = _g_max((t + T0).to(tl.float32), 1.0)
-    mk = tl.where(t + T0 > 0, 1.0, 0.0)
-    gm = _g_mul(tl.load(G + (i0 * gs0 + i1 * gs1 + i2 * gs2), mask=m, other=0.0), mk)   # MulBackward0: grad * mask
-    tl.store(GZ + (i0 * as0 + i1 * as1 + i2 * as2), gm, mask=m)                          # SubBackward0: self
-    tl.store(GC + (i0 * cs0 + i1 * cs1 + i2 * cs2), _g_div(_g_neg(gm), zn), mask=m)      # other: (-g) / zn
+        xc = _g_w(tl.load(XC + (t[:, None] * xs0 + b * xs1 + ch[None, :] * xs2), mask=m, other=0.0))
+        ds = g
+        tl.store(GXC + off, _g_n(g * lam), mask=m)
+        dlam = g * xc
+    tl.store(GVO + off, _g_n(ds * (sg * (1.0 + x * (1.0 - sg)))), mask=m)
+    dlam = tl.where(m, dlam, 0.0)
+    tl.store(GGATE + ((t * B + b) * H + h), _g_n(tl.sum(dlam, axis=1) * (1.0 - th * th)), mask=tm)
+    tl.store(PL + (prog * D + ch), tl.sum(dlam, axis=0), mask=cm)
 
 
 @triton.jit
@@ -316,109 +308,68 @@ def _flat_grid(n: int):
 
 
 # ================================================================================================ value_residual
-def _vres_fwd_alloc(v, xc, lam, gv, first):
+def _vres_dims(v: torch.Tensor, gate: torch.Tensor):
     T, B, D = (int(x) for x in v.shape)
-    dt = int(gv.shape[-1])
-    vm = _meta(v)
-    lm = _meta(lam)
-    if first:
-        vpm = (vm.float() * (1.0 + lm)).to(torch.bfloat16)
-    else:
-        vpm = (vm.float() + lm * _meta(xc).float()).to(torch.bfloat16)
-    om = torch.cat([vpm[..., :D - dt], (vpm[..., D - dt:].float() + _meta(gv)).to(torch.bfloat16)], dim=-1)
-    return torch.empty_strided((T, B, D), om.stride(), dtype=torch.bfloat16, device=v.device)
-
-
-@torch.library.custom_op("neuronspark::hippo_vres_fwd", mutates_args=(),
-                         schema="(Tensor v, Tensor? xc, Tensor lam, Tensor gv, bool first) -> Tensor")
-def _vres_fwd(v, xc, lam, gv, first):
-    T, B, D = (int(x) for x in v.shape)
-    dt = int(gv.shape[-1])
-    out = _vres_fwd_alloc(v, xc, lam, gv, first)
-    lst = _bcast(lam, (T, B, D))
-    xst = list(xc.stride()) if xc is not None else [0, 0, 0]
-    grid = (triton.cdiv(T, VRES_BT), B, triton.cdiv(D, VRES_BC))
-    _vres_fwd_kernel[grid](v, xc if xc is not None else v, lam, gv, out, T, B, D, dt, *v.stride(), *xst, *lst,
-                           *gv.stride(), *out.stride(), FIRST=bool(first), BT=VRES_BT, BC=VRES_BC,
-                           num_warps=VRES_WARPS, enable_fp_fusion=False)
-    return out
-
-
-@_vres_fwd.register_fake
-def _vres_fwd_fake(v, xc, lam, gv, first):
-    return _vres_fwd_alloc(v, xc, lam, gv, first)
-
-
-def _vres_bwd_alloc(g, v, xc, lam, dt, first):
-    T, B, D = (int(x) for x in v.shape)
-    dev = v.device
-    gm_ = _meta(g)
-    # torch's layouts: the cat's narrow views, .to(fp32) of the tail (ToCopyBackward0), the slice gradients' zero
-    # fills (contiguous (T, B, D)) and their sum, .to(fp32) of it, the products and their casts
-    ggv_st = gm_[..., D - dt:].to(torch.float32).stride()
-    g2m = torch.empty((T, B, D), dtype=torch.bfloat16, device="meta").to(torch.float32)
-    vm, lm = _meta(v), _meta(lam)
-    if first:
-        gvo_st = (g2m * (1.0 + lm)).to(torch.bfloat16).stride()
-        gl_st = (g2m * vm.float()).stride()
-        gxc = torch.empty((0,), dtype=torch.bfloat16, device=dev)
-    else:
-        xm = _meta(xc)
-        gvo_st = g2m.to(torch.bfloat16).stride()
-        gl_st = (g2m * xm.float()).stride()
-        gxc = torch.empty_strided((T, B, D), (g2m * lm).to(torch.bfloat16).stride(), dtype=torch.bfloat16, device=dev)
-    ggv = torch.empty_strided((T, B, dt), ggv_st, dtype=torch.float32, device=dev)
-    gvo = torch.empty_strided((T, B, D), gvo_st, dtype=torch.bfloat16, device=dev)
-    gl = torch.empty_strided((T, B, D), gl_st, dtype=torch.float32, device=dev)
-    return gvo, gxc, gl, ggv
-
-
-@torch.library.custom_op("neuronspark::hippo_vres_bwd", mutates_args=(),
-                         schema="(Tensor g, Tensor v, Tensor? xc, Tensor lam, int dt, bool first) "
-                                "-> (Tensor, Tensor, Tensor, Tensor)")
-def _vres_bwd(g, v, xc, lam, dt, first):
-    """(gv_in, gcarry, glam, gglu): gcarry is empty for layer 0."""
-    T, B, D = (int(x) for x in v.shape)
-    gvo, gxc, gl, ggv = _vres_bwd_alloc(g, v, xc, lam, dt, first)
-    lst = _bcast(lam, (T, B, D))
-    xst = list(xc.stride()) if xc is not None else [0, 0, 0]
-    grid = (triton.cdiv(T, VRES_BT), B, triton.cdiv(D, VRES_BC))
-    _vres_bwd_kernel[grid](g, v, xc if xc is not None else v, lam, gvo, gxc if not first else gvo, gl, ggv,
-                           T, B, D, dt, *g.stride(), *v.stride(), *xst, *lst, *gvo.stride(),
-                           *(gxc.stride() if not first else [0, 0, 0]), *gl.stride(), *ggv.stride(),
-                           FIRST=bool(first), BT=VRES_BT, BC=VRES_BC, num_warps=VRES_WARPS, enable_fp_fusion=False)
-    return gvo, gxc, gl, ggv
-
-
-@_vres_bwd.register_fake
-def _vres_bwd_fake(g, v, xc, lam, dt, first):
-    return _vres_bwd_alloc(g, v, xc, lam, dt, first)
+    H = int(gate.shape[-1])
+    bd = _pow2(D // H)
+    return T, B, D, H, D // H, max(1, VRES_TILE // bd), bd
 
 
 class ValueResidualFn(torch.autograd.Function):
-    """The value residual with the GLU tail (see the module docstring); ``xc`` None = hippocampal layer 0."""
+    """The values' SiLU, the value residual and the GLU tail (see the module docstring); ``xc`` None = hippocampal
+    layer 0, which also returns the SiLU output (the later layers' carry)."""
 
     @staticmethod
-    def forward(ctx, v, xc, lam, gv, first, dt):
-        out = _vres_fwd(v, xc, lam, gv, bool(first))
+    def forward(ctx, v, lam0, gate, xc, gv):
+        first = xc is None
+        T, B, D, H, DV, bt, bd = _vres_dims(v, gate)
+        out = torch.empty((T, B, D), dtype=torch.bfloat16, device=v.device)
+        vs = torch.empty((T, B, D), dtype=torch.bfloat16, device=v.device) if first else out
+        x = v if first else xc
+        _vres_fwd_kernel[(triton.cdiv(T, bt), B, H)](
+            v, x, gate, lam0, gv, out, vs, T, B, D, DV, int(gv.shape[-1]), *_s3(v), *_s3(x), *_s3(gate), *_s3(gv),
+            FIRST=first, BT=bt, BD=bd, num_warps=VRES_WARPS, enable_fp_fusion=False)
         ctx.set_materialize_grads(False)
-        ctx.save_for_backward(v, xc, lam)
-        ctx.first, ctx.dt = bool(first), int(dt)
-        return out
+        ctx.save_for_backward(v, lam0, gate, xc)
+        ctx.dt = int(gv.shape[-1])
+        return (out, vs) if first else out
 
     @staticmethod
-    def backward(ctx, g):
-        if g is None:
-            return None, None, None, None, None, None
-        v, xc, lam = ctx.saved_tensors
-        gvo, gxc, gl, ggv = _vres_bwd(g, v, xc, lam, ctx.dt, ctx.first)
-        return gvo, (None if ctx.first else gxc), gl, ggv, None, None
+    def backward(ctx, g, gc=None):
+        v, lam0, gate, xc = ctx.saved_tensors
+        first = xc is None
+        T, B, D, H, DV, bt, bd = _vres_dims(v, gate)
+        dt = ctx.dt
+        dev = v.device
+        if g is None:                                    # only the SiLU output is read: v's gradient through the SiLU
+            if gc is None:
+                return None, None, None, None, None
+            x = v.float()
+            sg = torch.sigmoid(x)
+            return (gc.float() * (sg * (1.0 + x * (1.0 - sg)))).to(torch.bfloat16), None, None, None, None
+        g = g.contiguous()
+        has_gc = gc is not None
+        gc = gc.contiguous() if has_gc else g
+        gvo = torch.empty((T, B, D), dtype=torch.bfloat16, device=dev)
+        gxc = gvo if first else torch.empty((T, B, D), dtype=torch.bfloat16, device=dev)
+        ggate = torch.empty((T, B, H), dtype=torch.bfloat16, device=dev)
+        ggv = torch.empty((T, B, dt), dtype=torch.bfloat16, device=dev)
+        npt = triton.cdiv(T, bt)
+        pl = torch.empty((npt * B, D), dtype=torch.float32, device=dev)
+        x = v if first else xc
+        _vres_bwd_kernel[(npt, B, H)](
+            g, gc, v, x, gate, lam0, gvo, gxc, ggate, ggv, pl, T, B, D, DV, dt, H, *_s3(v), *_s3(x), *_s3(gate),
+            FIRST=first, HAS_GC=has_gc, BT=bt, BD=bd, num_warps=VRES_WARPS, enable_fp_fusion=False)
+        return gvo, pl.sum(0), ggate, (None if first else gxc), ggv
 
 
-def value_residual(v: torch.Tensor, lam: torch.Tensor, carry: Optional[torch.Tensor],
-                   glu_add: torch.Tensor) -> torch.Tensor:
-    """The value residual of a hippocampal layer with the GLU addend on the last ``glu_add.shape[-1]`` channels (see the
-    module docstring); ``carry`` None for hippocampal layer 0.  bf16 (T, B, C) result.  Training regime."""
+def value_residual(v: torch.Tensor, lam0: torch.Tensor, gate: torch.Tensor, carry: Optional[torch.Tensor],
+                   glu_add: torch.Tensor):
+    """``(v', s)``: the value stream of a hippocampal layer after the SiLU, the value residual and the GLU addend on
+    the last ``glu_add.shape[-1]`` channels (see the module docstring), contiguous bf16 (T, B, C), and for hippocampal
+    layer 0 (``carry`` None) ``s = silu(v)``, the later layers' carry (else None).  ``v`` bf16 (T, B, C) (any
+    strides), ``lam0`` fp32 (C,), ``gate`` bf16 (T, B, H) gate logits with H dividing C, ``carry`` bf16 (T, B, C) or
+    None, ``glu_add`` bf16 (T, B, d).  Training regime."""
     require_cuda(v, "value_residual")
     if not (v.dtype == torch.bfloat16 and v.dim() == 3):
         raise RuntimeError("neuronspark.value_residual: v must be a 3-D bf16 CUDA tensor")
@@ -427,28 +378,38 @@ def value_residual(v: torch.Tensor, lam: torch.Tensor, carry: Optional[torch.Ten
     if not first and not (isinstance(carry, torch.Tensor) and carry.dtype == torch.bfloat16 and carry.shape == v.shape
                           and carry.device == v.device):
         raise RuntimeError("neuronspark.value_residual: the carry must be bf16 of v's shape")
-    if not (isinstance(lam, torch.Tensor) and lam.dtype == torch.float32 and lam.device == v.device and lam.dim() <= 3
-            and all(a in (1, b_) for a, b_ in zip((1,) * (3 - lam.dim()) + tuple(lam.shape), (T, B, D)))):
-        raise RuntimeError(f"neuronspark.value_residual: lam must be fp32 broadcastable to {(T, B, D)}, got "
-                           f"{getattr(lam, 'dtype', None)} {tuple(getattr(lam, 'shape', ()))}")
+    if not (isinstance(lam0, torch.Tensor) and lam0.dtype == torch.float32 and lam0.device == v.device
+            and tuple(lam0.shape) == (D,)):
+        raise RuntimeError(f"neuronspark.value_residual: lam0 must be fp32 ({D},), got "
+                           f"{getattr(lam0, 'dtype', None)} {tuple(getattr(lam0, 'shape', ()))}")
+    H = int(gate.shape[-1]) if isinstance(gate, torch.Tensor) and gate.dim() == 3 else 0
+    if not (H > 0 and gate.dtype == torch.bfloat16 and tuple(gate.shape) == (T, B, H) and D % H == 0
+            and gate.device == v.device and _pow2(D // H) <= VRES_TILE):
+        raise RuntimeError(f"neuronspark.value_residual: gate must be bf16 ({T}, {B}, H) with H dividing {D} and heads "
+                           f"of at most {VRES_TILE} channels, got {getattr(gate, 'dtype', None)} "
+                           f"{tuple(getattr(gate, 'shape', ()))}")
     dt = int(glu_add.shape[-1]) if isinstance(glu_add, torch.Tensor) and glu_add.dim() == 3 else -1
-    if not (isinstance(glu_add, torch.Tensor) and glu_add.dtype == torch.float32 and tuple(glu_add.shape) == (T, B, dt)
-            and glu_add.device == v.device and 0 < dt <= D):
-        raise RuntimeError("neuronspark.value_residual: glu_add must be fp32 (T, B, d) with 0 < d <= C")
-    if v.numel() >= 2 ** 31:
-        raise RuntimeError("neuronspark.value_residual: tensor too large")
-    return ValueResidualFn.apply(v, None if first else carry, lam, glu_add, first, dt)
+    if not (isinstance(glu_add, torch.Tensor) and glu_add.dtype == torch.bfloat16
+            and tuple(glu_add.shape) == (T, B, dt) and glu_add.device == v.device and 0 < dt <= D):
+        raise RuntimeError("neuronspark.value_residual: glu_add must be bf16 (T, B, d) with 0 < d <= C")
+    if v.numel() >= 2 ** 31 or min(v.stride()) < 0:
+        raise RuntimeError("neuronspark.value_residual: tensor too large or negatively strided")
+    res = ValueResidualFn.apply(v, lam0.contiguous(), gate, carry, glu_add)
+    return res if first else (res, None)
 
 
-def value_residual_ref(v: torch.Tensor, lam: torch.Tensor, carry: Optional[torch.Tensor],
-                       glu_add: torch.Tensor) -> torch.Tensor:
+def value_residual_ref(v: torch.Tensor, lam0: torch.Tensor, gate: torch.Tensor, carry: Optional[torch.Tensor],
+                       glu_add: torch.Tensor):
     D = int(v.shape[-1])
     dt = int(glu_add.shape[-1])
+    s = F.silu(v)
+    lam = lam0.view(1, 1, -1) + torch.tanh(gate.to(torch.float32)).repeat_interleave(D // int(gate.shape[-1]), dim=-1)
     if carry is None:
-        vp = (v.float() * (1.0 + lam)).to(v.dtype)
+        vp = (s.float() * (1.0 + lam)).to(v.dtype)
     else:
-        vp = (v.float() + lam * carry.float()).to(v.dtype)
-    return torch.cat([vp[..., :D - dt], (vp[..., D - dt:].float() + glu_add).to(v.dtype)], dim=-1)
+        vp = (s.float() + lam * carry.float()).to(v.dtype)
+    out = torch.cat([vp[..., :D - dt], (vp[..., D - dt:].float() + glu_add.float()).to(v.dtype)], dim=-1)
+    return out, (s if carry is None else None)
 
 
 # ================================================================================================ centre_rows
@@ -484,91 +445,6 @@ def centre_rows(r: torch.Tensor) -> torch.Tensor:
 
 def centre_rows_ref(r: torch.Tensor) -> torch.Tensor:
     return r - r.mean(dim=-1, keepdim=True)
-
-
-# ================================================================================================ zc_center
-def _zc_fwd_alloc(z, zcum):
-    T, B, D = (int(v) for v in z.shape)
-    znm = torch.empty((T, 1, 1), dtype=torch.float32, device="meta")
-    o_st = ((_meta(z) - _meta(zcum) / znm) * znm).contiguous().stride()
-    return torch.empty_strided((T, B, D), o_st, dtype=torch.float32, device=z.device)
-
-
-@torch.library.custom_op("neuronspark::hippo_zc_fwd", mutates_args=(), schema="(Tensor z, Tensor zcum) -> Tensor")
-def _zc_fwd(z, zcum):
-    T, B, D = (int(v) for v in z.shape)
-    out = _zc_fwd_alloc(z, zcum)
-    S0, S1, N, st = _axes3(out.stride(), (T, B, D), [z.stride(), zcum.stride(), out.stride()])
-    order = sorted(range(3), key=lambda a: (out.stride()[a], -a))
-    _zc_fwd_kernel[_flat_grid(N)](z, zcum, out, N, S0, S1, 0, *st, TAX=order.index(0), BLOCK=FLAT_BLOCK,
-                                  num_warps=FLAT_WARPS, enable_fp_fusion=False)
-    return out
-
-
-@_zc_fwd.register_fake
-def _zc_fwd_fake(z, zcum):
-    return _zc_fwd_alloc(z, zcum)
-
-
-def _zc_bwd_alloc(g):
-    T, B, D = (int(v) for v in g.shape)
-    znm = torch.empty((T, 1, 1), dtype=torch.float32, device="meta")
-    gmm = _meta(g) * znm                              # MulBackward0: grad * mask (mask (T, 1, 1))
-    gc_st = ((-gmm) / znm).stride()                   # SubBackward0 other: -grad; DivBackward0: grad / zn
-    gz = torch.empty_strided((T, B, D), gmm.stride(), dtype=torch.float32, device=g.device)
-    gc = torch.empty_strided((T, B, D), gc_st, dtype=torch.float32, device=g.device)
-    return gz, gc
-
-
-@torch.library.custom_op("neuronspark::hippo_zc_bwd", mutates_args=(), schema="(Tensor g) -> (Tensor, Tensor)")
-def _zc_bwd(g):
-    T, B, D = (int(v) for v in g.shape)
-    gz, gc = _zc_bwd_alloc(g)
-    S0, S1, N, st = _axes3(g.stride(), (T, B, D), [g.stride(), gz.stride(), gc.stride()])
-    order = sorted(range(3), key=lambda a: (g.stride()[a], -a))
-    _zc_bwd_kernel[_flat_grid(N)](g, gz, gc, N, S0, S1, 0, *st, TAX=order.index(0), BLOCK=FLAT_BLOCK,
-                                  num_warps=FLAT_WARPS, enable_fp_fusion=False)
-    return gz, gc
-
-
-@_zc_bwd.register_fake
-def _zc_bwd_fake(g):
-    return _zc_bwd_alloc(g)
-
-
-class ZcCenterFn(torch.autograd.Function):
-    """((z - zcum / max(t, 1)) * (t > 0)).contiguous() for fp32 (T, B, C) z / zcum."""
-
-    @staticmethod
-    def forward(ctx, z, zcum):
-        ctx.set_materialize_grads(False)
-        return _zc_fwd(z, zcum)
-
-    @staticmethod
-    def backward(ctx, g):
-        if g is None:
-            return None, None
-        return _zc_bwd(g)
-
-
-def zc_center(z: torch.Tensor, zcum: torch.Tensor) -> torch.Tensor:
-    """``((z - zcum / arange(T).clamp_min(1)) * (arange(T) > 0)).contiguous()`` for fp32 (T, B, C) CUDA ``z`` and its
-    strictly-past running sum ``zcum`` -> contiguous fp32.  Training regime (grad-enabled steps; no-grad forwards of
-    the module use the same arithmetic in torch)."""
-    for n, t in (("z", z), ("zcum", zcum)):
-        require_cuda(t, "zc_center")
-        if not (t.dtype == torch.float32 and t.dim() == 3 and t.numel() < 2 ** 31):
-            raise RuntimeError(f"neuronspark.zc_center: {n} must be a 3-D fp32 CUDA tensor")
-    if z.shape != zcum.shape:
-        raise RuntimeError("neuronspark.zc_center: shapes differ")
-    return ZcCenterFn.apply(z, zcum)
-
-
-def zc_center_ref(z: torch.Tensor, zcum: torch.Tensor) -> torch.Tensor:
-    T = int(z.shape[0])
-    zn = torch.arange(T, device=z.device, dtype=torch.float32).clamp_min(1.0).view(T, 1, 1)
-    mask = (torch.arange(T, device=z.device) > 0).view(T, 1, 1).to(torch.float32)
-    return ((z - zcum / zn) * mask).contiguous()
 
 
 # ================================================================================================ read_gain_residual

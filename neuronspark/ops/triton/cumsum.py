@@ -4,7 +4,10 @@ Operators (registry names):
 
 * ``cumsum0(x)`` (training): the inclusive ``x.cumsum(dim=0)`` of an fp32 CUDA tensor (T, ...), with autograd's
   backward (the reverse scan of the incoming gradient).  Used for the pool clocks (narrow (T, B) scans) and the
-  value-residual gate's running sums (wide (T, B, C) scans).
+  PLIF input's running sums (wide (T, B, C) scans).
+* ``centred_past(x)`` (training): the strictly-past running-mean centring of a whole row,
+  ``c_t = bf16((x_t - S_t / max(t, 1)) * [t > 0])`` with ``S_t = sum_{s < t} x_s``, for an fp32 (T, B, C) tensor (the
+  operand of the value-residual gate's projection), forward and backward one kernel each.
 * ``exact_cumsum0(x)`` (prefill, no autograd): ``torch.cumsum(x, dim=0)`` of an fp32 (T, ...) tensor with more than one
   column, as ATen's outer-dim scan computes it.
 * ``centred_running(x, run_sum, count, out_dtype)`` (prefill, no autograd, T >= 2): the strictly-past running-mean
@@ -26,6 +29,11 @@ Numerics contract
   scan differs from call to call.)
 * ``exact_cumsum0``: the same IEEE fp32 operations as ``torch.cumsum`` in the same order (``add.rn``; the accumulator
   from +0).
+* ``centred_past``: the tokens in tiles of CPAST_TT; a tile's prefix sums by a parallel scan plus the carried sum of
+  the earlier tiles, the division by max(t, 1), the difference, the mask and one bf16 rounding (what the linear
+  operator's cast of the fp32 result gives).  Backward: ``dx_s = w_s - sum_{t > s} w_t / t`` with ``w_t = g_t [t > 0]``,
+  the tiles in descending order (a reverse scan per tile plus the carried sum of the later tiles), fp32.  The order
+  of the fp32 additions differs from the torch chain (cumulative sum, shift, division): the per-operator rule class.
 * ``centred_running``: the tokens in tiles; a tile's prefix sums by a parallel scan plus the carried sum of the earlier
   tiles (the order of the fp32 additions differs from the sequential chain: the per-operator rule class), then the
   chain's per-element ``div.rn`` by max(n + t, 1), the difference and the mask, the output cast fused (round to nearest
@@ -51,14 +59,15 @@ from neuronspark.ops.triton._ptx import (  # noqa: F401  (jit helpers resolved t
     _rn_sub_f32,
 )
 
-__all__ = ["Cumsum0Fn", "cumsum0", "cumsum0_ref", "exact_cumsum0", "exact_cumsum0_ref", "centred_running",
-           "centred_running_ref"]
+__all__ = ["Cumsum0Fn", "cumsum0", "cumsum0_ref", "CentredPastFn", "centred_past", "centred_past_ref",
+           "exact_cumsum0", "exact_cumsum0_ref", "centred_running", "centred_running_ref"]
 
 # ------------------------------------------------------------------------------------------------ fixed constants
 # Training: narrow widths take the sequential kernel, wide widths the chunked kernel.
 NARROW_N = 32                          # widths up to 32 columns are "narrow"
 SEQ_BLOCK_N, SEQ_WARPS = 32, 1         # sequential kernel for the narrow scans (one warp, 32 columns per program)
 CHUNK_CH, CHUNK_BLOCK_N, CHUNK_WARPS, CHUNK_STAGES = 32, 32, 8, 4   # chunked kernel for the wide scans
+CPAST_TT, CPAST_BC, CPAST_WARPS = 128, 32, 4   # centred_past: tokens per tile, columns per program, warps
 # Prefill exact cumsum: one warp per program, one column per lane.
 PREFILL_BLOCK = 32
 # centred_running (TT tokens, BC columns, warps) by the call's width N = B * C: narrow (one prefill row) long tiles over few
@@ -607,6 +616,49 @@ def _cumsum0_chunk_kernel(X, Y, T, N, C, SXB, SXT, SYT, TC, REVERSE: tl.constexp
         tl.store(Y + t.to(tl.int64)[:, None] * SYT + cols[None, :], acc, mask=m)
 
 
+@triton.jit
+def _centred_past_fwd_kernel(X, OUT, T, N, C, sxt, sxb, sxc, TT: tl.constexpr, BC: tl.constexpr):
+    """centred_past: BC columns (j = b C + c of N = B C) per program, the T tokens in tiles of TT in ascending order;
+    X fp32 (T, B, C) of strides (sxt, sxb, sxc), OUT bf16 (T, N) contiguous."""
+    cols = tl.program_id(0) * BC + tl.arange(0, BC)
+    cm = cols < N
+    bb = cols // C
+    xcol = bb.to(tl.int64) * sxb + (cols - bb * C).to(tl.int64) * sxc
+    carry = tl.zeros([BC], dtype=tl.float32)
+    rows = tl.arange(0, TT)
+    for t0 in range(0, T, TT):
+        t = t0 + rows
+        m = (t < T)[:, None] & cm[None, :]
+        t64 = t.to(tl.int64)[:, None]
+        x = tl.load(X + t64 * sxt + xcol[None, :], mask=m, other=0.0)
+        run = carry[None, :] + (tl.cumsum(x, axis=0) - x)                # the sum before token t
+        o = x - run / tl.maximum(t.to(tl.float32), 1.0)[:, None]
+        o = tl.where((t > 0)[:, None], o, 0.0)
+        tl.store(OUT + t64 * N + cols[None, :], o.to(tl.bfloat16), mask=m)
+        carry = carry + tl.sum(x, axis=0)
+
+
+@triton.jit
+def _centred_past_bwd_kernel(G, OUT, T, N, TT: tl.constexpr, BC: tl.constexpr):
+    """centred_past backward: out[s] = w[s] - sum_{t > s} w[t] / t, w[t] = g[t] [t > 0]; BC columns per program, the
+    tiles of TT tokens in descending order; G bf16 (T, N) contiguous, OUT fp32 (T, N) contiguous."""
+    cols = tl.program_id(0) * BC + tl.arange(0, BC)
+    cm = cols < N
+    carry = tl.zeros([BC], dtype=tl.float32)
+    rows = tl.arange(0, TT)
+    nt = tl.cdiv(T, TT)
+    for i in range(0, nt):
+        t = (nt - 1 - i) * TT + rows
+        m = (t < T)[:, None] & cm[None, :]
+        off = t.to(tl.int64)[:, None] * N + cols[None, :]
+        w = tl.load(G + off, mask=m, other=0.0).to(tl.float32)
+        w = tl.where((t > 0)[:, None], w, 0.0)
+        u = w / tl.maximum(t.to(tl.float32), 1.0)[:, None]
+        later = carry[None, :] + (tl.cumsum(u, axis=0, reverse=True) - u)   # the sum over the later tokens
+        tl.store(OUT + off, w - later, mask=m)
+        carry = carry + tl.sum(u, axis=0)
+
+
 # ================================================================================================ prefill kernels
 # (_rn_* are the IEEE fp32 round-to-nearest helpers of neuronspark.ops.triton._ptx)
 
@@ -801,6 +853,57 @@ def cumsum0_ref(x: torch.Tensor) -> torch.Tensor:
 
 
 # ================================================================================================ prefill launchers
+# ================================================================================================ centred_past
+def _centred_past_check(x: torch.Tensor, dtype: torch.dtype, what: str):
+    require_cuda(x, what)
+    if x.dtype != dtype or x.dim() != 3 or x.numel() == 0 or min(x.stride()) < 0:
+        raise RuntimeError(f"neuronspark.{what}: a {dtype} (T, B, C) CUDA tensor is required, got {x.dtype} "
+                           f"{tuple(x.shape)}")
+    T, B, C = (int(v) for v in x.shape)
+    if (T + CPAST_TT) * B * C >= 2 ** 31:
+        raise RuntimeError(f"neuronspark.{what}: tensor too large")
+    return T, B, C
+
+
+class CentredPastFn(torch.autograd.Function):
+    """The strictly-past running-mean centring of a whole row, rounded to bf16 (see the module docstring)."""
+
+    @staticmethod
+    def forward(ctx, x):
+        T, B, C = (int(v) for v in x.shape)
+        out = torch.empty((T, B, C), dtype=torch.bfloat16, device=x.device)
+        _centred_past_fwd_kernel[(triton.cdiv(B * C, CPAST_BC),)](
+            x, out, T, B * C, C, int(x.stride(0)), int(x.stride(1)), int(x.stride(2)), TT=CPAST_TT, BC=CPAST_BC,
+            num_warps=CPAST_WARPS)
+        return out
+
+    @staticmethod
+    def backward(ctx, g):
+        g = g.contiguous()
+        T, B, C = _centred_past_check(g, torch.bfloat16, "centred_past backward")
+        out = torch.empty((T, B, C), dtype=torch.float32, device=g.device)
+        _centred_past_bwd_kernel[(triton.cdiv(B * C, CPAST_BC),)](g, out, T, B * C, TT=CPAST_TT, BC=CPAST_BC,
+                                                                 num_warps=CPAST_WARPS)
+        return out
+
+
+def centred_past(x: torch.Tensor) -> torch.Tensor:
+    """``bf16((x_t - S_t / max(t, 1)) * [t > 0])`` with ``S_t`` the sum of the earlier tokens, for a CUDA fp32
+    (T, B, C) ``x`` of any non-negative strides -> contiguous bf16 (T, B, C).  Training regime."""
+    _centred_past_check(x, torch.float32, "centred_past")
+    return CentredPastFn.apply(x)
+
+
+def centred_past_ref(x: torch.Tensor) -> torch.Tensor:
+    """The torch chain: the cumulative sum shifted by one token, the division, the difference, the mask, the cast."""
+    T = int(x.shape[0])
+    xf = x.float()
+    xcum = torch.cat([torch.zeros_like(xf[:1]), xf.cumsum(dim=0)[:-1]], dim=0)
+    n = torch.arange(T, device=x.device, dtype=torch.float32).clamp_min(1.0).view(T, 1, 1)
+    mask = (torch.arange(T, device=x.device) > 0).view(T, 1, 1).to(torch.float32)
+    return ((xf - xcum / n) * mask).to(torch.bfloat16)
+
+
 def _prefill_grid(n: int):
     return (triton.cdiv(int(n), PREFILL_BLOCK),)
 

@@ -123,13 +123,10 @@ _SPECS: List[OpSpec] = [
         "(T, B, C) bf16", "prefill",
         doc="x (T, B, C) bf16, cos / sin broadcastable bf16"),
     # ---------------------------------------------------------------------------------------------- memory residual glue
-    _op("value_residual", _T + "hippo_residual", "v lam carry glu_add",
-        "v' (T, B, 1536) bf16", "train",
-        doc="v (T, B, 1536) bf16, lam fp32 mix, carry (T, B, 1536) bf16 or None (hippocampal layer 0), glu_add (T, B, "
-            "256) fp32"),
-    _op("zc_center", _T + "hippo_residual", "z zcum",
-        "(T, B, C) fp32 contiguous", "train",
-        doc="z (T, B, C) fp32, zcum (T, B, C) fp32 running sum"),
+    _op("value_residual", _T + "hippo_residual", "v lam0 gate carry glu_add",
+        "(v' (T, B, 1536) bf16, silu(v) (T, B, 1536) bf16 for hippocampal layer 0, else None)", "train",
+        doc="v (T, B, 1536) bf16 before its SiLU, lam0 (1536,) fp32 static mix, gate (T, B, 6) bf16 gate logits, "
+            "carry (T, B, 1536) bf16 or None (hippocampal layer 0), glu_add (T, B, 256) bf16"),
     _op("centre_rows", _T + "hippo_residual", "r",
         "(T, B, D) bf16 = r - mean_c(r)", "train",
         doc="r (T, B, D) bf16 output projection of the attention sub-block"),
@@ -143,6 +140,9 @@ _SPECS: List[OpSpec] = [
     _op("cumsum0", _T + "cumsum", "x",
         "inclusive cumsum over dim 0, fp32", "train",
         doc="x (T, ...) fp32; the narrow / wide dispatch is internal and fixed"),
+    _op("centred_past", _T + "cumsum", "x",
+        "(T, B, C) bf16 contiguous: x minus the mean of the earlier tokens", "train",
+        doc="x (T, B, C) fp32"),
     _op("exact_cumsum0", _T + "cumsum", "x",
         "(T, N) fp32", "prefill",
         doc="x (T, N) fp32: sequential RN additions"),

@@ -42,7 +42,7 @@ Regime differences kept explicitly in the code paths (each regime has its own nu
   in-kernel from the matches), decode by the torch ring write, ``ops.xq_form_t1`` (the extra queries) and
   ``ops.ring_read_t1`` (every head's read and the extra queries' reads) at every decode batch size;
 * the pool clock: ``ops.cumsum0`` (whole row), ``ops.exact_cumsum0`` over the carried clock (prefill), one add
-  (decode); the value-residual running mean: ``ops.cumsum0`` + ``ops.zc_center`` (whole row),
+  (decode); the value-residual running mean: ``ops.centred_past`` (whole row),
   ``ops.centred_running`` (prefill), ``ops.centred_step`` over the carried sum (decode);
 * short conv: ``ops.short_conv_train`` / ``ops.short_conv_silu_prefill`` (T >= 3, the SiLU in the store; a 2-token call takes the depthwise
   ``F.conv1d`` over the carried history) / ``ops.short_conv_step``;
@@ -473,23 +473,16 @@ class PoolAttentionMixin:
         qkv = lin(zc.view(T * B, D), self.qkv_proj.weight).view(T, B, -1)
         qkv = o.short_conv_train(qkv, self.qkv_conv.weight)
         q, k, v = qkv.split([self.D_key, self.D_key, self.D_value], dim=-1)
-        v = F.silu(v)
-        # value residual: lambda with the per-token gate over the strictly-past running mean of z
-        lam = self.value_residual_lambda0()
-        zf = z.float()
-        zcum = torch.cat([torch.zeros_like(zf[:1]), o.cumsum0(zf)[:-1]], dim=0)
-        g_vr = torch.tanh(lin(o.zc_center(zf, zcum), self.pool_vr_gate).to(torch.float32))
-        lam = lam.view(1, 1, -1) + g_vr.repeat_interleave(dv, dim=-1)
-        if self.value_residual_first:
-            carry_out = v
-            carry_in = None
-        else:
+        # value residual: the static mix plus the per-token, per-head gate (tanh of the projection of z minus the mean
+        # of the earlier tokens), on the values' SiLU; with the GLU addend of the last head (one operator)
+        if not self.value_residual_first:
             self._check_carry(carry, v)
-            carry_out = carry_in = carry
-        # GLU addend of the last head, applied with the value residual
+        vr_gate = lin(o.centred_past(z.float()), self.pool_vr_gate)
         gp = F.silu(lin(zc, self.pool_glu_a).float()) * lin(zc, self.pool_glu_b).float()
-        gv_add = lin(gp.to(z.dtype).contiguous(), self.pool_glu_u).float()
-        v = o.value_residual(v, lam, carry_in, gv_add)
+        gv_add = lin(gp.to(z.dtype).contiguous(), self.pool_glu_u)
+        v, v_act = o.value_residual(v, self.value_residual_lambda0(), vr_gate,
+                                    None if self.value_residual_first else carry, gv_add)
+        carry_out = v_act if self.value_residual_first else carry
         # q / k SiLU + RoPE at positions 0 .. T - 1
         cos = self.rope_cos_bf16[:T]
         sin = self.rope_sin_bf16[:T]

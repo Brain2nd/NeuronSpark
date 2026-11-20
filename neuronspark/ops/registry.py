@@ -156,9 +156,6 @@ _SPECS: List[OpSpec] = [
     _op("short_conv_silu_prefill", _T + "short_conv", "x hist weight",
         "(T, B, 4608) bf16 silu(conv(x))", "prefill", mutates="hist",
         doc="x (T, B, 4608) bf16 with T >= 3, hist (B, 4608, 3) fp32, weight (4608, 1, 4) fp32"),
-    _op("short_conv_step", _T + "short_conv", "x hist weight",
-        "(B, 4608) bf16", "decode", mutates="hist",
-        doc="x (B, 4608) bf16, hist (B, 4608, 3) fp32, weight (4608, 1, 4) fp32"),
     # ---------------------------------------------------------------------------------------------- pool attention (train)
     _op("pool_attend", "neuronspark.ops.pool_attend",
         "q k gate v gain wbias sparsity xq psi cos sin cum beta qtok ktok orders scale",
@@ -345,6 +342,15 @@ _DECODE_STEP_SPECS: List[OpSpec] = [
     _op("centred_step", _T + "plif_step", "x run_sum count out_dtype",
         "(B, C) in out_dtype", "decode", mutates="run_sum",
         doc="x (B, C), run_sum (B, C) fp32 carried sum, count (B,) int64 tokens before this one"),
+    _op("ring_write_step", _T + "ring_step",
+        "qkv conv_hist conv_weight cos sin pos ring_ptr gate gl lam0 carry ga gb glu_u dlog rate base_decay gains "
+        "qgain wbias sparsity pool_k pool_gv pool_cum pool_run",
+        "(q (B, 6, 256) bf16 gained unit queries, v (B, 1536) bf16 values after the SiLU)", "decode",
+        mutates="conv_hist pool_k pool_gv pool_cum pool_run",
+        doc="qkv (B, 4608) bf16 projection, conv_hist (B, 4608, 3) fp32, conv_weight (4608, 1, 4), cos / sin (8192, 768) "
+            "bf16 tables, pos (B,) int64, ring_ptr (1,) int64, gate (B, 1536) fp32 spikes, gl (B, 6) bf16, lam0 (1536,), "
+            "carry (B, 1536) bf16 or None, ga / gb (B, 128) bf16, glu_u (256, 128), dlog (B, 256) bf16, rate (256,) "
+            "bf16, base_decay, gains / qgain / wbias (6,), sparsity, the rings and the carried clocks"),
 ]
 for _decode_spec in _DECODE_STEP_SPECS:
     if _decode_spec.name in OPS:

@@ -39,13 +39,15 @@ Regime differences kept explicitly in the code paths (each regime has its own nu
   materialised);
   prefill and decode write each call's events into per-head rings (unit keys, tagged values, absolute clocks; capacity
   W) and read the rings: prefill by ``ops.ring_write_prefill`` + ``ops.ring_recall_prefill`` (the induction term formed
-  in-kernel from the matches), decode by the torch ring write, ``ops.xq_form_t1`` (the extra queries) and
-  ``ops.ring_read_t1`` (every head's read and the extra queries' reads) at every decode batch size;
+  in-kernel from the matches), decode by ``ops.ring_write_step`` (the conv step, SiLU, RoPE, the unit keys and gained
+  unit queries, the value-residual mix and GLU tail, the tagged values and the clocks in one kernel after the step's
+  projections), ``ops.xq_form_t1`` (the extra queries) and ``ops.ring_read_t1`` (every head's read and the extra
+  queries' reads) at every decode batch size;
 * the pool clock: ``ops.clock_increments`` + ``ops.cumsum0`` (whole row), ``ops.exact_cumsum0`` over the carried
   clock (prefill), one add (decode); the value-residual running mean: ``ops.centred_past`` (whole row),
   ``ops.centred_running`` (prefill), ``ops.centred_step`` over the carried sum (decode);
 * short conv: ``ops.short_conv_train`` / ``ops.short_conv_silu_prefill`` (T >= 3, the SiLU in the store; a 2-token call takes the depthwise
-  ``F.conv1d`` over the carried history) / ``ops.short_conv_step``;
+  ``F.conv1d`` over the carried history) / inside ``ops.ring_write_step`` (decode);
 * prefill only: the value-residual gate's centred input is written in bf16 (the operand dtype of its projection),
   ``lam``, the value residual and the GLU tail are one kernel, ``ops.vr_mix_prefill`` (``lam`` is not materialised),
   and the extra queries after their projections by ``ops.xq_queries_prefill`` (SiLU, RoPE,
@@ -72,7 +74,7 @@ import torch.nn.functional as F
 from neuronspark.modules.linear import Linear, ShortConvWeight
 from neuronspark.modules.norms import RMSNorm
 from neuronspark.modules.plif import PLIFNeuron, forked_rng, linear_init
-from neuronspark.modules.rope import apply_rope_interleaved_ref, rope_head_band_tables
+from neuronspark.modules.rope import rope_head_band_tables
 from neuronspark.utils.cache import HippocampalState, WeightConstants
 
 __all__ = [
@@ -372,7 +374,7 @@ class PoolAttentionMixin:
 
     def _memory_decay(self, logit: torch.Tensor, rate: Optional[torch.Tensor] = None) -> torch.Tensor:
         """(T, B, 256, 1) fp32 decay a = exp(-bf16(exp(A_log)) softplus(f32(logit))) * hippocampal_base_decay from the
-        bf16 decay logit (T, B, 256); ``rate`` = bf16(exp(A_log)) when the caller holds it (the decode step)."""
+        bf16 decay logit (T, B, 256); ``rate`` = bf16(exp(A_log)) when the caller holds it (the prefill)."""
         if rate is None:
             rate = torch.exp(self.decay_A_log).to(logit.dtype)
         a = torch.exp(-rate * F.softplus(logit.float()))
@@ -381,7 +383,7 @@ class PoolAttentionMixin:
 
     def _clock_increments(self, a: torch.Tensor, T: int, B: int, gains: Optional[torch.Tensor] = None) -> torch.Tensor:
         """(T, B, H) fp32 gained clock increments of every head (inference): the shared mean log decay times gamma_h
-        (``gains`` = :meth:`pool_bias_gains` when the caller holds it: the decode step)."""
+        (``gains`` = :meth:`pool_bias_gains` when the caller holds it: the prefill)."""
         H = self.hippocampal_heads
         _a = a.reshape(T, B, -1).float().clamp_min(DECAY_FLOOR)
         la = _a.log().mean(dim=-1, keepdim=True).expand(T, B, H)
@@ -393,13 +395,6 @@ class PoolAttentionMixin:
         if self.write_sparsity > 0.0:
             g_raw = g_raw - self.write_sparsity
         return torch.sigmoid(g_raw).to(v.dtype) * v
-
-    def _value_residual_torch(self, v: torch.Tensor, lam: torch.Tensor, carry: Optional[torch.Tensor]):
-        """(v', carry_out) of an inference call (torch expressions)."""
-        if self.value_residual_first:
-            return (v.float() * (1.0 + lam)).to(v.dtype), v
-        self._check_carry(carry, v)
-        return (v.float() + lam * carry.float()).to(v.dtype), carry
 
     @staticmethod
     def _check_carry(carry: Optional[torch.Tensor], v: torch.Tensor) -> None:
@@ -413,12 +408,6 @@ class PoolAttentionMixin:
         lin = self._ops.linear
         gp = F.silu(lin(z, self.pool_glu_a).float()) * lin(z, self.pool_glu_b).float()
         return lin(gp.to(z.dtype), self.pool_glu_u).float()
-
-    def _glu_tail_torch(self, v: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        """v with the GLU addend added to the last head's value channels (inference, torch)."""
-        gv = self._glu_addend(z)
-        dvh = self.hippocampal_value_head_dim
-        return torch.cat([v[..., :self.D_value - dvh], (v[..., self.D_value - dvh:].float() + gv).to(v.dtype)], dim=-1)
 
     def _xq_band(self, t: torch.Tensor) -> torch.Tensor:
         """The last head's column band of a (..., D_key / 2) RoPE table."""
@@ -626,47 +615,41 @@ class PoolAttentionMixin:
         T, B, D = (int(s) for s in h.shape)
         H, dk, dv, M = self.hippocampal_heads, self.hippocampal_head_dim, self.hippocampal_value_head_dim, self.xq_count
         matches = self._check_ind(ind, (B, 1, W))
+        if dk != dv or D != H * dk:
+            raise RuntimeError(f"hippocampal layer: the decode step writes key and value heads of one width over the "
+                               f"model width (D {D}, heads {H}, key head {dk}, value head {dv})")
+        if self.value_residual_first:
+            carry_in = None
+        else:
+            if carry is None or tuple(carry.shape) != (1, B, self.D_value) or carry.dtype != torch.bfloat16:
+                raise RuntimeError("hippocampal layer: the value residual needs the first hippocampal layer's value "
+                                   f"stream of this call as the carry (bf16 (1, {B}, {self.D_value})), got "
+                                   f"{None if carry is None else (tuple(carry.shape), carry.dtype)}")
+            carry_in = carry[0]
         lam0, qgain, xq_gain, wbias, gains, rate, beta, xq_wb = self._step_constants()
-        qkv = lin(z, self.qkv_proj.weight)
-        qkv = o.short_conv_step(qkv[0], st.conv_hist, self.qkv_conv.weight).unsqueeze(0)
-        q, k, v = qkv.split([self.D_key, self.D_key, self.D_value], dim=-1)
-        q, k, v = F.silu(q), F.silu(k), F.silu(v)
-        zc = o.centred_step(z[0], st.vr_sum, pos0, torch.bfloat16).unsqueeze(0)   # bf16: the gate projection's operand
-        g_vr = torch.tanh(lin(zc, self.pool_vr_gate).to(torch.float32))
-        lam = lam0.view(1, 1, -1) + g_vr.repeat_interleave(dv, dim=-1)
-        v, carry_out = self._value_residual_torch(v, lam, carry)
-        v = self._glu_tail_torch(v, z)
-        positions = pos0.view(1, B)
-        cos = self.rope_cos[positions].to(q.dtype)
-        sin = self.rope_sin[positions].to(q.dtype)
-        q = apply_rope_interleaved_ref(q, cos, sin)
-        k = apply_rope_interleaved_ref(k, cos, sin)
-        gate = self.gate_neuron(z, st.gate_neuron, pos0)
-        a = self._memory_decay(lin(z.float(), self.W_decay.weight), rate)
+        zb = z[0].to(torch.bfloat16)                                   # (B, D): the operand of the projections of z
+        gl = lin(o.centred_step(z[0], st.vr_sum, pos0, torch.bfloat16), self.pool_vr_gate)   # (B, H) bf16
+        gate = self.gate_neuron(z, st.gate_neuron, pos0)                                      # (1, B, D) fp32 spikes
+        # the ring write: conv step, SiLU, RoPE, unit keys and gained unit queries, value-residual mix and GLU tail,
+        # tagged values, clocks -- one kernel after the projections
+        q_h, v = o.ring_write_step(lin(zb, self.qkv_proj.weight), st.conv_hist, self.qkv_conv.weight,
+                                   self.rope_cos_bf16, self.rope_sin_bf16, pos0, ptr0, gate[0], gl, lam0, carry_in,
+                                   lin(zb, self.pool_glu_a), lin(zb, self.pool_glu_b), self.pool_glu_u,
+                                   lin(zb, self.W_decay.weight), rate, self.hippocampal_base_decay, gains, qgain,
+                                   wbias, self.write_sparsity, st.pool_k, st.pool_gv, st.pool_cum, st.pool_run)
+        carry_out = v.unsqueeze(0) if self.value_residual_first else carry
         # the last head's extra queries: the low-rank map and the gain projection, then one kernel (the M projections,
         # SiLU, RoPE on the head's band, normalisation, gain; bf16, the rounding the ring read applies)
-        xq = o.xq_form_t1(lin(z, self.pool_xq_a)[0], xq_wb, self._xq_band(cos)[0], self._xq_band(sin)[0],
-                          lin(z, self.pool_xq_gain_proj)[0], xq_gain)                   # (B, M, dk) bf16
-        # ring write (torch): unit keys, gained unit queries (fp32 gain), tagged values, absolute clocks
-        k_hat = F.normalize(k.reshape(T, B, H, dk), dim=-1)
-        q_h = F.normalize(q.reshape(T, B, H, dk), dim=-1)
-        q_h = q_h * qgain.to(q_h.dtype).view(1, 1, H, 1)
-        g_h = gate.reshape(T, B, H, dk).float() + wbias.view(1, 1, H, 1)
-        gv = self._tagged_values(g_h, v.reshape(T, B, H, dv))
-        cum_abs = st.pool_run.unsqueeze(0) + self._clock_increments(a, T, B, gains).cumsum(dim=0)
-        slots = (ptr0 + torch.arange(T, device=h.device, dtype=torch.int64)) % W
-        st.pool_k.index_copy_(2, slots, k_hat.permute(1, 2, 0, 3).to(st.pool_k.dtype))
-        st.pool_gv.index_copy_(2, slots, gv.permute(1, 2, 0, 3).to(st.pool_gv.dtype))
-        st.pool_cum.index_copy_(2, slots, cum_abs.permute(1, 2, 0).contiguous())
+        xq = o.xq_form_t1(lin(zb, self.pool_xq_a), xq_wb, self._xq_band(self.rope_cos_bf16)[pos0],
+                          self._xq_band(self.rope_sin_bf16)[pos0], lin(zb, self.pool_xq_gain_proj), xq_gain)
         # the ring kernel: every head's read and the extra queries' reads over the live slots (pos0 = tokens before
-        # this step; ptr0 = this step's slot)
-        red = o.ring_read_t1(q_h[0], xq, cum_abs[0], st.pool_k, st.pool_gv, st.pool_cum, pos0, ptr0, matches, beta,
+        # this step; ptr0 = this step's slot; the step's clocks are the carried clocks just advanced)
+        red = o.ring_read_t1(q_h, xq, st.pool_run, st.pool_k, st.pool_gv, st.pool_cum, pos0, ptr0, matches, beta,
                              self.match_scale)
         red = red.reshape(B, -1)
         base = red[:, :H * dv].reshape(1, B, H * dv).to(h.dtype)
         r_x = red[:, H * dv:].reshape(T, B, M * dv)                              # bf16: the projection's operand
         xq_add = lin(lin(r_x, self.pool_xq_out_in), self.pool_xq_out)
-        st.pool_run.copy_(cum_abs[-1])
         last = (H - 1) * dv
         attn = torch.cat([base[..., :last], base[..., last:] + xq_add], dim=-1)
         return self._out_proj_centred(self._out_norm_gate_infer(attn, h)), carry_out

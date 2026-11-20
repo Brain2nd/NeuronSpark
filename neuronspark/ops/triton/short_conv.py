@@ -10,8 +10,9 @@ Operators (registry names):
 * ``short_conv_silu_prefill(x, hist, weight)`` (prefill, T >= 3, no autograd): the same chain with the carried three taps
   ``hist`` (B, C, 3) (oldest first) standing for ``x[t < 0]``; ``hist`` is rolled in place to the call's last three
   inputs.  Returns (T, B, C) bf16 contiguous.
-* ``short_conv_step(x, hist, weight)`` (decode, T == 1, no autograd): ``y = w0 h0 + w1 h1 + w2 h2 + w3 x`` as the fma
-  chain, ``hist`` rolled in place to ``(h1, h2, x)``; ``x`` (B, C) bf16 with unit row stride -> (B, C) bf16.
+* decode (T == 1): the conv step ``y = w0 h0 + w1 h1 + w2 h2 + w3 x`` (the fma chain, ``hist`` rolled in place to
+  ``(h1, h2, x)``) is part of :func:`neuronspark.ops.triton.ring_step.ring_write_step`; ``short_conv_step_ref`` is its
+  torch form (a piece of that operator's reference).
 
 Numerics contract
 -----------------
@@ -42,7 +43,7 @@ from neuronspark.ops.triton._ptx import (  # noqa: F401  (jit helpers resolved t
 )
 
 __all__ = ["ShortConvFn", "short_conv_train", "short_conv_train_ref", "short_conv_silu_prefill", "short_conv_silu_prefill_ref",
-           "short_conv_step", "short_conv_step_ref"]
+           "short_conv_step_ref"]
 
 K = 4
 # ------------------------------------------------------------------------------------------------ fixed constants
@@ -51,7 +52,6 @@ TRAIN_BWD_CFG = (64, 64, 2)      # training backward (input gradient + weight-gr
 WFIN_CFG = (16, 128, 4)          # weight-gradient finish (PB partial rows per step, BJ (c, k) entries, warps)
 TILE_ROWS = max(TRAIN_FWD_CFG[0], TRAIN_BWD_CFG[0]) + 3            # the rows a training tile addresses (3 of halo)
 PREFILL_BT, PREFILL_BC, PREFILL_WARPS = 32, 256, 4
-STEP_BLOCK, STEP_WARPS = 1024, 4
 
 
 # ================================================================================================ training kernels
@@ -155,35 +155,6 @@ def _bf16(x):
     u = u + 0x7FFF + lsb
     u = u & -65536                     # 0xFFFF0000 as a signed int32
     return u.to(tl.float32, bitcast=True)
-
-
-@triton.jit
-def _conv_step_kernel(X, HIST, WT, OUT, s_x_b, s_h_b, s_h_c, s_out_b, C, BLOCK: tl.constexpr):
-    """one row b, BLOCK channels: y = w0 h0 + w1 h1 + w2 h2 + w3 x as the fp32 FMA chain of PyTorch's depthwise conv on
-    bf16 operands (the staged history and the weight in bf16), y rounded to bf16; the history rolled: (h1, h2, x)"""
-    b = tl.program_id(0)
-    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    m = c < C
-    x16 = tl.load(X + b * s_x_b + c, mask=m, other=0.0)                       # bf16
-    hp = HIST + b * s_h_b + c * s_h_c
-    h0 = _bf16(tl.load(hp, mask=m, other=0.0).to(tl.float32))                # the staging copy's bf16 rounding
-    h1 = _bf16(tl.load(hp + 1, mask=m, other=0.0).to(tl.float32))
-    h2 = _bf16(tl.load(hp + 2, mask=m, other=0.0).to(tl.float32))
-    x = x16.to(tl.float32)
-    w0 = _bf16(tl.load(WT + c * 4 + 0, mask=m, other=0.0).to(tl.float32))     # autocast's bf16 weight
-    w1 = _bf16(tl.load(WT + c * 4 + 1, mask=m, other=0.0).to(tl.float32))
-    w2 = _bf16(tl.load(WT + c * 4 + 2, mask=m, other=0.0).to(tl.float32))
-    w3 = _bf16(tl.load(WT + c * 4 + 3, mask=m, other=0.0).to(tl.float32))
-    acc = tl.zeros_like(x)
-    acc = tl.math.fma(w0, h0, acc)
-    acc = tl.math.fma(w1, h1, acc)
-    acc = tl.math.fma(w2, h2, acc)
-    acc = tl.math.fma(w3, x, acc)
-    tl.store(OUT + b * s_out_b + c, acc.to(tl.bfloat16), mask=m)
-    hdt = HIST.dtype.element_ty
-    tl.store(hp, h1.to(hdt), mask=m)
-    tl.store(hp + 1, h2.to(hdt), mask=m)
-    tl.store(hp + 2, x.to(hdt), mask=m)
 
 
 @triton.jit
@@ -410,37 +381,9 @@ def short_conv_silu_prefill_ref(x: torch.Tensor, hist: torch.Tensor, weight: tor
     return F.silu(out.permute(2, 0, 1))
 
 
-@torch.library.custom_op("neuronspark::short_conv_step", mutates_args=("hist",),
-                         schema="(Tensor x, Tensor(a!) hist, Tensor weight) -> Tensor")
-def _sc_step(x, hist, weight):
-    B, C = int(x.shape[0]), int(x.shape[1])
-    out = torch.empty((B, C), dtype=torch.bfloat16, device=x.device)
-    _conv_step_kernel[(B, triton.cdiv(C, STEP_BLOCK))](x, hist, weight, out, x.stride(0), hist.stride(0),
-                                                       hist.stride(1), out.stride(0), C, BLOCK=STEP_BLOCK,
-                                                       num_warps=STEP_WARPS)
-    return out
-
-
-@_sc_step.register_fake
-def _sc_step_fake(x, hist, weight):
-    return torch.empty((x.shape[0], x.shape[1]), dtype=torch.bfloat16, device=x.device)
-
-
-def short_conv_step(x: torch.Tensor, hist: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """The causal conv of a decode step: ``x`` (B, C) bf16 with unit row stride (the step's projection), ``hist``
-    (B, C, 3) the carried taps (rolled in place to (h1, h2, x)), ``weight`` fp32 (C, 1, 4) -> (B, C) bf16
-    contiguous.  No autograd."""
-    require_cuda(x, "short_conv_step")
-    if x.dim() != 2 or x.dtype != torch.bfloat16 or x.stride(1) != 1:
-        raise RuntimeError("neuronspark.short_conv_step: x must be (B, C) bf16 with unit row stride")
-    B, C = int(x.shape[0]), int(x.shape[1])
-    _check_hist(hist, B, C, "short_conv_step")
-    _check_weight(weight, C, "short_conv_step")
-    return _sc_step(x, hist, weight)
-
-
 def short_conv_step_ref(x: torch.Tensor, hist: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """The torch path's expressions (the staging copies, F.conv1d on bf16 operands, the roll in place)."""
+    """The conv of a decode step in torch: ``x`` (B, C) bf16, ``hist`` (B, C, 3) the carried taps (rolled in place to
+    (h1, h2, x)), ``weight`` fp32 (C, 1, 4) -> (B, C) bf16 (the staging copies, F.conv1d on bf16 operands)."""
     C = x.shape[1]
     full = torch.cat([hist.to(torch.bfloat16), x.unsqueeze(-1)], dim=2)          # (B, C, 4) bf16
     out = F.conv1d(full, weight.to(torch.bfloat16), groups=C)                    # (B, C, 1) bf16

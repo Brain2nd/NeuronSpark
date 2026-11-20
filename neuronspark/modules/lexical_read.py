@@ -13,9 +13,10 @@ read is per token, so both regimes run the same arithmetic per position).
 
 Ops per regime: whole row -- ``ops.row_rmsnorm_tee`` for hn (bf16) and the lex_q projection on hn's rows, then
 ``ops.lex_read_train`` for the 64-wide ZCN norms, alpha and the residual (one forward and one backward kernel,
-:mod:`neuronspark.ops.triton.lex_read_train`); prefill and decode (T >= 1) -- ``ops.rmsnorm_rows`` for hn, then
+:mod:`neuronspark.ops.triton.lex_read_train`); prefill (T >= 2) -- ``ops.rmsnorm_rows`` for hn, then
 ``ops.lex_read_prefill`` for the ZCN norms, alpha and the residual after the three projections (one kernel per call,
-:mod:`neuronspark.ops.triton.lex_read`).
+:mod:`neuronspark.ops.triton.lex_read`); decode (T == 1) -- ``ops.lex_read_step`` after the projections: the read
+and the frozen norm of its result in one kernel.
 
 Parameters (keys, flat on the layer): ``lex_q.weight`` (64, 1536), ``lex_k.weight`` (64, 160), ``lex_o.weight``
 (1536, 160), ``lex_q_gain`` / ``lex_k_gain`` (64,) = 0, ``lex_beta`` (1,) = ``lexical_memory_gate_bias`` (-2.0).

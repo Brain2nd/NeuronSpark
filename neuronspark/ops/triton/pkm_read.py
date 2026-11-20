@@ -5,9 +5,9 @@ value table V (S = 128^2 = 16384 rows x D = 768, fp32).  No (T, B, M, D) gathere
 
 Operators (regime: public function -> what runs):
 
-* train   :func:`pkm_value_read` -> :class:`PKMReadFn`.  Forward (custom op ``neuronspark::pkm_read_fwd``): exact
-  fp32, ``o[r, :]`` = an fma.rn chain over m = 0 .. 63 in slot order from +0; 8 rows x 128 columns per program,
-  8 warps, the gathers issued in groups of 8 slots (one [8, 128, 8] load per group, then the group's slots enter the
+* train and prefill :func:`pkm_value_read` -> :class:`PKMReadFn` (the prefill calls it without autograd: the forward
+  kernel alone).  Forward (custom op ``neuronspark::pkm_read_fwd``): exact fp32, ``o[r, :]`` = an fma.rn chain over
+  m = 0 .. 63 in slot order from +0; 8 rows x 128 columns per program, 8 warps, the gathers issued in groups of 8 slots (one [8, 128, 8] load per group, then the group's slots enter the
   chain one by one).  Backward (custom op ``neuronspark::pkm_read_bwd``): one stable sort of the R * M slot ids (int16
   keys: S <= 32767), segment offsets by searchsorted, then one program per (slot, chunk of 64 occurrences in sorted
   order) that forms both gradients from a single load of the slot's value row: grad_V partial = fma.rn chain of
@@ -16,15 +16,13 @@ Operators (regime: public function -> what runs):
   prefetched.  A second kernel sums each slot's chunk partials in order (add.rn from +0).
   Deterministic and capture-safe (static shapes, no host synchronisation).  Both gradients are always formed (one
   fused kernel); a gradient no input needs is dropped.
-* prefill :func:`pkm_weighted_sum` (custom op ``neuronspark::pkm_weighted_sum``): the forward sum for one (t, b) row
-  per program and 256 columns, a sequential fma.rn chain over the 64 pairs from +0.
 * decode: :func:`neuronspark.ops.triton.pkm_step.pkm_value_step` (no op here).
 
 Numerics: exact fp32 products (no TF32 operand rounding) and fixed summation orders, an fp32 reduction-order
-difference from the float64 references.  Tests: the per-operator tolerance rule of :mod:`neuronspark.utils.testing`.
+difference from the float64 reference.  Tests: the per-operator tolerance rule of :mod:`neuronspark.utils.testing`.
 
-Pure-torch references (same signatures): :func:`pkm_value_read_ref`, :func:`pkm_weighted_sum_ref`
-(``F.embedding`` + ``einsum("tbm,tbmd->tbd")``, evaluated in float64).
+Pure-torch reference (same signature): :func:`pkm_value_read_ref` (``F.embedding`` + ``einsum("tbm,tbmd->tbd")``,
+evaluated in float64).
 """
 from __future__ import annotations
 
@@ -36,14 +34,11 @@ import triton
 import triton.language as tl
 
 from neuronspark.ops.triton import require_cuda
-from neuronspark.ops.triton._ptx import _rn_fma_f32  # noqa: F401  (resolved by _pkm_wsum_kernel)
 
 __all__ = [
     "PKMReadFn",
     "pkm_value_read",
     "pkm_value_read_ref",
-    "pkm_weighted_sum",
-    "pkm_weighted_sum_ref",
 ]
 
 # ================================================================================================ fixed constants
@@ -64,10 +59,6 @@ DVSUM_COLS = 256
 DVSUM_WARPS = 4
 #: largest table for which the slot sort runs on int16 keys (the same stable order as int64 keys)
 SORT16_MAX_SLOTS = 32767
-#: prefill weighted sum: columns per program, warps, pipeline stages
-WSUM_COLS = 256
-WSUM_WARPS = 4
-WSUM_STAGES = 1
 
 
 def _need(cond: bool, msg: str) -> None:
@@ -191,53 +182,11 @@ def pkm_value_read(w: torch.Tensor, u: torch.Tensor, V: torch.Tensor) -> torch.T
     return o.view(T, B, int(V.shape[1]))
 
 
-# ================================================================================================ prefill
-def _wsum(w: torch.Tensor, u: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-    require_cuda(w, "pkm_weighted_sum")
-    _need(w.dim() == 3 and V.dim() == 2, f"w (T, B, M) and V (S, dv) expected, got {tuple(w.shape)} {tuple(V.shape)}")
-    T, B, M = (int(s) for s in w.shape)
-    dv = int(V.shape[1])
-    _need(w.dtype == torch.float32 and V.dtype == torch.float32 and u.dtype == torch.int64
-          and tuple(u.shape) == (T, B, M) and u.device == w.device and V.device == w.device,
-          f"pkm_weighted_sum: fp32 w {tuple(w.shape)}, int64 u of the same shape and an fp32 table on one device "
-          f"required, got w {w.dtype}, u {u.dtype} {tuple(u.shape)}, V {V.dtype}")
-    wc, uc, vc = w.contiguous(), u.contiguous(), V.contiguous()
-    out = torch.empty((T, B, dv), dtype=torch.float32, device=w.device)
-    if T * B:
-        _pkm_wsum_kernel[(T * B, triton.cdiv(dv, WSUM_COLS))](wc, uc, vc, out, M=M, DV=dv, BLOCK_D=WSUM_COLS,
-                                                              num_warps=WSUM_WARPS, num_stages=WSUM_STAGES,
-                                                              enable_fp_fusion=False)
-    return out
-
-
-@torch.library.custom_op("neuronspark::pkm_weighted_sum", mutates_args=())
-def _pkm_weighted_sum_op(w: torch.Tensor, u: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-    return _wsum(w, u, V)
-
-
-@_pkm_weighted_sum_op.register_fake
-def _pkm_weighted_sum_fake(w, u, V):
-    return w.new_empty((w.shape[0], w.shape[1], V.shape[1]), dtype=torch.float32)
-
-
-def pkm_weighted_sum(w: torch.Tensor, u: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-    """``o[t, b] = sum_m w[t, b, m] * V[u[t, b, m]]`` (T, B, dv) fp32 for the prefill: ``w`` (T, B, M) fp32, ``u``
-    (T, B, M) int64, ``V`` (S, dv) fp32.  No autograd."""
-    return torch.ops.neuronspark.pkm_weighted_sum(w, u, V)
-
-
 # ================================================================================================ pure-torch references
 def pkm_value_read_ref(w: torch.Tensor, u: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
     """Pure-torch reference of :func:`pkm_value_read`: ``einsum("tbm,tbmd->tbd", w, F.embedding(u, V))``
     evaluated in float64 and rounded once to fp32; differentiable (float64 gradients delivered in the inputs'
     dtypes)."""
-    vals = F.embedding(u, V.to(torch.float64))
-    return torch.einsum("tbm,tbmd->tbd", w.to(torch.float64), vals).to(torch.float32)
-
-
-@torch.no_grad()
-def pkm_weighted_sum_ref(w: torch.Tensor, u: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
-    """Pure-torch reference of :func:`pkm_weighted_sum` (the same float64 expression, no autograd)."""
     vals = F.embedding(u, V.to(torch.float64))
     return torch.einsum("tbm,tbmd->tbd", w.to(torch.float64), vals).to(torch.float32)
 
@@ -393,17 +342,3 @@ def _pr_dv_sum_kernel(PART, CST, DV, D: tl.constexpr, DB: tl.constexpr):
     for q in range(q0, q1):
         acc = _pr_add(acc, tl.load(PART + q * D + d))
     tl.store(DV + s.to(tl.int64) * D + d, acc)
-
-
-@triton.jit
-def _pkm_wsum_kernel(Wt, U, VALS, O, M: tl.constexpr, DV, BLOCK_D: tl.constexpr):
-    row = tl.program_id(0)
-    d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
-    dm = d < DV
-    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-    for m in range(M):
-        u = tl.load(U + row * M + m)
-        wv = tl.load(Wt + row * M + m)
-        v = tl.load(VALS + u * DV + d, mask=dm, other=0.0).to(tl.float32)
-        acc = _rn_fma_f32(tl.broadcast_to(wv, (BLOCK_D,)), v, acc)
-    tl.store(O + row * DV + d, acc, mask=dm)

@@ -25,8 +25,8 @@ Ops per regime:
   ``ops.pkm_topk_train`` (pruned exact top-k, with backward); ``ops.pkm_value_read`` (exact fp32 fma chain,
   deterministic backward); ``ops.pkm_norm_gate`` (the ZCN, the gate and the rounding to bf16: one forward and one
   backward kernel); torch softmax;
-* prefill (T >= 2): ``ops.pkm_topk_prefill`` (exact top-k) + torch softmax; ``ops.pkm_weighted_sum``;
-  ``ops.rmsnorm_rows`` for the ZCN;
+* prefill (T >= 2): the training forward's kernels without autograd, ``ops.pkm_topk_train`` (exact top-k) + torch
+  softmax and ``ops.pkm_value_read``; ``ops.rmsnorm_rows`` for the ZCN;
 * decode (T == 1): ``ops.pkm_scores_step`` (the unit half-queries and their cosines), ``ops.pkm_topk_softmax_t1``
   (the gain multiply, the exact top-k and the softmax in one kernel), ``ops.pkm_value_step`` (the weighted value sum,
   the ZCN and the gate).
@@ -237,9 +237,9 @@ class PKMMixin:
             kh, gains, _ = self._pkm_constants()  # the unit sub-keys and the score gains: per weight version
             qh = self._pkm_queries(q, T, B)
             s = self._pkm_raw_scores(qh, kh) * gains.view(1, 1, H, 2, 1)
-            sc, u, ii, jj = o.pkm_topk_prefill(s[..., 0, :], s[..., 1, :], k)
+            sc, u, ii, jj = o.pkm_topk_train(s, k)           # no autograd here: the forward kernel alone
             w = torch.softmax(sc, dim=-1)
-            val = o.pkm_weighted_sum(w.reshape(T, B, H * k), u.reshape(T, B, H * k), self.pkm_values)
+            val = o.pkm_value_read(w.reshape(T, B, H * k), u.reshape(T, B, H * k), self.pkm_values)
             r = rows_rmsnorm(o, val, PKM_EPS, weight=self.pkm_norm_gain, zero_centered=True,
                              out_dtype=torch.float32)
             r = r * torch.sigmoid(glog.to(torch.float32))

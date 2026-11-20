@@ -16,7 +16,8 @@ index).  No floating-point reduction is involved in the selection; the only arit
 
 Operators (regime: public function -> what runs):
 
-* train   :func:`pkm_topk_train` (s (T, B, H, 2, n) fp32, any strides) -> :class:`PKMTopKFn`.  Forward: custom op
+* train and prefill :func:`pkm_topk_train` (s (T, B, H, 2, n) fp32, any strides) -> :class:`PKMTopKFn` (the prefill
+  calls it without autograd: the forward kernel alone).  Forward: custom op
   ``neuronspark::pkm_topk_train_fwd``, 4 rows per program, 2 warps: composite int64 keys (radix key << 32 |
   (n - 1 - index)) through tl.topk give the selected set, a tl.sort the slot order, then the network compare-swap by
   compare-swap on the slot arrays.  The candidate top-k is taken over the 50 non-dominated pairs (i, j) with
@@ -26,29 +27,27 @@ Operators (regime: public function -> what runs):
   of g_sc over the selected candidates of row a / column c (masked (BR, 16, 16) sums: fp32 reduction-order class
   against autograd's), the (2, n) gradient row zero-filled, then the 16 + 16 sums scatter-stored at i1 / i2 (each
   value ``sum + 0.0``, every other slot +0.0).
-* prefill :func:`pkm_topk_prefill` (s1, s2 (T, B, H, n) fp32 with unit inner stride): custom op
-  ``neuronspark::pkm_topk_prefill``, one program per row with both halves batched as (2, n), 1 warp.  Each half's top-16
-  is the first 16 of its composite int64 keys (radix key << 32 | (2^32 - 1 - index)) sorted descending; when no two of
-  the 16 compare equal under ``GTOp`` (==, -0 == +0, NaN == NaN) the network's output is that order, so the values
-  (re-read by index) and indices come from the sort.  The candidate top-k is taken over the 50 non-dominated pairs,
-  sorted the same way.  A row with such a tie in either step, or a non-finite half value, runs the row-batched
-  selection (sort, index-order prefix counts, compaction, the 32-slot network) instead.
 * decode  :func:`pkm_topk_softmax_t1` (raw scores (B, H, 2, n) and the (H, 2) score gain): custom op
-  ``neuronspark::pkm_topk_softmax_t1``: the gain multiply at the load, the same exact selection and the softmax of the
-  16 selected scores (max, libdevice exp, 16-term sum, division: the sum is the only reordered arithmetic) in one
-  kernel, 4 warps.  :func:`pkm_beta_table` forms the gain table.
+  ``neuronspark::pkm_topk_softmax_t1``, one program per row with both halves batched as (2, n), 4 warps: the gain
+  multiply at the load; each half's top-16 is the first 16 of its composite int64 keys (radix key << 32 |
+  (2^32 - 1 - index)) sorted descending; when no two of the 16 compare equal under ``GTOp`` (==, -0 == +0,
+  NaN == NaN) the network's output is that order, so the values (re-read by index) and indices come from the sort.
+  The candidate top-k is taken over the 50 non-dominated pairs, sorted the same way.  A row with such a tie in either
+  step, or a non-finite half value, runs the row-batched selection (sort, index-order prefix counts, compaction, the
+  32-slot network) instead.  Then the softmax of the 16 selected scores (max, libdevice exp, 16-term sum, division:
+  the sum is the only reordered arithmetic).  :func:`pkm_beta_table` forms the gain table.
 
 Outputs: sc (and the decode weights) fp32, u / ii / jj int64, each (..., 16) contiguous.
 
-Sub-key counts.  The kernels work on rows of a power-of-two width: training 16 <= n <= 128, prefill and decode
-16 <= n <= 256.  A count that is not a power of two (112 sub-keys) is loaded into the next power-of-two width with
--inf in the lanes from n on.  Such a lane is never selected: it compares equal to a real -inf at most, torch's order
-among equal keys is the index order, the padding has the largest indices, and a row has at least 16 real lanes.  A
+Sub-key counts.  The kernels work on rows of a power-of-two width: training and prefill 16 <= n <= 128, decode
+16 <= n <= 256.  A count that is not a power of two (112 sub-keys) is loaded into the next power-of-two width with -inf
+in the lanes from n on.  Such a lane is never selected: it compares equal to a real -inf at most, torch's order among
+equal keys is the index order, the padding has the largest indices, and a row has at least 16 real lanes.  A
 power-of-two count compiles the unmasked load.  Tests: the per-operator tolerance rule of
 :mod:`neuronspark.utils.testing`.
 
-Pure-torch references (same signatures): :func:`pkm_topk_train_ref`, :func:`pkm_topk_prefill_ref`,
-:func:`pkm_topk_softmax_t1_ref` (three torch.topk calls, the candidate add, the gathers).
+Pure-torch references (same signatures): :func:`pkm_topk_train_ref`, :func:`pkm_topk_softmax_t1_ref` (three
+torch.topk calls, the candidate add, the gathers).
 """
 from __future__ import annotations
 
@@ -68,8 +67,6 @@ __all__ = [
     "PKMTopKFn",
     "pkm_topk_train",
     "pkm_topk_train_ref",
-    "pkm_topk_prefill",
-    "pkm_topk_prefill_ref",
     "pkm_topk_softmax_t1",
     "pkm_topk_softmax_t1_ref",
     "pkm_beta_table",
@@ -88,11 +85,9 @@ PRUNE_PAIRS = 50
 #: training backward (zero-fill + scatter-store form): rows per program, warps
 BWD_ROWS = 2
 BWD_WARPS = 2
-#: prefill exact kernel: one row per program, 1 warp
-PREFILL_WARPS = 1
 #: decode kernel (scaled top-k + softmax): one row per program, 4 warps
 DECODE_WARPS = 4
-#: row widths of the prefill / decode exact kernels (n is padded to the next of them)
+#: row widths of the decode kernel (n is padded to the next of them)
 EXACT_N = (16, 32, 64, 128, 256)
 
 # documented first-call cache: the (64,) int32 pruned-pair table per device (built eagerly on the first call)
@@ -216,57 +211,6 @@ def pkm_topk_train(s: torch.Tensor, k: int = TOPK) -> Tuple[torch.Tensor, torch.
     return sc, u, ii, jj
 
 
-# ================================================================================================ prefill
-def _exact_supported(s1: torch.Tensor, s2: torch.Tensor, k: int) -> bool:
-    n = int(s1.shape[-1]) if s1.dim() else 0
-    return (s1.dim() == 4 and s2.dim() == 4 and tuple(s1.shape) == tuple(s2.shape) and int(s1.shape[0]) >= 1
-            and s1.is_cuda and s2.is_cuda and s1.device == s2.device and s1.dtype == torch.float32
-            and s2.dtype == torch.float32 and int(k) == TOPK and TOPK <= n <= EXACT_N[-1])
-
-
-def _topk_prefill(s1: torch.Tensor, s2: torch.Tensor, k: int):
-    _need(_exact_supported(s1, s2, k),
-          f"prefill top-k: unsupported operands {tuple(s1.shape)} {s1.dtype} / {tuple(s2.shape)} {s2.dtype}, k {k} "
-          f"(CUDA fp32 (T, B, H, n) halves of one shape, {TOPK} <= n <= {EXACT_N[-1]}, k = {TOPK})")
-    T, B, H, n = (int(v) for v in s1.shape)
-    if s1.stride(-1) != 1:
-        s1 = s1.contiguous()
-    if s2.stride(-1) != 1:
-        s2 = s2.contiguous()
-    shp = (T, B, H, int(k))
-    dev = s1.device
-    sc = torch.empty(shp, dtype=torch.float32, device=dev)
-    u = torch.empty(shp, dtype=torch.int64, device=dev)
-    ii = torch.empty(shp, dtype=torch.int64, device=dev)
-    jj = torch.empty(shp, dtype=torch.int64, device=dev)
-    R = T * B * H
-    if R:
-        _product_topk_prefill_kernel[(R,)](
-            s1, s2, sc, u, ii, jj, _pix(dev), s1.stride(0), s1.stride(1), s1.stride(2), s2.stride(0), s2.stride(1),
-            s2.stride(2), B, H, n, N=triton.next_power_of_2(n), PAD=bool(n & (n - 1)), num_warps=PREFILL_WARPS)
-    return sc, u, ii, jj
-
-
-@torch.library.custom_op("neuronspark::pkm_topk_prefill", mutates_args=())
-def _pkm_topk_prefill_op(s1: torch.Tensor, s2: torch.Tensor,
-                         k: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    return _topk_prefill(s1, s2, k)
-
-
-@_pkm_topk_prefill_op.register_fake
-def _pkm_topk_prefill_fake(s1, s2, k):
-    shp = (*s1.shape[:-1], int(k))
-    return (s1.new_empty(shp), s1.new_empty(shp, dtype=torch.int64), s1.new_empty(shp, dtype=torch.int64),
-            s1.new_empty(shp, dtype=torch.int64))
-
-
-def pkm_topk_prefill(s1: torch.Tensor, s2: torch.Tensor,
-                     k: int = TOPK) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """(sc fp32, u, ii, jj int64), each (T, B, H, 16) contiguous, from the scaled half scores ``s1`` / ``s2``
-    (T, B, H, n) fp32 (strided views are fine; a non-unit inner stride is made contiguous).  No autograd."""
-    return torch.ops.neuronspark.pkm_topk_prefill(s1, s2, int(k))
-
-
 # ================================================================================================ decode
 def _topk_softmax_t1(s_raw: torch.Tensor, beta: torch.Tensor, k: int):
     require_cuda(s_raw, "pkm_topk_softmax_t1")
@@ -336,11 +280,6 @@ def _product_topk_torch(s1: torch.Tensor, s2: torch.Tensor, k: int):
 def pkm_topk_train_ref(s: torch.Tensor, k: int = TOPK):
     """Pure-torch reference of :func:`pkm_topk_train` (differentiable through torch.topk / gather)."""
     return _product_topk_torch(s[..., 0, :], s[..., 1, :], int(k))
-
-
-def pkm_topk_prefill_ref(s1: torch.Tensor, s2: torch.Tensor, k: int = TOPK):
-    """Pure-torch reference of :func:`pkm_topk_prefill`."""
-    return _product_topk_torch(s1, s2, int(k))
 
 
 def pkm_topk_softmax_t1_ref(s_raw: torch.Tensor, beta: torch.Tensor, k: int = TOPK):
@@ -573,7 +512,7 @@ def _pkm_topk_bwd3_kernel(GSC, J, I1, I2, OUT, R, gss, js, i1s, i2s, NL: tl.cons
     tl.store(OUT + (ob + NL + i2v), gt2 + 0.0, mask=m2)
 
 
-# Exact selection of the prefill and decode kernels.
+# Exact selection of the decode kernel.
 @triton.jit
 def _order_key(x):
     # TopKTypeConfig<float>::convert (uint32) as a signed int32 of the same order (key ^ 0x80000000): x >= +0.0 -> its
@@ -751,39 +690,12 @@ def _product16(x, hb, beta, PIX, N: tl.constexpr, HAS_BETA: tl.constexpr):
 
 
 @triton.jit
-def _product_topk_prefill_kernel(S1, S2, SC, U, II, JJ, PIX, s1_t, s1_b, s1_h, s2_t, s2_b, s2_h, B, H, n_sub,
-                                 N: tl.constexpr, PAD: tl.constexpr):
-    # the product top-k of one (t, b, h) row, the two halves as a (2, N) batch (PAD: n_sub < N, the lanes from
-    # n_sub on hold -inf)
-    row = tl.program_id(0)
-    h = row % H
-    b = (row // H) % B
-    t = row // (H * B)
-    offs = tl.arange(0, N)
-    half = tl.arange(0, 2)[:, None]
-    base1 = S1 + t * s1_t + b * s1_b + h * s1_h
-    base2 = S2 + t * s2_t + b * s2_b + h * s2_h
-    hb = tl.where(half == 0, base1, base2)                                # (2, 1)
-    if PAD:
-        x = tl.load(hb + offs[None, :], mask=tl.broadcast_to((offs < n_sub)[None, :], (2, N)), other=float("-inf"))
-    else:
-        x = tl.load(hb + offs[None, :])                                   # (2, N): row 0 = s1, row 1 = s2
-    sc, ii, jj = _product16(x, hb, x, PIX, N, False)
-    ii64 = ii.to(tl.int64)
-    jj64 = jj.to(tl.int64)
-    o = row * 16 + tl.arange(0, 16)
-    tl.store(SC + o, sc)
-    tl.store(U + o, ii64 * n_sub + jj64)
-    tl.store(II + o, ii64)
-    tl.store(JJ + o, jj64)
-
-
-@triton.jit
 def _pkm_topk_sm_kernel(S, BETA, SC, W, U, II, JJ, PIX, s_b, s_h, s_a, H, n_sub, N: tl.constexpr,
                         PAD: tl.constexpr):
-    """_product_topk_prefill_kernel for one (b, h) row of the raw (B, H, 2, N) scores: the two halves scaled by
-    beta[h, a] at the load (the `s * beta` fp32 multiply of the PKM read), the exact half / product top-16s, and the
-    softmax of the 16 selected scores (fp32: max, libdevice exp, sum, division); PAD as in the prefill kernel"""
+    """the product top-k of one (b, h) row of the raw (B, H, 2, N) scores: the two halves scaled by beta[h, a] at the
+    load (the `s * beta` fp32 multiply of the PKM read), the exact half / product top-16s (:func:`_product16`), and the
+    softmax of the 16 selected scores (fp32: max, libdevice exp, sum, division); PAD: n_sub < N, the lanes from n_sub
+    on hold -inf"""
     row = tl.program_id(0)
     h = row % H
     b = row // H

@@ -96,7 +96,7 @@ _SPECS: List[OpSpec] = [
         doc="proj (B, 18832) bf16, conv_state (B, 9472, 3) fp32, ssm_state (B, 144, 64, 128) bf16|fp32 (stored in its "
             "own dtype), conv_w (9472, 4), conv_b, A (144,), dt_bias, D, theta (9216,), gamma (9216,)"),
     _op("dendritic_res_add", _T + "dendritic_residual", "h upd",
-        "(T, B, 1536) fp32 contiguous = h + upd.float()", "prefill",
+        "(T, B, 1536) fp32 contiguous = h + upd.float()", "prefill decode",
         doc="h (T, B, 1536) fp32 residual stream, upd (T, B, 1536) bf16 with unit last stride (the transposed view of "
             "the (B, T, 1536) W_out output)"),
     # ---------------------------------------------------------------------------------------------- memory norms
@@ -302,7 +302,7 @@ def check_all_signatures(names: Iterable[str] = ()) -> None:
 # mix), registered into OPS after the main table.
 _HIPPOCAMPAL_PREFILL_SPECS: List[OpSpec] = [
     _op("copy_stats_prefill", _T + "copy_stats", "ring ring_ptr pos T",
-        "(maximum, lse) each (T, B) fp32 contiguous; -inf where a query has no valid slot", "prefill",
+        "(maximum, lse) each (T, B) fp32 contiguous; -inf where a query has no valid slot", "prefill decode",
         doc="ring (B, W, 96) fp32 unit operands (the call's own written at (ring_ptr + t) % W), ring_ptr (1,) int64 "
             "pointer at the call's start, pos (B,) int64 tokens before the call, T the call's tokens"),
     _op("xq_queries_prefill", _T + "xq_query", "qs psi head_gain cos sin",
@@ -310,7 +310,7 @@ _HIPPOCAMPAL_PREFILL_SPECS: List[OpSpec] = [
         doc="qs 4 x (T, B, 256) bf16 contiguous projections, psi (T, B, 4) fp32 clamped gain projection, head_gain "
             "one-element bf16 match gain of the last head, cos / sin (T, B, 128) bf16 last-head RoPE band"),
     _op("lex_read_prefill", _T + "lex_read", "h q_raw k_raw o q_gain k_gain beta eps",
-        "(T, B, 1536) fp32 contiguous h + alpha * o", "prefill",
+        "(T, B, 1536) fp32 contiguous h + alpha * o", "prefill decode",
         doc="h (T, B, 1536) fp32, q_raw / k_raw (T, B, 64) bf16, o (T, B, 1536) bf16, q_gain / k_gain (64,) fp32, "
             "beta (1,) fp32, eps = 1e-6"),
     _op("vr_mix_prefill", _T + "vr_mix", "v carry gl lam0 glu_add",

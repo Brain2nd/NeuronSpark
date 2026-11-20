@@ -19,9 +19,9 @@ Numerics per regime: the score matrix is an fp32 einsum, so it runs in TF32 unde
 inside.  Inference keeps one ring of unit operands (:class:`~neuronspark.utils.cache.CopyState` ``u`` (B, W, 96)): a
 call writes its operands at slots ``(ring_ptr + t) % W`` and scores its queries against every slot whose event lies at
 a row position in ``[start_b, t - 2]`` (``start_b = ring_ptr - pos_b``, the row's first event: 0 for every row of a
-cache started with the batch).  A prefill call (T >= 2) reduces the scores with the operator ``copy_stats_prefill``
-(:mod:`neuronspark.ops.triton.copy_stats`: one kernel, online max / logsumexp over ring tiles, the score dot at
-``tf32x3`` precision; ``impl="ref"`` takes its torch chain); a decode step (T == 1) runs the torch chain below.
+cache started with the batch).  A call (a prefill or one decode token) forms and reduces the scores with the operator
+``copy_stats_prefill`` (:mod:`neuronspark.ops.triton.copy_stats`: one kernel, online max / logsumexp over ring tiles,
+the score dot at ``tf32x3`` precision; ``impl="ref"`` takes its torch chain).
 """
 from __future__ import annotations
 
@@ -30,7 +30,6 @@ from typing import NamedTuple, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from neuronspark.modules.induction import ring_positions
 from neuronspark.ops import namespace
 from neuronspark.utils.cache import CopyState
 
@@ -99,7 +98,7 @@ def copy_stats_session(lex_t: torch.Tensor, state: CopyState, ring_ptr: torch.Te
     the call's unit operands are written into ``state.u`` (B, W, d) at ``(ring_ptr + t) % W`` first.  ``ring_ptr``
     (1,) int64 and ``pos`` (B,) int64 are the counters at the start of the call (tokens consumed before it).  ``ops``:
     the operator namespace of the model (:func:`neuronspark.ops.namespace`; None = the kernels), whose
-    ``copy_stats_prefill`` reduces the scores of a call with T >= 2."""
+    ``copy_stats_prefill`` forms and reduces the scores of the call (a prefill or one decode token)."""
     ring = state.u
     B, Wr, d = (int(s) for s in ring.shape)
     if Wr != int(W):
@@ -119,18 +118,10 @@ def copy_stats_session(lex_t: torch.Tensor, state: CopyState, ring_ptr: torch.Te
         steps = torch.arange(T, device=z.device, dtype=torch.int64)
         slots = (ring_ptr + steps) % Wr
         ring.index_copy_(1, slots, u.transpose(0, 1))
-        if T > 1:
-            # prefill: the scores and their reduction in one operator (online max / logsumexp over ring tiles)
-            o = namespace("kernel") if ops is None else ops
-            maximum, lse = o.copy_stats_prefill(ring, ring_ptr, pos.to(torch.int64).contiguous(), T)
-            return CopyStats(maximum, lse)
-        uq = ring.index_select(1, slots)                                  # (B, T, d): the call's unit operands
-        p = ring_positions(ring_ptr, T, Wr).view(1, 1, Wr)
-        t_abs = (ring_ptr + steps).view(1, T, 1)
-        start = (ring_ptr - pos.to(torch.int64)).view(B, 1, 1)
-        valid = (p >= start) & (p <= t_abs - COPY_LAG)                    # (B, T, W)
-        scores = torch.einsum("btd,bwd->btw", uq, ring)
-        return _stats(scores, valid, Wr)
+        # the scores and their reduction in one operator (online max / logsumexp over ring tiles)
+        o = namespace("kernel") if ops is None else ops
+        maximum, lse = o.copy_stats_prefill(ring, ring_ptr, pos.to(torch.int64).contiguous(), T)
+        return CopyStats(maximum, lse)
 
 
 @torch.no_grad()

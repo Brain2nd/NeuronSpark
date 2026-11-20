@@ -41,7 +41,7 @@ Regimes (the caller picks one per call; :class:`DendriticNeuronLayer` dispatches
   ``dendritic_res_add``, the residual addition of the transposed GEMM output (the bf16 operand converted exactly to
   fp32, one row-coalesced kernel).
 * decode (inference, T == 1): ``dendritic_prenorm_rows`` -> bf16 GEMM -> ``dendritic_step_core`` (conv tail roll, state
-  update in the state's storage dtype, gated norm, soma) -> bf16 GEMM -> the residual addition.
+  update in the state's storage dtype, gated norm, soma) -> bf16 GEMM -> ``dendritic_res_add``.
 
 The prefill and the decode step read ``A`` and ``theta`` from a per-weight-version cache
 (:class:`neuronspark.utils.cache.WeightConstants`).
@@ -410,8 +410,7 @@ class DendriticNeurons(nn.Module):
         A, theta = self._step_constants.get((self.A_log, self.rho), lambda: (self.A(), self.theta()))
         xs = o.dendritic_step_core(proj, state.conv, state.ssm, self.conv_weight, self.conv_bias, A, self.dt_bias,
                                    self.D, theta, self.gamma, self.norm_eps)             # (B, 9216) bf16
-        out = hc + o.linear(xs, self.W_out).float()
-        return out[None]
+        return o.dendritic_res_add(hc.unsqueeze(0), o.linear(xs, self.W_out).unsqueeze(0))   # h + upd, one kernel
 
     # ------------------------------------------------------------------------------------------------ inference cache
     def allocate_inference_cache(self, batch_size: int, max_seqlen: Optional[int] = None,

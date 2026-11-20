@@ -3,12 +3,15 @@
 Operators (registry names):
 
 * ``row_rmsnorm(x, weight, eps)`` (training): ``y = x * rsqrt(mean(x^2, -1) + eps)``, times ``weight`` when given, on a
-  dense fp32 ``(T, B, C)`` x of any stride order -> fp32, the layout torch's eager chain gives.  Used for the frozen
-  attention norm (``weight=None``), the lexical-read norm (``weight=None``) and the FFN norm (``weight`` = the fp32 gain).
+  dense fp32 ``(T, B, C)`` x with a unit inner stride -> fp32 in x's layout.
+* ``row_rmsnorm_tee(x, weight, eps, fp32, bf16)`` (training): the same norm with the forms its consumers take:
+  ``(x, y, ys16)`` = x itself (the residual stream handed on), the fp32 norm (when ``fp32``) and ``bf16`` (0, 1, 2)
+  bf16 roundings of it (the operands of projections: no cast and, in x's layout, no row copy in the projection).  One
+  forward kernel; one backward kernel sums the gradients of every output, the residual stream's included.  Used for
+  the lexical-read norm (bf16 only), the frozen attention norm (fp32) and the FFN norm (``weight`` = the fp32 gain;
+  fp32 for the neuron, two bf16 operands for the PKM projections).
 * ``out_norm_gate(attn, w, gate_logits, eps)`` (training): ``sigmoid(gate_logits) * ((1 + w) * rmsnorm(attn))`` with a
   dense fp32 ``attn``, the zero-centred weight ``w`` (fp32 ``(C,)``) and bf16 gate logits -> fp32.
-* ``nov_norm(r, eps)`` (training): ``rf * rsqrt(mean(rf^2, -1) + eps)`` with ``rf = float(r)`` of a dense bf16 ``r`` ->
-  fp32 (the novelty predictor's view of the attention residual).
 * ``rmsnorm_rows(x, eps, weight=None, zero_centered=False, out_dtype=None)`` (prefill / decode, no autograd):
   ``(float(x) * rsqrt(mean(float(x)^2, -1) + eps) [* w1]).to(out_dtype)`` over the last dim with ``w1 = weight`` or
   ``1 + weight`` (``zero_centered``); rows of width ``N % 128 == 0``, ``N <= 4096``; other widths raise (the 64-wide
@@ -21,22 +24,23 @@ no flush-to-zero), exact conversions ``cvt.f32.bf16`` / ``cvt.rn.bf16.f32``, ``r
 instruction nvcc emits for ATen's ``::rsqrt(float)``), the sigmoid ``1 / (1 + expf(-x))`` with libdevice ``expf``; every
 training kernel is compiled with ``enable_fp_fusion=False``.
 
-* Training forwards: the mean of squares is formed in the order of ATen's ``reduce_kernel`` for a reduction over the
-  contiguous last dim with one warp per row (VEC-wide loads, VEC running sums per lane combined in slot order, then the
-  ``shfl_down`` tree), times the host's fp32 ``1 / C``, i.e. in the order of operations of torch's ``pow + mean``
-  chain.  The layout conditions of that reduction path are checked; other layouts raise.
-* Training backwards: one kernel per op forms the row sums of the ``r`` gradient's summands in registers (a register
+* ``row_rmsnorm`` / ``row_rmsnorm_tee``: plain fp32 register sums and products in both directions (Triton's
+  arithmetic; another summation order than the torch chain's reductions).
+* ``out_norm_gate`` forward: the mean of squares is formed in the order of ATen's ``reduce_kernel`` for a reduction
+  over the contiguous last dim with one warp per row (VEC-wide loads, VEC running sums per lane combined in slot order,
+  then the ``shfl_down`` tree), times the host's fp32 ``1 / C``, i.e. in the order of operations of torch's ``pow +
+  mean`` chain.  The layout conditions of that reduction path are checked; other layouts raise.
+* ``out_norm_gate`` backward: one kernel forms the row sums of the ``r`` gradient's summands in registers (a register
   tree, not ATen's order), both contributions to ``x`` (the multiply's and the square's edges of torch's graph), and per
   program the column partial sums of the ``(C,)`` weight gradient, which one torch ``sum`` reduces: fp32
-  reduction-order class.  ``out_norm_gate``'s gate gradient follows ATen's bf16 ``SigmoidBackward0`` (three bf16
-  roundings).
+  reduction-order class.  The gate gradient follows ATen's bf16 ``SigmoidBackward0`` (three bf16 roundings).
 * ``rmsnorm_rows``: one kernel per call: ``x * x`` (``mul.rn``), the sum of squares in ATen's vectorised 4-wide reduction
   order for a contiguous row, the host fp32 factor ``1 / N``, the fp32 ``eps`` add, libdevice ``rsqrt``, the products,
   the final rounding: the eager torch chain's order of operations.
 
 Each launcher is registered as a ``torch.library`` custom op (``neuronspark::hippo_*``) with a fake implementation that
 allocates the same layouts.  Pure-torch references ``*_ref`` (same parameters) are the eager torch chains: the
-RMSNorm eager path, the frozen norm, the zero-centred out norm with its output gate, the novelty rms.
+RMSNorm eager path, the frozen norm, the zero-centred out norm with its output gate.
 """
 import struct
 from typing import Optional, Tuple
@@ -65,16 +69,14 @@ from neuronspark.ops.triton._ptx import (  # noqa: F401  (the glue arithmetic un
 )
 
 __all__ = [
-    "RowNormFn", "row_rmsnorm", "row_rmsnorm_ref",
+    "RowNormFn", "row_rmsnorm", "row_rmsnorm_ref", "row_rmsnorm_tee", "row_rmsnorm_tee_ref",
     "OutNormGateFn", "out_norm_gate", "out_norm_gate_ref",
-    "NovNormFn", "nov_norm", "nov_norm_ref",
     "rmsnorm_rows", "rmsnorm_rows_ref", "rmsnorm_gate_rows", "rmsnorm_gate_rows_ref",
 ]
 
 # ------------------------------------------------------------------------------------------------ fixed constants
 # Launch configuration of the training regime (fixed):
-FWDX_ROWS, FWDX_WARPS = 1, 4          # fused forwards of row_rmsnorm / out_norm_gate: rows per program, warps
-NOV_FWDX_ROWS, NOV_FWDX_WARPS = 1, 2  # fused forward of nov_norm
+FWDX_ROWS, FWDX_WARPS = 1, 4          # forwards of row_rmsnorm / out_norm_gate: rows per program, warps
 ROW_BR = 4                            # rows per program of the backward kernels (fixes the weight-gradient partials)
 ROW_WARPS = 8                         # warps of the backward kernels (row-loop form for row_rmsnorm / out_norm_gate)
 XVEC = 4                              # reduce_kernel's input vector width for the fp32 mean (exact-order row sums)
@@ -177,66 +179,61 @@ def _xrow_sum2(P, roff, rm, RHO, MODE: tl.constexpr, IS16: tl.constexpr, NJ: tl.
 
 # ================================================================================================ training kernels
 @triton.jit
-def _rn_fwd_kernel(X, W, Y, VAR, R, B, D, EPSB, MINV,
-                   xs0, xs1, xs2, ys0, ys1, ys2, vs0, vs1,
-                   HAS_W: tl.constexpr, BR: tl.constexpr, BD: tl.constexpr,
-                   NJ: tl.constexpr, XVEC: tl.constexpr, XUP: tl.constexpr):
-    """y = x * rsqrt(mean(x^2) + eps) [* w]; var written (T, B, 1); the mean of squares in reduce_kernel's order."""
-    r = tl.program_id(0).to(tl.int64) * BR + tl.arange(0, BR)
-    rm = r < R
+def _rn_fwd_kernel(X, W, Y32, Y16, RR, B, D, eps, xs0, xs1, ys0, ys1, hs0, hs1,
+                   HAS_W: tl.constexpr, OUT32: tl.constexpr, OUT16: tl.constexpr, BD: tl.constexpr):
+    """One (t, b) row: y = x * rsqrt(mean(x^2) + eps) [* w], written as fp32 (Y32) and / or rounded to bf16 (Y16); the
+    row factor stored at RR[t * B + b]."""
+    r = tl.program_id(0).to(tl.int64)
     t = r // B
     b = r - t * B
-    c = tl.arange(0, BD).to(tl.int64)
+    c = tl.arange(0, BD)
     cm = c < D
-    m = rm[:, None] & cm[None, :]
-    var = _g_mul(_xrow_sum2(X, t * xs0 + b * xs1, rm, MINV, 1, False, NJ, XVEC, XUP, BR), _g_bits(MINV))
-    x = tl.load(X + (t[:, None] * xs0 + b[:, None] * xs1 + c[None, :] * xs2), mask=m, other=0.0)
-    tl.store(VAR + (t * vs0 + b * vs1), var, mask=rm)
-    rr = tl.broadcast_to(_g_rsqrt(_g_add(var, _g_bits(EPSB)))[:, None], (BR, BD))
-    y = _g_mul(x, rr)
+    x = tl.load(X + (t * xs0 + b * xs1) + c, mask=cm, other=0.0)
+    rr = tl.rsqrt(tl.sum(x * x, axis=0) / D + eps)
+    tl.store(RR + r, rr)
+    y = x * rr
     if HAS_W:
-        w = tl.load(W + c, mask=cm, other=0.0)
-        y = _g_mul(tl.broadcast_to(w[None, :], (BR, BD)), y)
-    tl.store(Y + (t[:, None] * ys0 + b[:, None] * ys1 + c[None, :] * ys2), y, mask=m)
+        y = tl.load(W + c, mask=cm, other=0.0) * y
+    if OUT32:
+        tl.store(Y32 + (t * ys0 + b * ys1) + c, y, mask=cm)
+    if OUT16:
+        tl.store(Y16 + (t * hs0 + b * hs1) + c, y.to(tl.bfloat16), mask=cm)
 
 
 @triton.jit
-def _rn_bwd_loop_kernel(G, X, VAR, W, GX, PW, R, B, D, EPSB, INVB,
-                        gs0, gs1, gs2, xs0, xs1, xs2, vs0, vs1, os0, os1, os2,
-                        HAS_W: tl.constexpr, BR: tl.constexpr, BD: tl.constexpr):
-    """gx = g' r + ((sum_c g' x) * -0.5 * r^3 / D) * 2 x with g' = g w (or g), one [1, BD] row per iteration of the
-    program's BR rows; PW[prog, c] = sum over the program's rows of g (x r), accumulated row by row from row 0."""
+def _rn_bwd_kernel(G32, G16A, G16B, GRES, X, RR, W, GX, PW, R, B, D,
+                   as0, as1, as2, bs0, bs1, bs2, cs0, cs1, cs2, ds0, ds1, ds2, xs0, xs1, os0, os1,
+                   HAS_W: tl.constexpr, HAS32: tl.constexpr, N16: tl.constexpr, HAS_RES: tl.constexpr,
+                   BR: tl.constexpr, BD: tl.constexpr):
+    """BR rows per program.  g = the sum of the gradients of y (fp32 G32, bf16 G16A / G16B widened); with a weight
+    PW[program, c] = sum_rows g (x rr) and g <- g w; gx = g rr - (sum_c g x) rr^3 x / D [+ GRES, the gradient that
+    reaches x beside the norm]."""
     pid = tl.program_id(0).to(tl.int64)
-    c = tl.arange(0, BD).to(tl.int64)
+    r = pid * BR + tl.arange(0, BR)
+    rm = r < R
+    t = r // B
+    b = r - t * B
+    c = tl.arange(0, BD)
     cm = c < D
+    m = rm[:, None] & cm[None, :]
+    c64 = c.to(tl.int64)
+    g = tl.zeros([BR, BD], dtype=tl.float32)
+    if HAS32:
+        g += tl.load(G32 + (t * as0 + b * as1)[:, None] + c64[None, :] * as2, mask=m, other=0.0)
+    if N16 > 0:
+        g += tl.load(G16A + (t * bs0 + b * bs1)[:, None] + c64[None, :] * bs2, mask=m, other=0.0).to(tl.float32)
+    if N16 > 1:
+        g += tl.load(G16B + (t * cs0 + b * cs1)[:, None] + c64[None, :] * cs2, mask=m, other=0.0).to(tl.float32)
+    x = tl.load(X + (t * xs0 + b * xs1)[:, None] + c[None, :], mask=m, other=0.0)
+    rr = tl.load(RR + r, mask=rm, other=0.0)
     if HAS_W:
-        w = tl.broadcast_to(tl.load(W + c, mask=cm, other=0.0)[None, :], (1, BD))
-    for i in tl.static_range(BR):
-        r = pid * BR + i
-        rv = r < R
-        t = r // B
-        b = r - t * B
-        m = cm[None, :] & rv
-        g = tl.load(G + (t * gs0 + b * gs1 + c[None, :] * gs2), mask=m, other=0.0)
-        x = tl.load(X + (t * xs0 + b * xs1 + c[None, :] * xs2), mask=m, other=0.0)
-        var = tl.load(VAR + (t * vs0 + b * vs1) + tl.zeros([1], dtype=tl.int64),
-                      mask=rv & (tl.zeros([1], dtype=tl.int32) == 0), other=1.0)
-        r1 = _g_rsqrt(_g_add(var, _g_bits(EPSB)))
-        rr = tl.broadcast_to(r1[:, None], (1, BD))
-        if HAS_W:
-            pr = _g_mul(g, _g_mul(x, rr))
-            if i == 0:
-                pacc = pr
-            else:
-                pacc = _g_add(pacc, pr)
-            g = _g_mul(g, w)
-        sr = tl.sum(_g_mul(g, x), axis=1)
-        gt = _g_mul(_g_mul(sr, -0.5), _g_mul(_g_mul(r1, r1), r1))
-        gm = tl.broadcast_to(_g_mul(gt, _g_bits(INVB))[:, None], (1, BD))
-        gx = _g_add(_g_mul(g, rr), _g_mul(gm, _g_mul(x, 2.0)))
-        tl.store(GX + (t * os0 + b * os1 + c[None, :] * os2), gx, mask=m)
-    if HAS_W:
-        tl.store(PW + (pid * D + c[None, :]), pacc, mask=cm[None, :])
+        tl.store(PW + pid * D + c, tl.sum(g * (x * rr[:, None]), axis=0), mask=cm)
+        g = g * tl.load(W + c, mask=cm, other=0.0)[None, :]
+    sr = tl.sum(g * x, axis=1) * (rr * rr * rr) / D
+    gx = g * rr[:, None] - sr[:, None] * x
+    if HAS_RES:
+        gx += tl.load(GRES + (t * ds0 + b * ds1)[:, None] + c64[None, :] * ds2, mask=m, other=0.0)
+    tl.store(GX + (t * os0 + b * os1)[:, None] + c[None, :], gx, mask=m)
 
 
 @triton.jit
@@ -305,48 +302,6 @@ def _og_bwd_loop_kernel(G, X, VAR, W1, SG, DS, GX, PW, R, B, D, EPSB, INVB,
         gx = _g_add(_g_mul(g2, rr), _g_mul(gm, _g_mul(x, 2.0)))
         tl.store(GX + (t * os0 + b * os1 + c[None, :] * os2), gx, mask=m)
     tl.store(PW + (pid * D + c[None, :]), pacc, mask=cm[None, :])
-
-
-@triton.jit
-def _nov_fwd_kernel(RR, Y, VAR, R, B, D, EPSB, MINV, rs0, rs1, rs2, ys0, ys1, ys2, vs0, vs1,
-                    BR: tl.constexpr, BD: tl.constexpr,
-                    NJ: tl.constexpr, XVEC: tl.constexpr, XUP: tl.constexpr):
-    """y = rf * rsqrt(mean(rf^2) + eps), rf = float(r) of a bf16 r; var written."""
-    r = tl.program_id(0).to(tl.int64) * BR + tl.arange(0, BR)
-    rm = r < R
-    t = r // B
-    b = r - t * B
-    c = tl.arange(0, BD).to(tl.int64)
-    cm = c < D
-    m = rm[:, None] & cm[None, :]
-    var = _g_mul(_xrow_sum2(RR, t * rs0 + b * rs1, rm, MINV, 1, True, NJ, XVEC, XUP, BR), _g_bits(MINV))
-    x = _g_w(tl.load(RR + (t[:, None] * rs0 + b[:, None] * rs1 + c[None, :] * rs2), mask=m, other=0.0))
-    tl.store(VAR + (t * vs0 + b * vs1), var, mask=rm)
-    rr = tl.broadcast_to(_g_rsqrt(_g_add(var, _g_bits(EPSB)))[:, None], (BR, BD))
-    tl.store(Y + (t[:, None] * ys0 + b[:, None] * ys1 + c[None, :] * ys2), _g_mul(x, rr), mask=m)
-
-
-@triton.jit
-def _nov_bwd_kernel(G, RR, VAR, GR, R, B, D, EPSB, INVB, gs0, gs1, gs2, rs0, rs1, rs2, vs0, vs1, os0, os1, os2,
-                    BR: tl.constexpr, BD: tl.constexpr):
-    """gr = bf16(g r + ((sum_c g rf) * -0.5 * r^3 / D) * 2 rf)."""
-    r = tl.program_id(0).to(tl.int64) * BR + tl.arange(0, BR)
-    rm = r < R
-    t = r // B
-    b = r - t * B
-    c = tl.arange(0, BD).to(tl.int64)
-    cm = c < D
-    m = rm[:, None] & cm[None, :]
-    g = tl.load(G + (t[:, None] * gs0 + b[:, None] * gs1 + c[None, :] * gs2), mask=m, other=0.0)
-    x = _g_w(tl.load(RR + (t[:, None] * rs0 + b[:, None] * rs1 + c[None, :] * rs2), mask=m, other=0.0))
-    var = tl.load(VAR + (t * vs0 + b * vs1), mask=rm, other=1.0)
-    r1 = _g_rsqrt(_g_add(var, _g_bits(EPSB)))
-    rr = tl.broadcast_to(r1[:, None], (BR, BD))
-    sr = tl.sum(_g_mul(g, x), axis=1)
-    gt = _g_mul(_g_mul(sr, -0.5), _g_mul(_g_mul(r1, r1), r1))
-    gm = tl.broadcast_to(_g_mul(gt, _g_bits(INVB))[:, None], (BR, BD))
-    gr = _g_add(_g_mul(g, rr), _g_mul(gm, _g_mul(x, 2.0)))
-    tl.store(GR + (t[:, None] * os0 + b[:, None] * os1 + c[None, :] * os2), _g_n(gr), mask=m)
 
 
 # ================================================================================================ inference kernel
@@ -480,99 +435,132 @@ def _check_dense3(x: torch.Tensor, dtype: torch.dtype, what: str) -> None:
 
 
 # ================================================================================================ row_rmsnorm
-def _rownorm_fwd_alloc(x, weight):
-    xm = _meta(x)
-    var = _var_like(xm, x.device)
-    ym = xm * _meta(var)
-    if weight is not None:
-        ym = _meta(weight) * ym
-    y = torch.empty_strided(tuple(x.shape), ym.stride(), dtype=torch.float32, device=x.device)
-    return y, var
+def _zero(device, dtype) -> torch.Tensor:
+    return torch.empty((0,), dtype=dtype, device=device)
 
 
 @torch.library.custom_op("neuronspark::hippo_rownorm_fwd", mutates_args=(),
-                         schema="(Tensor x, Tensor? weight, float eps) -> (Tensor, Tensor)")
-def _rownorm_fwd(x, weight, eps):
-    """(y, var) of row_rmsnorm's forward (y in torch's layout for x, var (T, B, 1) fp32)."""
+                         schema="(Tensor x, Tensor? weight, float eps, bool out32, bool out16) -> (Tensor, Tensor, Tensor)")
+def _rownorm_fwd(x, weight, eps, out32, out16):
+    """(y fp32, y bf16, rr): the norm in x's layout as fp32 and / or bf16 (an output that is not asked for is empty)
+    and the (T, B) fp32 row factors."""
     T, B, D, R = _rows(x.shape)
-    nj, vec = _xcfg(_meta(x).pow(2), x, D, R, XVEC)
-    y, var = _rownorm_fwd_alloc(x, weight)
-    _rn_fwd_kernel[(triton.cdiv(R, FWDX_ROWS),)](
-        x, weight if weight is not None else x, y, var, R, B, D, _f32_bits(eps), _invb(D),
-        *_s3(x), *_s3(y), *_s2(var), HAS_W=weight is not None, BR=FWDX_ROWS, BD=_pow2(D),
-        NJ=nj, XVEC=vec, XUP=XUP, num_warps=FWDX_WARPS, enable_fp_fusion=False)
-    return y, var
+    y32 = torch.empty_like(x) if out32 else _zero(x.device, torch.float32)
+    y16 = torch.empty_like(x, dtype=torch.bfloat16) if out16 else _zero(x.device, torch.bfloat16)
+    rr = torch.empty((T, B), dtype=torch.float32, device=x.device)
+    _rn_fwd_kernel[(R,)](x, weight if weight is not None else x, y32, y16, rr, B, D, float(eps), *_s2(x),
+                         *(_s2(y32) if out32 else (0, 0)), *(_s2(y16) if out16 else (0, 0)),
+                         HAS_W=weight is not None, OUT32=bool(out32), OUT16=bool(out16), BD=_pow2(D),
+                         num_warps=FWDX_WARPS)
+    return y32, y16, rr
 
 
 @_rownorm_fwd.register_fake
-def _rownorm_fwd_fake(x, weight, eps):
-    return _rownorm_fwd_alloc(x, weight)
-
-
-def _rownorm_bwd_alloc(g, x, var, weight):
-    gm_ = _meta(g)
-    g2m = gm_ * _meta(weight) if weight is not None else gm_
-    gx = torch.empty_strided(tuple(x.shape), (g2m * _meta(var)).stride(), dtype=torch.float32, device=x.device)
-    D = int(x.shape[-1])
-    pw = torch.empty((D if weight is not None else 0,), dtype=torch.float32, device=x.device)
-    return gx, pw
+def _rownorm_fwd_fake(x, weight, eps, out32, out16):
+    return (torch.empty_like(x) if out32 else _zero(x.device, torch.float32),
+            torch.empty_like(x, dtype=torch.bfloat16) if out16 else _zero(x.device, torch.bfloat16),
+            x.new_empty((x.shape[0], x.shape[1]), dtype=torch.float32))
 
 
 @torch.library.custom_op("neuronspark::hippo_rownorm_bwd", mutates_args=(),
-                         schema="(Tensor g, Tensor x, Tensor var, Tensor? weight, float eps) -> (Tensor, Tensor)")
-def _rownorm_bwd(g, x, var, weight, eps):
-    """(gx, pw): x's gradient (both edges summed, torch's layout) and the (D,) weight gradient ((0,) without weight)."""
+                         schema="(Tensor? g32, Tensor? g16a, Tensor? g16b, Tensor? gres, Tensor x, Tensor rr, "
+                                "Tensor? weight) -> (Tensor, Tensor)")
+def _rownorm_bwd(g32, g16a, g16b, gres, x, rr, weight):
+    """(gx, pw): x's gradient in x's layout (the norm's edges and gres summed in the kernel) and the (D,) weight
+    gradient ((0,) without weight).  g16a is given whenever g16b is."""
     T, B, D, R = _rows(x.shape)
     has_w = weight is not None
-    gx, _ = _rownorm_bwd_alloc(g, x, var, weight)
+    gx = torch.empty_like(x)
     np_ = triton.cdiv(R, ROW_BR)
     pwp = torch.empty((np_, D), dtype=torch.float32, device=x.device) if has_w else None
-    _rn_bwd_loop_kernel[(np_,)](g, x, var, weight if has_w else x, gx, pwp if has_w else gx, R, B, D,
-                                _f32_bits(eps), _invb(D), *_s3(g), *_s3(x), *_s2(var), *_s3(gx),
-                                HAS_W=has_w, BR=ROW_BR, BD=_pow2(D), num_warps=ROW_WARPS, enable_fp_fusion=False)
-    pw = pwp.sum(0) if has_w else torch.empty((0,), dtype=torch.float32, device=x.device)
-    return gx, pw
+    n16 = (g16a is not None) + (g16b is not None)
+    _rn_bwd_kernel[(np_,)](
+        g32 if g32 is not None else x, g16a if g16a is not None else x, g16b if g16b is not None else x,
+        gres if gres is not None else x, x, rr, weight if has_w else x, gx, pwp if has_w else gx, R, B, D,
+        *(_s3(g32) if g32 is not None else (0, 0, 0)), *(_s3(g16a) if g16a is not None else (0, 0, 0)),
+        *(_s3(g16b) if g16b is not None else (0, 0, 0)), *(_s3(gres) if gres is not None else (0, 0, 0)),
+        *_s2(x), *_s2(gx), HAS_W=has_w, HAS32=g32 is not None, N16=n16, HAS_RES=gres is not None,
+        BR=ROW_BR, BD=_pow2(D), num_warps=ROW_WARPS)
+    return gx, (pwp.sum(0) if has_w else _zero(x.device, torch.float32))
 
 
 @_rownorm_bwd.register_fake
-def _rownorm_bwd_fake(g, x, var, weight, eps):
-    return _rownorm_bwd_alloc(g, x, var, weight)
+def _rownorm_bwd_fake(g32, g16a, g16b, gres, x, rr, weight):
+    return torch.empty_like(x), x.new_empty((int(x.shape[-1]) if weight is not None else 0,), dtype=torch.float32)
 
 
 class RowNormFn(torch.autograd.Function):
-    """y = x * rsqrt(mean(x^2, -1) + eps) [* weight] on a dense fp32 3-D x; backward: one kernel for x's gradient
-    (both of torch's edges summed in the kernel) and the weight's column partials (one torch sum)."""
+    """The row norm y = x * rsqrt(mean(x^2, -1) + eps) [* weight] of a dense fp32 (T, B, C) x with the outputs
+    ``(x, [y fp32], [y bf16] * n16)``: x itself (the residual stream, handed on so that its gradient returns here), the
+    norm as fp32 when ``fp32``, and ``n16`` (0, 1 or 2) bf16 roundings of the norm that share one buffer (one per bf16
+    consumer: each consumer's gradient arrives on its own).  Backward: one kernel sums the gradients of the norm's
+    outputs in fp32, forms the norm's two edges to x, adds the residual stream's gradient and writes x's gradient; the
+    weight's column partials are reduced by one torch sum."""
 
     @staticmethod
-    def forward(ctx, x, weight, eps):
-        y, var = _rownorm_fwd(x, weight, float(eps))
+    def forward(ctx, x, weight, eps, fp32, n16):
+        y32, y16, rr = _rownorm_fwd(x, weight, float(eps), bool(fp32), n16 > 0)
         ctx.set_materialize_grads(False)
-        ctx.save_for_backward(x, var, weight)
-        ctx.eps = float(eps)
-        return y
+        ctx.save_for_backward(x, rr, weight)
+        ctx.outs = (bool(fp32), int(n16))
+        outs = [x]
+        if fp32:
+            outs.append(y32)
+        if n16 > 0:
+            outs.append(y16)
+        if n16 > 1:
+            outs.append(y16.detach())                 # the same buffer as a second output
+        return tuple(outs)
 
     @staticmethod
-    def backward(ctx, g):
-        if g is None:
-            return None, None, None
-        x, var, weight = ctx.saved_tensors
-        if g.dtype != torch.float32 or g.shape != x.shape:
-            raise RuntimeError(f"neuronspark.row_rmsnorm backward: gradient {g.dtype} {tuple(g.shape)} for "
-                               f"{tuple(x.shape)}")
-        gx, pw = _rownorm_bwd(g, x, var, weight, ctx.eps)
-        return gx, (pw if weight is not None else None), None
+    def backward(ctx, gres, *gs):
+        fp32, n16 = ctx.outs
+        x, rr, weight = ctx.saved_tensors
+        g32 = gs[0] if fp32 else None
+        g16 = [g for g in gs[(1 if fp32 else 0):] if g is not None]
+        if g32 is None and not g16:
+            return gres, None, None, None, None
+        for g, dt in ((g32, torch.float32), *((g, torch.bfloat16) for g in g16), (gres, torch.float32)):
+            if g is not None and (g.dtype != dt or g.shape != x.shape):
+                raise RuntimeError(f"neuronspark.row_rmsnorm backward: gradient {g.dtype} {tuple(g.shape)} for "
+                                   f"{dt} {tuple(x.shape)}")
+        gx, pw = _rownorm_bwd(g32, g16[0] if g16 else None, g16[1] if len(g16) > 1 else None, gres, x, rr, weight)
+        return gx, (pw if weight is not None else None), None, None, None
+
+
+def _check_rownorm(x: torch.Tensor, weight: Optional[torch.Tensor], what: str) -> None:
+    _check_dense3(x, torch.float32, what)
+    if x.stride(-1) != 1:
+        raise RuntimeError(f"neuronspark.{what}: x needs a unit inner stride, got {tuple(x.stride())}")
+    if weight is not None and (weight.dtype != torch.float32 or weight.dim() != 1 or not weight.is_contiguous()
+                               or int(weight.shape[0]) != int(x.shape[-1]) or weight.device != x.device):
+        raise RuntimeError(f"neuronspark.{what}: weight must be a contiguous fp32 ({x.shape[-1]},) tensor on x's "
+                           f"device, got {weight.dtype} {tuple(weight.shape)}")
 
 
 def row_rmsnorm(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float) -> torch.Tensor:
-    """``x * rsqrt(mean(x^2, -1) + eps)`` [``* weight``] for a dense fp32 (T, B, C) CUDA ``x`` (any stride order; the
-    trunk's (T, B, C) view of a (B, T, C) tensor) -> fp32 in torch's layout for x.  ``weight``: None (gain 1) or an fp32
-    (C,) tensor.  Training regime (forward in torch's order of operations; backward fp32 reduction-order class)."""
-    _check_dense3(x, torch.float32, "row_rmsnorm")
-    if weight is not None and (weight.dtype != torch.float32 or weight.dim() != 1
-                               or int(weight.shape[0]) != int(x.shape[-1]) or weight.device != x.device):
-        raise RuntimeError(f"neuronspark.row_rmsnorm: weight must be an fp32 ({x.shape[-1]},) tensor on x's device, "
-                           f"got {weight.dtype} {tuple(weight.shape)}")
-    return RowNormFn.apply(x, weight, float(eps))
+    """``x * rsqrt(mean(x^2, -1) + eps)`` [``* weight``] for a dense fp32 (T, B, C) CUDA ``x`` (unit inner stride, any
+    (t, b) strides: the trunk's (T, B, C) view of a (B, T, C) tensor) -> fp32 in x's layout.  ``weight``: None (gain 1)
+    or an fp32 (C,) tensor.  Training regime."""
+    _check_rownorm(x, weight, "row_rmsnorm")
+    return RowNormFn.apply(x, weight, float(eps), True, 0)[1]
+
+
+def row_rmsnorm_tee(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float, fp32: bool,
+                    bf16: int) -> Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]]:
+    """The row norm of the residual stream with its consumers' forms: ``(x, y, ys16)``.
+
+    ``x`` as for :func:`row_rmsnorm`.  Returns ``x`` (the same values; use it as the residual stream after this call,
+    so that its gradient and the norm's are summed in one backward kernel), ``y`` the fp32 norm in x's layout (None
+    unless ``fp32``) and ``ys16``, ``bf16`` (0, 1 or 2) bf16 roundings of the norm in x's layout (one buffer; one
+    tensor per bf16 consumer, e.g. the operand of a projection).  Training regime."""
+    _check_rownorm(x, weight, "row_rmsnorm_tee")
+    bf16 = int(bf16)
+    if bf16 not in (0, 1, 2) or not (fp32 or bf16):
+        raise RuntimeError(f"neuronspark.row_rmsnorm_tee: fp32 = {fp32}, bf16 = {bf16}: at least one output, at most two "
+                           "bf16 outputs")
+    outs = RowNormFn.apply(x, weight, float(eps), bool(fp32), bf16)
+    return outs[0], (outs[1] if fp32 else None), tuple(outs[(2 if fp32 else 1):])
 
 
 def row_rmsnorm_ref(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float) -> torch.Tensor:
@@ -582,6 +570,14 @@ def row_rmsnorm_ref(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float)
     if weight is not None:
         y = weight * y
     return y
+
+
+def row_rmsnorm_tee_ref(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float, fp32: bool,
+                        bf16: int) -> Tuple[torch.Tensor, Optional[torch.Tensor], Tuple[torch.Tensor, ...]]:
+    """The torch form of :func:`row_rmsnorm_tee`: x itself, the eager chain's norm, and one bf16 cast of it per bf16
+    output."""
+    y = row_rmsnorm_ref(x, weight, eps)
+    return x, (y if fp32 else None), tuple(y.to(torch.bfloat16) for _ in range(int(bf16)))
 
 
 # ================================================================================================ out_norm_gate
@@ -690,86 +686,6 @@ def out_norm_gate_ref(attn: torch.Tensor, w: torch.Tensor, gate_logits: torch.Te
     xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
     y = (1.0 + w) * xf
     return torch.sigmoid(gate_logits) * y
-
-
-# ================================================================================================ nov_norm
-def _nov_fwd_alloc(r):
-    rfm = _meta(r).float()
-    var = _var_like(rfm, r.device)
-    y = torch.empty_strided(tuple(r.shape), (rfm * _meta(var)).stride(), dtype=torch.float32, device=r.device)
-    return y, var
-
-
-@torch.library.custom_op("neuronspark::hippo_novnorm_fwd", mutates_args=(),
-                         schema="(Tensor r, float eps) -> (Tensor, Tensor)")
-def _nov_fwd(r, eps):
-    T, B, D, R = _rows(r.shape)
-    nj, vec = _xcfg(_meta(r).float().pow(2), r, D, R, XVEC)
-    y, var = _nov_fwd_alloc(r)
-    _nov_fwd_kernel[(triton.cdiv(R, NOV_FWDX_ROWS),)](
-        r, y, var, R, B, D, _f32_bits(eps), _invb(D), *_s3(r), *_s3(y), *_s2(var),
-        BR=NOV_FWDX_ROWS, BD=_pow2(D), NJ=nj, XVEC=vec, XUP=XUP, num_warps=NOV_FWDX_WARPS, enable_fp_fusion=False)
-    return y, var
-
-
-@_nov_fwd.register_fake
-def _nov_fwd_fake(r, eps):
-    return _nov_fwd_alloc(r)
-
-
-def _nov_bwd_alloc(g, r, var):
-    gr_st = (_meta(g) * _meta(var)).to(torch.bfloat16).stride()
-    return torch.empty_strided(tuple(r.shape), gr_st, dtype=torch.bfloat16, device=r.device)
-
-
-@torch.library.custom_op("neuronspark::hippo_novnorm_bwd", mutates_args=(),
-                         schema="(Tensor g, Tensor r, Tensor var, float eps) -> Tensor")
-def _nov_bwd(g, r, var, eps):
-    T, B, D, R = _rows(r.shape)
-    gr = _nov_bwd_alloc(g, r, var)
-    _nov_bwd_kernel[(triton.cdiv(R, ROW_BR),)](g, r, var, gr, R, B, D, _f32_bits(eps), _invb(D), *_s3(g), *_s3(r),
-                                               *_s2(var), *_s3(gr), BR=ROW_BR, BD=_pow2(D), num_warps=ROW_WARPS,
-                                               enable_fp_fusion=False)
-    return gr
-
-
-@_nov_bwd.register_fake
-def _nov_bwd_fake(g, r, var, eps):
-    return _nov_bwd_alloc(g, r, var)
-
-
-class NovNormFn(torch.autograd.Function):
-    """rf * rsqrt(mean(rf^2, -1) + eps), rf = float(r) of a dense bf16 3-D r; backward the bf16 gradient of r."""
-
-    @staticmethod
-    def forward(ctx, r, eps):
-        y, var = _nov_fwd(r, float(eps))
-        ctx.set_materialize_grads(False)
-        ctx.save_for_backward(r, var)
-        ctx.eps = float(eps)
-        return y
-
-    @staticmethod
-    def backward(ctx, g):
-        if g is None:
-            return None, None
-        r, var = ctx.saved_tensors
-        if g.dtype != torch.float32 or g.shape != r.shape:
-            raise RuntimeError(f"neuronspark.nov_norm backward: gradient {g.dtype} {tuple(g.shape)} for "
-                               f"{tuple(r.shape)}")
-        return _nov_bwd(g, r, var, ctx.eps), None
-
-
-def nov_norm(r: torch.Tensor, eps: float) -> torch.Tensor:
-    """``rf * rsqrt(mean(rf^2, -1) + eps)`` with ``rf = r.float()`` for a dense bf16 (T, B, C) CUDA ``r`` -> fp32.
-    Training regime (the novelty predictor's rms of the centred attention residual, eps 1e-6)."""
-    _check_dense3(r, torch.bfloat16, "nov_norm")
-    return NovNormFn.apply(r, float(eps))
-
-
-def nov_norm_ref(r: torch.Tensor, eps: float) -> torch.Tensor:
-    rf = r.float()
-    return rf * torch.rsqrt(rf.pow(2).mean(-1, keepdim=True) + eps)
 
 
 # ================================================================================================ rmsnorm_rows

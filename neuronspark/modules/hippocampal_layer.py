@@ -191,29 +191,30 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
         self._check_copy(copy, T, B)
         mode = None if calib is None else calib.pkm_mode(self)
         h = self._lexical_read_train(h, lex)
-        z = o.row_rmsnorm(h, None, self.norm_eps)
+        # each row norm hands the residual stream on: its backward sums the stream's gradient with the norm's
+        h, z, _ = o.row_rmsnorm_tee(h, None, self.norm_eps, True, 0)
         if mode == "queries":
             calib.record(self, "copy_max", copy[0].detach().flatten().to(device="cpu", dtype=torch.float32))
         r, carry_out = self._attention_train(h, z, ind, carry)
         pi = None
         if calib is None or self._pkm_ready:
             pi = self.copy_confidence(copy)
-            c = self.copy_novelty(z, r, lambda t: o.nov_norm(t, NOVELTY_RMS_EPS))
             if aux_out is not None:
                 aux_out.append((z.detach(), r.detach(), pi.detach()))
-            with torch.autocast(h.device.type, enabled=False):
-                f = self.read_gain_factor(pi, c)
-                h = o.read_gain_residual(h, r, f)
+            # the novelty factor c, the read gain 1 + kappa pi c and the residual add: one operator
+            h, c = o.novelty_read_gain(h, z, r, pi, self.copy_novelty_w, self.copy_novelty_b, self.copy_novelty_v,
+                                       self.read_copy_gain, NOVELTY_RMS_EPS)
             if self.probe is not None:
-                self.probe.copy(self, pi, c, f)
+                self.probe.copy(self, pi, c, self.read_gain_factor(pi, c))
         else:
             h = h + r
-        x_hat = o.row_rmsnorm(h, self.ffn_norm.weight, self.ffn_norm.eps)
+        # x_hat in fp32 for the neuron and as the bf16 operands of the two PKM projections
+        h, x_hat, (x_q, x_g) = o.row_rmsnorm_tee(h, self.ffn_norm.weight, self.ffn_norm.eps, True, 2)
         zs = self.input_neuron2(x_hat)
         if self.probe is not None:
             self.probe.ffn_input(self, zs)
         ffn = o.linear(self.snn_ffn(zs, probe=self.probe, layer=self), self.ffn_out_proj.weight)
-        y = self._pkm_read_train(x_hat, r, calib, mode)
+        y = self._pkm_read_train(x_q, x_g, r, calib, mode)
         if y is None:
             return h + ffn, carry_out
         if pi is None:

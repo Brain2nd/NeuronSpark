@@ -10,6 +10,8 @@ the hippocampal layer): ``(xf * rsqrt(mean(xf^2, -1) + eps)).to(x.dtype)``.
 
 The op order is fixed (``x.pow(2).mean(-1, keepdim=True)``, ``torch.rsqrt(v + eps)``, the gain product last): it is
 the eager arithmetic that the fused norm kernels reproduce.
+
+``project_rows(ops, x, weight)``: the projection of a norm's (T, B, C) output in its memory row order (no row copy).
 """
 from __future__ import annotations
 
@@ -18,7 +20,20 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-__all__ = ["RMSNorm", "frozen_rms_norm", "rms_norm_ref"]
+__all__ = ["RMSNorm", "frozen_rms_norm", "rms_norm_ref", "project_rows"]
+
+
+def project_rows(ops, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``ops.linear`` over the rows of a (T, B, C) tensor -> (T, B, N), without copying the rows: a row-major ``x`` and
+    the (T, B, C) view of B-major storage (the residual stream's layout, which the training row norms keep) are
+    projected in their memory order and the result is viewed back as (T, B, N) (unit inner stride; B-major when x is);
+    any other layout is copied to row-major first."""
+    T, B, C = (int(v) for v in x.shape)
+    if not x.is_contiguous():
+        xt = x.transpose(0, 1)
+        if xt.is_contiguous():
+            return ops.linear(xt.reshape(B * T, C), weight).view(B, T, -1).transpose(0, 1)
+    return ops.linear(x.reshape(T * B, C), weight).view(T, B, -1)
 
 
 def rms_norm_ref(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float,

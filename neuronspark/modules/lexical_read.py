@@ -11,8 +11,9 @@ with ZCN(x, g) = x rsqrt(mean(x^2) + 1e-6) (1 + g) in fp32 (zero-centred gain, n
 (T, B, 160) fp32 lexical vector of this call (the whole row's, or the carried-window vector of an inference call: the
 read is per token, so both regimes run the same arithmetic per position).
 
-Ops per regime: whole row -- ``ops.row_rmsnorm`` for hn and the lex_q projection on the (T * B, D) view of hn, the
-64-wide ZCN norms, alpha and the residual in torch; prefill and decode (T >= 1) -- ``ops.rmsnorm_rows`` for hn, then
+Ops per regime: whole row -- ``ops.row_rmsnorm_tee`` for hn (bf16) and the lex_q projection on hn's rows, then
+``ops.lex_read_train`` for the 64-wide ZCN norms, alpha and the residual (one forward and one backward kernel,
+:mod:`neuronspark.ops.triton.lex_read_train`); prefill and decode (T >= 1) -- ``ops.rmsnorm_rows`` for hn, then
 ``ops.lex_read_prefill`` for the ZCN norms, alpha and the residual after the three projections (one kernel per call,
 :mod:`neuronspark.ops.triton.lex_read`).
 
@@ -29,6 +30,7 @@ import torch
 import torch.nn as nn
 
 from neuronspark.modules.linear import Linear
+from neuronspark.modules.norms import project_rows
 from neuronspark.modules.plif import forked_rng, linear_init, rows_rmsnorm
 
 __all__ = ["LexicalReadMixin", "LEX_SEED_BASE", "LEX_EPS"]
@@ -90,12 +92,14 @@ class LexicalReadMixin:
         """Whole-row form: h (T, B, D) fp32, lex (T, B, 160) fp32 -> h' fp32."""
         self._check_lex(h, lex)
         o = self._ops
-        T, B, D = (int(s) for s in h.shape)
-        hn = o.row_rmsnorm(h, None, LEX_EPS)
-        q_raw = o.linear(hn.reshape(T * B, D), self.lex_q.weight).view(T, B, -1)
+        # hn in bf16 (its only consumer is the lex_q projection); h is handed on by the norm so that the gradients of
+        # the norm and of the residual are summed in the norm's backward
+        h, _, (hn,) = o.row_rmsnorm_tee(h, None, LEX_EPS, False, 1)
+        q_raw = project_rows(o, hn, self.lex_q.weight)
         m_in = lex.to(h.dtype)
-        alpha = self._lexical_gate(q_raw, o.linear(m_in, self.lex_k.weight))
-        return h + (alpha * o.linear(m_in, self.lex_o.weight).float()).to(h.dtype)
+        k_raw = o.linear(m_in, self.lex_k.weight)
+        o_raw = o.linear(m_in, self.lex_o.weight)
+        return o.lex_read_train(h, q_raw, k_raw, o_raw, self.lex_q_gain, self.lex_k_gain, self.lex_beta, LEX_EPS)
 
     def _lexical_read_infer(self, h: torch.Tensor, lex: torch.Tensor) -> torch.Tensor:
         """Prefill / decode form (any T >= 1): the same expressions per token; the norms, the gate and the residual

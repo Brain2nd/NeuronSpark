@@ -14,9 +14,10 @@ and uses it at two sites:
       c   = sigmoid( z . w + b + rms(r) . v )                                  (T, B) fp32, with gradient
       f   = (kappa pi) c                                                       fp32
       h'  = h + bf16(f32(r) (1 + f))                                           r = the centred attention residual
-  ``z`` is the layer's frozen-norm input (fp32), ``rms(r) = f32(r) rsqrt(mean(f32(r)^2) + 1e-6)``; the predictor's
-  matvecs and the gain run with autocast disabled (fp32; TF32 under the training regime, the matvecs' backward too:
-  :func:`neuronspark.utils.precision.regime_product`);
+  ``z`` is the layer's frozen-norm input (fp32), ``rms(r) = f32(r) rsqrt(mean(f32(r)^2) + 1e-6)``.  The whole-row
+  forward runs the predictor, the gain and the add as ``ops.novelty_read_gain`` (one forward and one backward kernel,
+  exact fp32 dot products: :mod:`neuronspark.ops.triton.novelty_gain`); an inference call runs
+  :meth:`CopyGateMixin.copy_novelty` and :meth:`CopyGateMixin.read_gain_factor` with autocast disabled (fp32 matvecs);
 * PKM copy gate with the fixed strength ``pkm_copy_strength`` (4.0, a PKM buffer); the novelty factor c does not
   enter it (c scales the read gain only):
       rho = 2 sigmoid(-strength pi)                                            (T, B) fp32, no gradient
@@ -78,9 +79,10 @@ class CopyGateMixin:
     # ------------------------------------------------------------------------------------------------ the predictor
     def copy_novelty(self, z: torch.Tensor, r: torch.Tensor,
                      rms: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
-        """(T, B) fp32 novelty factor c = sigmoid(z . w + b + rms(r) . v) with gradient to w, b, v, z and r.  ``rms`` is
-        the regime's fp32 rms normalisation of the bf16 residual (training: ``ops.nov_norm``; inference:
-        ``ops.rmsnorm_rows``).  With autograd the two matvecs' backward runs under the TF32 setting of this call."""
+        """(T, B) fp32 novelty factor c = sigmoid(z . w + b + rms(r) . v) with gradient to w, b, v, z and r (the form
+        of the inference calls; the whole-row forward runs ``ops.novelty_read_gain``).  ``rms`` is the regime's fp32
+        rms normalisation of the bf16 residual (inference: ``ops.rmsnorm_rows``).  With autograd the two matvecs'
+        backward runs under the TF32 setting of this call."""
         if tuple(r.shape) != tuple(z.shape):
             raise RuntimeError(f"novelty predictor: residual {tuple(r.shape)} does not match z {tuple(z.shape)}")
         with torch.autocast(z.device.type, enabled=False):

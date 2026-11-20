@@ -17,10 +17,14 @@ dv = 768, one shared table of n^2 = 16384 slots):
 
 Ops per regime:
 
-* whole row: projections on the (T * B, D) view; the score einsum through
-  :func:`neuronspark.utils.precision.regime_product` (its backward GEMMs under the forward's TF32 setting);
+* whole row: the query and gate projections on the rows of the bf16 FFN input (``ops.row_rmsnorm_tee``'s bf16
+  outputs: no cast, no row copy); ``ops.pkm_unit_queries`` (the unit half-queries of the bf16
+  projection) and ``ops.pkm_gained_keys`` (the unit sub-keys times beta), one forward and one backward kernel each; the
+  score einsum of the two through :func:`neuronspark.utils.precision.regime_product` (its backward GEMMs under the
+  forward's TF32 setting);
   ``ops.pkm_topk_train`` (pruned exact top-k, with backward); ``ops.pkm_value_read`` (exact fp32 fma chain,
-  deterministic backward); torch normalisation / softmax / ZCN;
+  deterministic backward); ``ops.pkm_norm_gate`` (the ZCN, the gate and the rounding to bf16: one forward and one
+  backward kernel); torch softmax;
 * prefill (T >= 2): ``ops.pkm_topk_prefill`` (exact top-k) + torch softmax; ``ops.pkm_weighted_sum``;
   ``ops.rmsnorm_rows`` for the ZCN;
 * decode (T == 1): ``ops.pkm_scores_step`` (the unit half-queries and their cosines), ``ops.pkm_topk_softmax_t1``
@@ -62,6 +66,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from neuronspark.modules.linear import Linear
+from neuronspark.modules.norms import project_rows
 from neuronspark.modules.plif import forked_rng, linear_init, rows_rmsnorm
 from neuronspark.utils.cache import WeightConstants
 from neuronspark.utils.precision import regime_product
@@ -167,10 +172,12 @@ class PKMMixin:
         return self._ops.linear(r.to(x_hat.dtype), self.pkm_o.weight)
 
     # ------------------------------------------------------------------------------------------------ whole row
-    def _pkm_read_train(self, x_hat: torch.Tensor, res_attn: torch.Tensor, calib=None,
+    def _pkm_read_train(self, x_q: torch.Tensor, x_g: torch.Tensor, res_attn: torch.Tensor, calib=None,
                         mode: Optional[str] = None) -> Optional[torch.Tensor]:
         """Whole-row read y (T, B, D) bf16, or None when nothing is added (a launch-calibration call: an unready layer,
-        or a layer captured by the calibration's ``mode``)."""
+        or a layer captured by the calibration's ``mode``).  ``x_q`` / ``x_g``: the FFN input x_hat (T, B, D) as the
+        operands of the query and of the gate projection (the two bf16 outputs of ``ops.row_rmsnorm_tee``; one tensor
+        may be given twice)."""
         if mode not in PKM_CALIB_MODES:
             raise RuntimeError(f"PKM: unknown calibration mode {mode!r}")
         if mode is None and not self._pkm_ready:
@@ -178,28 +185,26 @@ class PKMMixin:
                 return None                                  # an unready layer inside a calibration: nothing added
             self._require_pkm_ready()
         o = self._ops
-        T, B, D = (int(s) for s in x_hat.shape)
+        T, B, _ = (int(s) for s in x_q.shape)
         H, k = self.pkm_heads, self.pkm_k
-        xr = x_hat.reshape(T * B, D)
-        q = o.linear(xr, self.pkm_q.weight).view(T, B, -1)
+        q = project_rows(o, x_q, self.pkm_q.weight)
         if mode == "queries":
-            with torch.autocast(x_hat.device.type, enabled=False):
-                qh = F.normalize(q.to(torch.float32).view(T * B, H, 2, self.pkm_half), dim=-1)
+            with torch.autocast(x_q.device.type, enabled=False):
+                qh = F.normalize(q.to(torch.float32).reshape(T * B, H, 2, self.pkm_half), dim=-1)
             calib.record(self, "pkm_queries", qh.detach().to(device="cpu", dtype=torch.float32))
             return None
-        glog = o.linear(xr, self.pkm_g.weight).view(T, B, -1)
-        with torch.autocast(x_hat.device.type, enabled=False):
-            qh = self._pkm_queries(q, T, B)
-            s = self._pkm_raw_scores(qh) * self._pkm_gains().view(1, 1, H, 2, 1)
+        glog = project_rows(o, x_g, self.pkm_g.weight)
+        with torch.autocast(x_q.device.type, enabled=False):
+            qh = o.pkm_unit_queries(q, H, self.pkm_half)
+            # the gain rides on the unit sub-keys: s = qh . (kh beta), the einsum's backward under this call's TF32 setting
+            s = regime_product(_half_query_scores, qh, o.pkm_gained_keys(self.pkm_subkeys, self.pkm_log_gain))
             sc, u, ii, jj = o.pkm_topk_train(s, k)
             w = torch.softmax(sc, dim=-1)
             if self.probe is not None:
                 self.probe.pkm(self, w, u, glog)
             val = o.pkm_value_read(w.reshape(T, B, H * k), u.reshape(T, B, H * k), self.pkm_values)
-            r = val * torch.rsqrt(val.pow(2).mean(dim=-1, keepdim=True) + PKM_EPS) * (
-                1.0 + self.pkm_norm_gain.to(torch.float32))
-            r = r * torch.sigmoid(glog.to(torch.float32))
-        y = self._pkm_out(r, x_hat)
+            r = o.pkm_norm_gate(val, self.pkm_norm_gain, glog, PKM_EPS)       # bf16: the output projection's operand
+        y = o.linear(r, self.pkm_o.weight)
         if mode == "rms":
             calib.record(self, "pkm_usage", (u.detach(), w.detach(), ii.detach(), jj.detach()))
             yc = y.detach().float()

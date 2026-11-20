@@ -101,8 +101,13 @@ _SPECS: List[OpSpec] = [
             "the (B, T, 1536) W_out output)"),
     # ---------------------------------------------------------------------------------------------- memory norms
     _op("row_rmsnorm", _T + "hippo_norms", "x weight eps",
-        "(T, B, C) fp32", "train",
-        doc="x (T, B, C) fp32|bf16, weight (C,) fp32 or None (gain 1)"),
+        "(T, B, C) fp32 in x's layout", "train",
+        doc="x (T, B, C) fp32, weight (C,) fp32 or None (gain 1)"),
+    _op("row_rmsnorm_tee", _T + "hippo_norms", "x weight eps fp32 bf16",
+        "(x, y (T, B, C) fp32 or None, bf16 x [(T, B, C) bf16]): the residual stream handed on, the norm, its bf16 "
+        "roundings", "train",
+        doc="x (T, B, C) fp32, weight (C,) fp32 or None (gain 1), fp32: return the fp32 norm, bf16 in (0, 1, 2): the "
+            "number of bf16 outputs (one per bf16 consumer)"),
     _op("rmsnorm_rows", _T + "hippo_norms", "x eps weight zero_centered out_dtype",
         "(M, N) in out_dtype (default x.dtype)", "prefill decode",
         doc="x (M, N) any float, weight (N,) fp32 or None, zero_centered: gain 1 + weight; N % 128 == 0, N <= 4096"),
@@ -112,9 +117,6 @@ _SPECS: List[OpSpec] = [
     _op("out_norm_gate", _T + "hippo_norms", "attn w gate_logits eps",
         "(T, B, 1536) fp32 = zero-centred RMSNorm(attn) * sigmoid(gate_logits)", "train",
         doc="attn (T, B, 1536) fp32, w (1536,) fp32 (zero-centred), gate_logits (T, B, 1536) bf16"),
-    _op("nov_norm", _T + "hippo_norms", "r eps",
-        "(T, B, 1536) fp32", "train",
-        doc="r (T, B, 1536) bf16"),
     # ---------------------------------------------------------------------------------------------- memory rope
     _op("silu_rope", _T + "hippo_rope", "x cos sin",
         "(T, B, C) bf16 = rope(silu(x))", "train",
@@ -136,6 +138,15 @@ _SPECS: List[OpSpec] = [
     _op("pkm_tail", _T + "hippo_residual", "h ffn y rho",
         "h_out (T, B, D) fp32", "train prefill decode",
         doc="h (T, B, D) fp32, ffn (T, B, D) bf16, y (T, B, D) bf16, rho (T, B) fp32 (no gradient)"),
+    _op("novelty_read_gain", _T + "novelty_gain", "h z r pi w b v kappa eps",
+        "(h' (T, B, D) fp32 in h's layout, c (T, B) fp32 novelty factor); backward: h, z, r, w, b, v", "train",
+        doc="h, z (T, B, D) fp32, r (T, B, D) bf16, pi (T, B) fp32 copy confidence (no gradient), w / v (D,) fp32, "
+            "b (1,) fp32, kappa = 4.0 read gain, eps = 1e-6"),
+    # ---------------------------------------------------------------------------------------------- lexical read (train)
+    _op("lex_read_train", _T + "lex_read_train", "h q_raw k_raw o q_gain k_gain beta eps",
+        "(T, B, 1536) fp32 h + alpha * o in h's layout; backward: every tensor argument", "train",
+        doc="h (T, B, 1536) fp32, q_raw / k_raw (T, B, 64) bf16, o (T, B, 1536) bf16, q_gain / k_gain (64,) fp32, "
+            "beta (1,) fp32, eps = 1e-6"),
     # ---------------------------------------------------------------------------------------------- cumulative sums
     _op("cumsum0", _T + "cumsum", "x",
         "inclusive cumsum over dim 0, fp32", "train",
@@ -212,12 +223,21 @@ _SPECS: List[OpSpec] = [
         "spikes S (T, B, C) out_dtype", "prefill", mutates="v0",
         doc="a, drive (T, B, C) fp32, v_th (C,) fp32, v0 (B, C) fp32 carried membrane"),
     # ---------------------------------------------------------------------------------------------- PKM
+    _op("pkm_unit_queries", _T + "pkm_query", "q heads half",
+        "(T, B, 4, 2, 64) fp32 unit half-queries; backward: dq bf16", "train",
+        doc="q (T, B, 512) bf16 query projection, heads = 4, half = 64"),
+    _op("pkm_gained_keys", _T + "pkm_query", "subkeys log_gain",
+        "(4, 2, 128, 64) fp32 unit sub-keys times sqrt(64) exp(log_gain); backward: dsubkeys, dlog_gain", "train",
+        doc="subkeys (4, 2, 128, 64) fp32, log_gain (8,) fp32"),
     _op("pkm_topk_train", _T + "pkm_topk", "s k",
         "(sc fp32, u, ii, jj int64) each (T, B, 4, 16); backward -> ds", "train",
         doc="s (T, B, 4, 2, 128) fp32 half-query scores, k = 16"),
     _op("pkm_value_read", _T + "pkm_read", "w u V",
         "(T, B, 768) fp32; backward: dw, dV", "train",
         doc="w (T, B, 64) fp32 slot weights, u (T, B, 64) int64 slot ids, V (16384, 768) fp32"),
+    _op("pkm_norm_gate", _T + "pkm_gate", "val gain glog eps",
+        "(T, B, 768) bf16 = bf16(zero-centred RMSNorm(val) * sigmoid(glog)); backward: dval, dgain, dglog", "train",
+        doc="val (T, B, 768) fp32 value read, gain (768,) fp32 (zero-centred), glog (T, B, 768) bf16 gate logits"),
     _op("pkm_topk_prefill", _T + "pkm_topk", "s1 s2 k",
         "(sc, u, ii, jj)", "prefill",
         doc="s1, s2 (T, B, 4, 128) fp32 half-query scores, k = 16"),

@@ -30,7 +30,6 @@ import torch
 import torch.nn as nn
 
 from neuronspark.modules.linear import Linear
-from neuronspark.modules.norms import project_rows
 from neuronspark.modules.plif import forked_rng, linear_init, rows_rmsnorm
 
 __all__ = ["LexicalReadMixin", "LEX_SEED_BASE", "LEX_EPS"]
@@ -94,8 +93,9 @@ class LexicalReadMixin:
         o = self._ops
         # hn in bf16 (its only consumer is the lex_q projection); h is handed on by the norm so that the gradients of
         # the norm and of the residual are summed in the norm's backward
+        T, B, D = (int(s) for s in h.shape)
         h, _, (hn,) = o.row_rmsnorm_tee(h, None, LEX_EPS, False, 1)
-        q_raw = project_rows(o, hn, self.lex_q.weight)
+        q_raw = o.linear(hn.reshape(T * B, D), self.lex_q.weight).view(T, B, -1)
         m_in = lex.to(h.dtype)
         k_raw = o.linear(m_in, self.lex_k.weight)
         o_raw = o.linear(m_in, self.lex_o.weight)

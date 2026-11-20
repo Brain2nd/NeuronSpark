@@ -101,7 +101,7 @@ _SPECS: List[OpSpec] = [
             "the (B, T, 1536) W_out output)"),
     # ---------------------------------------------------------------------------------------------- memory norms
     _op("row_rmsnorm", _T + "hippo_norms", "x weight eps",
-        "(T, B, C) fp32 in x's layout", "train",
+        "(T, B, C) fp32, row-major", "train",
         doc="x (T, B, C) fp32, weight (C,) fp32 or None (gain 1)"),
     _op("row_rmsnorm_tee", _T + "hippo_norms", "x weight eps fp32 bf16",
         "(x, y (T, B, C) fp32 or None, bf16 x [(T, B, C) bf16]): the residual stream handed on, the norm, its bf16 "

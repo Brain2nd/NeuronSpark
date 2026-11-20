@@ -145,10 +145,11 @@ def _novelty_read_gain_fwd_fake(h, z, r, pi, w, b, v, kappa, eps):
 def _novelty_read_gain_bwd(g: torch.Tensor, z: torch.Tensor, r: torch.Tensor, pi: torch.Tensor, w: torch.Tensor,
                            v: torch.Tensor, c: torch.Tensor, rr: torch.Tensor,
                            kappa: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """(dz fp32 in z's layout, dr bf16 in r's layout, sums fp32 (2 D + 1,): the gradients of w, of v and of b)."""
+    """(dz fp32 row-major, dr bf16 in the layout torch gives a tensor like r, sums fp32 (2 D + 1,): the gradients of w,
+    of v and of b)."""
     T, B, D = (int(x) for x in z.shape)
     R = T * B
-    dz = torch.empty_like(z)
+    dz = torch.empty((T, B, D), dtype=torch.float32, device=z.device)
     dr = _dest_like(r)
     n_prog = triton.cdiv(R, BWD_ROWS)
     part = torch.empty((n_prog, 2 * D + 1), dtype=torch.float32, device=z.device)
@@ -161,7 +162,8 @@ def _novelty_read_gain_bwd(g: torch.Tensor, z: torch.Tensor, r: torch.Tensor, pi
 
 @_novelty_read_gain_bwd.register_fake
 def _novelty_read_gain_bwd_fake(g, z, r, pi, w, v, c, rr, kappa):
-    return torch.empty_like(z), torch.empty_like(r), z.new_empty((2 * z.shape[-1] + 1,), dtype=torch.float32)
+    return (z.new_empty(tuple(z.shape), dtype=torch.float32), torch.empty_like(r),
+            z.new_empty((2 * z.shape[-1] + 1,), dtype=torch.float32))
 
 
 class NoveltyReadGainFn(torch.autograd.Function):

@@ -3,11 +3,12 @@
 Operators (registry names):
 
 * ``row_rmsnorm(x, weight, eps)`` (training): ``y = x * rsqrt(mean(x^2, -1) + eps)``, times ``weight`` when given, on a
-  dense fp32 ``(T, B, C)`` x with a unit inner stride -> fp32 in x's layout.
+  dense fp32 ``(T, B, C)`` x with a unit inner stride -> fp32, row-major (contiguous) whatever x's layout.
 * ``row_rmsnorm_tee(x, weight, eps, fp32, bf16)`` (training): the same norm with the forms its consumers take:
   ``(x, y, ys16)`` = x itself (the residual stream handed on), the fp32 norm (when ``fp32``) and ``bf16`` (0, 1, 2)
-  bf16 roundings of it (the operands of projections: no cast and, in x's layout, no row copy in the projection).  One
-  forward kernel; one backward kernel sums the gradients of every output, the residual stream's included.  Used for
+  bf16 roundings of it (the operands of projections: no cast in the projection).  The norm's outputs are row-major
+  (contiguous) whatever x's layout: the consumers that take (T * B, C) rows view them without a copy.  One forward
+  kernel; one backward kernel sums the gradients of every output, the residual stream's included.  Used for
   the lexical-read norm (bf16 only), the frozen attention norm (fp32) and the FFN norm (``weight`` = the fp32 gain;
   fp32 for the neuron, two bf16 operands for the PKM projections).
 * ``out_norm_gate(attn, w, gate_logits, eps)`` (training): ``sigmoid(gate_logits) * ((1 + w) * rmsnorm(attn))`` with a
@@ -442,11 +443,11 @@ def _zero(device, dtype) -> torch.Tensor:
 @torch.library.custom_op("neuronspark::hippo_rownorm_fwd", mutates_args=(),
                          schema="(Tensor x, Tensor? weight, float eps, bool out32, bool out16) -> (Tensor, Tensor, Tensor)")
 def _rownorm_fwd(x, weight, eps, out32, out16):
-    """(y fp32, y bf16, rr): the norm in x's layout as fp32 and / or bf16 (an output that is not asked for is empty)
-    and the (T, B) fp32 row factors."""
+    """(y fp32, y bf16, rr): the norm, row-major (T, B, C), as fp32 and / or bf16 (an output that is not asked for is
+    empty) and the (T, B) fp32 row factors."""
     T, B, D, R = _rows(x.shape)
-    y32 = torch.empty_like(x) if out32 else _zero(x.device, torch.float32)
-    y16 = torch.empty_like(x, dtype=torch.bfloat16) if out16 else _zero(x.device, torch.bfloat16)
+    y32 = torch.empty((T, B, D) if out32 else (0,), dtype=torch.float32, device=x.device)
+    y16 = torch.empty((T, B, D) if out16 else (0,), dtype=torch.bfloat16, device=x.device)
     rr = torch.empty((T, B), dtype=torch.float32, device=x.device)
     _rn_fwd_kernel[(R,)](x, weight if weight is not None else x, y32, y16, rr, B, D, float(eps), *_s2(x),
                          *(_s2(y32) if out32 else (0, 0)), *(_s2(y16) if out16 else (0, 0)),
@@ -457,9 +458,10 @@ def _rownorm_fwd(x, weight, eps, out32, out16):
 
 @_rownorm_fwd.register_fake
 def _rownorm_fwd_fake(x, weight, eps, out32, out16):
-    return (torch.empty_like(x) if out32 else _zero(x.device, torch.float32),
-            torch.empty_like(x, dtype=torch.bfloat16) if out16 else _zero(x.device, torch.bfloat16),
-            x.new_empty((x.shape[0], x.shape[1]), dtype=torch.float32))
+    shape = tuple(x.shape)
+    return (x.new_empty(shape if out32 else (0,), dtype=torch.float32),
+            x.new_empty(shape if out16 else (0,), dtype=torch.bfloat16),
+            x.new_empty(shape[:2], dtype=torch.float32))
 
 
 @torch.library.custom_op("neuronspark::hippo_rownorm_bwd", mutates_args=(),
@@ -540,7 +542,7 @@ def _check_rownorm(x: torch.Tensor, weight: Optional[torch.Tensor], what: str) -
 
 def row_rmsnorm(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float) -> torch.Tensor:
     """``x * rsqrt(mean(x^2, -1) + eps)`` [``* weight``] for a dense fp32 (T, B, C) CUDA ``x`` (unit inner stride, any
-    (t, b) strides: the trunk's (T, B, C) view of a (B, T, C) tensor) -> fp32 in x's layout.  ``weight``: None (gain 1)
+    (t, b) strides: the trunk's (T, B, C) view of a (B, T, C) tensor) -> fp32, row-major.  ``weight``: None (gain 1)
     or an fp32 (C,) tensor.  Training regime."""
     _check_rownorm(x, weight, "row_rmsnorm")
     return RowNormFn.apply(x, weight, float(eps), True, 0)[1]
@@ -551,8 +553,8 @@ def row_rmsnorm_tee(x: torch.Tensor, weight: Optional[torch.Tensor], eps: float,
     """The row norm of the residual stream with its consumers' forms: ``(x, y, ys16)``.
 
     ``x`` as for :func:`row_rmsnorm`.  Returns ``x`` (the same values; use it as the residual stream after this call,
-    so that its gradient and the norm's are summed in one backward kernel), ``y`` the fp32 norm in x's layout (None
-    unless ``fp32``) and ``ys16``, ``bf16`` (0, 1 or 2) bf16 roundings of the norm in x's layout (one buffer; one
+    so that its gradient and the norm's are summed in one backward kernel), ``y`` the fp32 norm, row-major (None
+    unless ``fp32``) and ``ys16``, ``bf16`` (0, 1 or 2) bf16 roundings of the norm, row-major (one buffer; one
     tensor per bf16 consumer, e.g. the operand of a projection).  Training regime."""
     _check_rownorm(x, weight, "row_rmsnorm_tee")
     bf16 = int(bf16)

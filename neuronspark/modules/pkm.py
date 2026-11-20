@@ -18,7 +18,7 @@ dv = 768, one shared table of n^2 = 16384 slots):
 Ops per regime:
 
 * whole row: the query and gate projections on the rows of the bf16 FFN input (``ops.row_rmsnorm_tee``'s bf16
-  outputs: no cast, no row copy); ``ops.pkm_unit_queries`` (the unit half-queries of the bf16
+  outputs, row-major: no cast, no row copy); ``ops.pkm_unit_queries`` (the unit half-queries of the bf16
   projection) and ``ops.pkm_gained_keys`` (the unit sub-keys times beta), one forward and one backward kernel each; the
   score einsum of the two through :func:`neuronspark.utils.precision.regime_product` (its backward GEMMs under the
   forward's TF32 setting);
@@ -66,7 +66,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from neuronspark.modules.linear import Linear
-from neuronspark.modules.norms import project_rows
 from neuronspark.modules.plif import forked_rng, linear_init, rows_rmsnorm
 from neuronspark.utils.cache import WeightConstants
 from neuronspark.utils.precision import regime_product
@@ -185,15 +184,15 @@ class PKMMixin:
                 return None                                  # an unready layer inside a calibration: nothing added
             self._require_pkm_ready()
         o = self._ops
-        T, B, _ = (int(s) for s in x_q.shape)
+        T, B, D = (int(s) for s in x_q.shape)
         H, k = self.pkm_heads, self.pkm_k
-        q = project_rows(o, x_q, self.pkm_q.weight)
+        q = o.linear(x_q.reshape(T * B, D), self.pkm_q.weight).view(T, B, -1)
         if mode == "queries":
             with torch.autocast(x_q.device.type, enabled=False):
                 qh = F.normalize(q.to(torch.float32).reshape(T * B, H, 2, self.pkm_half), dim=-1)
             calib.record(self, "pkm_queries", qh.detach().to(device="cpu", dtype=torch.float32))
             return None
-        glog = project_rows(o, x_g, self.pkm_g.weight)
+        glog = o.linear(x_g.reshape(T * B, D), self.pkm_g.weight).view(T, B, -1)
         with torch.autocast(x_q.device.type, enabled=False):
             qh = o.pkm_unit_queries(q, H, self.pkm_half)
             # the gain rides on the unit sub-keys: s = qh . (kh beta), the einsum's backward under this call's TF32 setting

@@ -13,7 +13,7 @@ this op) by the expressions of the hippocampal layer under the bf16 autocast of 
     out = bf16(q)
 
 ``psi`` (T, B, >= M) fp32 is the clamped gain projection, ``head_gain`` the last head's match gain in the query dtype
-(one element).  The chain returns the fp32 queries; the ring read (``ring_recall_prefill``, extra-query form) rounds
+(one element).  The chain forms the queries in fp32; the ring read (``ring_recall_prefill``, extra-query form) rounds
 its queries to bf16 before the score dot, so the bf16 output of this op is exactly the operand the read forms.  One
 program forms ``XQ_QUERY_ROWS`` (t, b) rows of one query and writes them into the stacked (M, T, B, dk) bf16 buffer;
 the public function returns its (B, M, T, dk) permuted view (the layout of the chain's stack + permute).
@@ -191,7 +191,8 @@ def xq_queries_prefill_ref(qs: Sequence[torch.Tensor], psi: torch.Tensor, head_g
     """The hippocampal layer's torch formation of the extra queries after their projections, under the bf16 autocast of
     the inference regime (same arguments as :func:`xq_queries_prefill`): SiLU and the interleaved RoPE as bf16 ops,
     ``F.normalize`` (fp32 under autocast), the gain ``exp(psi_m) * f32(head_gain)`` in fp32 and the product with the
-    unit query; stacked and permuted to (B, M, T, dk).  Returns the fp32 queries."""
+    unit query; stacked and permuted to (B, M, T, dk), then rounded to bf16 once (the operand the ring read forms from
+    the fp32 queries).  Returns (B, M, T, dk) bf16 in the layout of the chain's stack + permute."""
     with torch.autocast("cuda", dtype=torch.bfloat16):
         queries = []
         for m, q in enumerate(qs):
@@ -199,4 +200,4 @@ def xq_queries_prefill_ref(qs: Sequence[torch.Tensor], psi: torch.Tensor, head_g
             q_m = F.normalize(apply_rope_interleaved_ref(q_m, cos.to(q_m.dtype), sin.to(q_m.dtype)), dim=-1)
             g = torch.exp(psi[..., m:m + 1]) * head_gain.to(torch.float32)
             queries.append(q_m * g.to(q_m.dtype))
-        return torch.stack(queries, dim=0).permute(2, 0, 1, 3)
+        return torch.stack(queries, dim=0).permute(2, 0, 1, 3).to(torch.bfloat16)

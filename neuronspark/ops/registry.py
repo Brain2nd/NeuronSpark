@@ -359,6 +359,10 @@ _DECODE_STEP_SPECS: List[OpSpec] = [
     _op("pkm_tail_step", _T + "hippo_step", "h ffn y rho",
         "(B, 1536) fp32", "decode",
         doc="h (B, 1536) fp32, ffn / y (B, 1536) bf16, rho (B,) fp32"),
+    _op("induction_step", _T + "induction_step", "ids win keys ring_ptr pad",
+        "(4, B, W) uint8: entry k - 1 the order-k match of every ring slot", "decode", mutates="win keys",
+        doc="ids (B,) int64, win (B, 4) int64 the rows' last ids, keys (B, W, 4) int64 ring, ring_ptr (1,) int64, "
+            "pad 151669"),
     _op("lexical_step", _T + "lex_step", "ids win tables orders hash_mult hash_add hash_wrap vocab_size scale",
         "(B, 160) fp32 lexical vector of one token", "decode", mutates="win",
         doc="ids (B,) int64, win (B, 2) int64 the rows' last ids, tables 5 x (rows, d) fp32, orders (1, 2, 2, 3, 3), "

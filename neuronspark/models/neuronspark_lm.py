@@ -331,7 +331,8 @@ class NeuronSparkModel(nn.Module):
             if T > 1:
                 x = x.contiguous()                                           # T-major stream for the prefill
             lex = self.lexical_memory.session_vector(ids, ip.lexical, ops=o)
-            ind = induction_session_match(ids, ip.induction, ip.ring_ptr, W, cfg.hippocampal_induction_bias_orders)
+            ind = induction_session_match(ids, ip.induction, ip.ring_ptr, W, cfg.hippocampal_induction_bias_orders,
+                                          ops=o)
             copy = copy_stats_session(lex, ip.copy, ip.ring_ptr, ip.pos, W, tuple(cfg.lexical_order1_slice), ops=o)
             carry: Optional[torch.Tensor] = None
             for layer in self.layers:

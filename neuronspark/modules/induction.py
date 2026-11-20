@@ -34,6 +34,7 @@ from typing import Sequence, Tuple
 
 import torch
 
+from neuronspark.ops import namespace
 from neuronspark.utils.cache import InductionState
 
 __all__ = [
@@ -109,10 +110,12 @@ def ring_strict_past(ptr0: torch.Tensor, T: int, W: int, lag: int) -> torch.Tens
 
 
 def induction_session_match(ids: torch.Tensor, state: InductionState, ring_ptr: torch.Tensor, W: int,
-                            orders: Sequence[int] = INDUCTION_ORDERS) -> Tuple[torch.Tensor, ...]:
+                            orders: Sequence[int] = INDUCTION_ORDERS, ops=None) -> Tuple[torch.Tensor, ...]:
     """Inference call: ``ids`` (B, T) -> one (B, T, W) bool match per order (ascending), the call's queries against
     every slot of the keys ring after this call's keys were written at ``(ring_ptr + t) % W``; ``state.keys`` /
-    ``state.win`` are updated in place.  ``ring_ptr`` (1,) int64: the ring pointer at the start of the call."""
+    ``state.win`` are updated in place.  ``ring_ptr`` (1,) int64: the ring pointer at the start of the call.  ``ops``:
+    the operator namespace of the model (:func:`neuronspark.ops.namespace`; None = the kernels), whose
+    ``induction_step`` matches one token (T == 1: the same integer comparisons, one kernel)."""
     keys, win = state.keys, state.win
     B, Wr, n = (int(s) for s in keys.shape)
     if Wr != int(W):
@@ -130,6 +133,10 @@ def induction_session_match(ids: torch.Tensor, state: InductionState, ring_ptr: 
     if tuple(ring_ptr.shape) != (1,) or ring_ptr.dtype != torch.int64:
         raise RuntimeError("induction_session_match: ring_ptr must be a (1,) int64 device tensor")
     pad = int(state.pad_id)
+    if T == 1 and (ops is not None or x.is_cuda):
+        o = namespace("kernel") if ops is None else ops
+        m = o.induction_step(x[:, 0].contiguous(), win, keys, ring_ptr, pad)             # (n, B, W) uint8
+        return tuple(m[k - 1].view(torch.bool).unsqueeze(1) for k in orders)
     ext = torch.cat([win, x], dim=1)                                      # (B, n + T): ext[:, n + tau] = x_{p0 + tau}
     keys_new = torch.stack([ext[:, n - 1 - i:n - 1 - i + T] for i in range(n)], dim=-1)   # (B, T, n): x_{t-1-i}
     qwin = torch.stack([ext[:, n - i:n - i + T] for i in range(n)], dim=-1)              # (B, T, n): x_{t-i}

@@ -10,13 +10,19 @@ or two loads per tile), one tree sum per output feature, the result rounded to b
 order than cuBLAS's; the reference is :func:`linear_row_ref` (= :func:`neuronspark.ops.linear.linear_ref`: the bf16
 operands multiplied in float64, one bf16 rounding).
 
-:func:`neuronspark.ops.linear.linear` routes its inference calls here when :func:`takes_row` holds.  The bound on the
+Two neighbours of a product can ride in its kernel (a program holds its output features and reads the whole input):
+the input as the bf16 product of two rows (``x_scale``: the spiking FFN's ``g * u``) and an addend of the result
+(``addend``: the dendritic layer's residual stream in fp32, the FFN's skip term in bf16), each with the rounding of
+the torch operation it stands for.
+
+:func:`neuronspark.ops.linear.linear` and :func:`neuronspark.ops.linear.linear_add` route their inference calls here
+when :func:`takes_row` holds.  The bound on the
 output features is where cuBLAS is the faster of the two on the B200 (measured in a replayed graph on cold weights:
 N = 5,504 and 18,832 at K = 1,536).
 """
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -49,7 +55,8 @@ def row_tile(k: int) -> Tuple[int, int, int]:
 
 # ================================================================================================ kernel
 @triton.jit
-def _linear_row_kernel(X, W, Y, N, s_w, K: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _linear_row_kernel(X, XS, W, A, Y, N, s_w, K: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                       SCALE: tl.constexpr, ADD: tl.constexpr):
     n = tl.program_id(0) * BN + tl.arange(0, BN)
     mn = n < N
     kk = tl.arange(0, BK)
@@ -58,13 +65,22 @@ def _linear_row_kernel(X, W, Y, N, s_w, K: tl.constexpr, BN: tl.constexpr, BK: t
     for k0 in tl.static_range(0, K, BK):
         if k0 + BK <= K:
             x = tl.load(X + k0 + kk).to(tl.float32)
+            if SCALE:
+                x = (x * tl.load(XS + k0 + kk).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
             w = tl.load(rows + (k0 + kk)[None, :], mask=mn[:, None], other=0.0).to(tl.float32)
         else:
             mk = k0 + kk < K
             x = tl.load(X + k0 + kk, mask=mk, other=0.0).to(tl.float32)
+            if SCALE:
+                x = (x * tl.load(XS + k0 + kk, mask=mk, other=0.0).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
             w = tl.load(rows + (k0 + kk)[None, :], mask=mn[:, None] & mk[None, :], other=0.0).to(tl.float32)
         acc += w * x[None, :]
-    tl.store(Y + n, tl.sum(acc, axis=1).to(tl.bfloat16), mask=mn)
+    y = tl.sum(acc, axis=1).to(tl.bfloat16)
+    if ADD:
+        a = tl.load(A + n, mask=mn, other=0.0).to(tl.float32)
+        tl.store(Y + n, (a + y.to(tl.float32)).to(Y.dtype.element_ty), mask=mn)
+    else:
+        tl.store(Y + n, y, mask=mn)
 
 
 # ================================================================================================ launcher
@@ -81,20 +97,42 @@ def takes_row(x2: torch.Tensor, w: torch.Tensor, n: int) -> bool:
             and 1 <= int(n) <= min(ROW_MAX_N, int(w.shape[0])))
 
 
-def linear_row(x2: torch.Tensor, w: torch.Tensor, n: int) -> torch.Tensor:
-    """(1, n) bf16 = x2 @ w[:n]^T for operands that satisfy :func:`takes_row` (raises otherwise)."""
+def _row_operand(t: Optional[torch.Tensor], cols: int, dtypes, device) -> bool:
+    return t is None or (t.dim() == 2 and tuple(t.shape) == (1, cols) and t.dtype in dtypes and t.device == device
+                         and t.stride(1) == 1 and not t.is_neg())
+
+
+def linear_row(x2: torch.Tensor, w: torch.Tensor, n: int, x_scale: Optional[torch.Tensor] = None,
+               addend: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """(1, n) bf16 = x2 @ w[:n]^T for operands that satisfy :func:`takes_row` (raises otherwise).
+
+    ``x_scale`` (1, K) bf16: the product's input is ``bf16(x2 * x_scale)`` (the bf16 product of two bf16 tensors).
+    ``addend`` (1, n) fp32 or bf16: the result is ``addend + product`` in the addend's dtype (the bf16 product widened
+    exactly; a bf16 sum is the fp32 sum rounded once), a new tensor.  Both in the kernel of the product."""
     require_cuda(x2, "linear_row")
     if not takes_row(x2, w, n):
         raise RuntimeError(f"neuronspark.linear_row: operands x {tuple(x2.shape)} {x2.dtype} stride "
                            f"{tuple(x2.stride())}, w {tuple(w.shape)} {w.dtype}, n {n} outside its form (one row, "
                            f"K <= {ROW_MAX_K}, 1 <= n <= {ROW_MAX_N} rows of a contiguous bf16 weight)")
     K, N = int(x2.shape[1]), int(n)
+    if not _row_operand(x_scale, K, (torch.bfloat16,), x2.device):
+        raise RuntimeError(f"neuronspark.linear_row: x_scale must be a bf16 (1, {K}) tensor with a unit inner stride")
+    if not _row_operand(addend, N, (torch.float32, torch.bfloat16), x2.device):
+        raise RuntimeError(f"neuronspark.linear_row: addend must be an fp32 or bf16 (1, {N}) tensor with a unit "
+                           f"inner stride")
     bn, bk, warps = row_tile(K)
-    y = torch.empty((1, N), dtype=torch.bfloat16, device=x2.device)
-    _linear_row_kernel[(triton.cdiv(N, bn),)](x2, w, y, N, int(w.stride(0)), K=K, BN=bn, BK=bk, num_warps=warps)
+    y = torch.empty((1, N), dtype=torch.bfloat16 if addend is None else addend.dtype, device=x2.device)
+    _linear_row_kernel[(triton.cdiv(N, bn),)](x2, x2 if x_scale is None else x_scale, w, y if addend is None else addend,
+                                              y, N, int(w.stride(0)), K=K, BN=bn, BK=bk,
+                                              SCALE=int(x_scale is not None), ADD=int(addend is not None),
+                                              num_warps=warps)
     return y
 
 
-def linear_row_ref(x2: torch.Tensor, w: torch.Tensor, n: int) -> torch.Tensor:
-    """Pure-torch reference: the bf16 operands multiplied in float64, the output rounded to bf16 once."""
-    return torch.matmul(x2.double(), w[:int(n)].double().t()).to(torch.bfloat16)
+def linear_row_ref(x2: torch.Tensor, w: torch.Tensor, n: int, x_scale: Optional[torch.Tensor] = None,
+                   addend: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Pure-torch reference: the bf16 operands (the input scaled in bf16 first) multiplied in float64, the output
+    rounded to bf16 once, the addend added in its dtype."""
+    xin = x2 if x_scale is None else x2 * x_scale
+    y = torch.matmul(xin.double(), w[:int(n)].double().t()).to(torch.bfloat16)
+    return y if addend is None else addend + y

@@ -55,7 +55,9 @@ aligned extent keeps cuBLAS off its unaligned kernel: 0.08 ms against 0.11 / 0.3
 accumulation and one bf16 rounding (the same reference): a product of one row and up to 4,096 output features
 (:func:`neuronspark.ops.triton.linear_row.linear_row`: the projections of a step of one sequence), and a product of 2
 to 32 rows and fewer than 16 output features (:func:`neuronspark.ops.triton.linear_small_n.linear_small_n`: the step's
-per-head projections, a split-K GEMM and a reduction on cuBLAS).
+per-head projections, a split-K GEMM and a reduction on cuBLAS).  :func:`linear_add` is an inference product with
+an addend (and, optionally, an input that is the product of two bf16 rows): at one row the neighbours ride in the
+product's kernel.
 
 Pure-torch reference :func:`linear_ref`: the same bf16-rounded operands multiplied in float64, the output rounded
 once to bf16; its gradients are float64 products delivered in the inputs' dtypes.
@@ -71,6 +73,8 @@ __all__ = [
     "Fp32WgradLinearFn",
     "LinearOperandsFn",
     "linear",
+    "linear_add",
+    "linear_add_ref",
     "linear_operands",
     "linear_ref",
     "cache_bf16_",
@@ -423,10 +427,16 @@ def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         # then an ordinary view update for autograd, and the slice's backward hands the Function the (..., P)
         # gradient with zero pad columns
         return out if int(out.shape[-1]) == n else out[..., :n]
+    return _inference(x, weight)
+
+
+def _inference(x: torch.Tensor, weight: torch.Tensor, w: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """The inference product of :func:`linear`; ``w``: the bf16 inference weight when the caller holds it."""
     n = int(weight.shape[0])
-    w = _cached_bf16(weight)
     if w is None:
-        w = _inference_bf16(weight)
+        w = _cached_bf16(weight)
+        if w is None:
+            w = _inference_bf16(weight)
     xb = x.to(torch.bfloat16)
     k = int(xb.shape[-1])
     if xb.is_cuda and k > 0:
@@ -442,6 +452,49 @@ def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
                 return linear_small_n(x2, w).view(*xb.shape[:-1], n)
     out = F.linear(xb, w)
     return out if int(out.shape[-1]) == n else out[..., :n]
+
+
+def linear_add(x: torch.Tensor, weight: torch.Tensor, addend: torch.Tensor,
+               x_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Inference only (no autograd): ``addend + linear(x, weight)`` in ``addend``'s dtype, a new tensor.
+
+    ``addend`` (..., N) fp32 (the bf16 product widened exactly and added in fp32: a residual stream) or bf16 (the fp32
+    sum rounded to bf16 once: ``addend + product`` of two bf16 tensors).  ``x_scale`` (the shape of ``x``; both bf16):
+    the product's input is ``x * x_scale``, the bf16 product of the two.  A call of one row in
+    :func:`neuronspark.ops.triton.linear_row.linear_row`'s form runs the scaling, the product and the addition in that
+    kernel; any other call runs :func:`linear` on ``x`` (``x * x_scale``) and one addition: the same operations."""
+    _check(x, weight)
+    n, k = int(weight.shape[0]), int(weight.shape[1])
+    if torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in (x, weight, addend, x_scale)):
+        raise RuntimeError("neuronspark.ops.linear_add: an inference operator (no autograd): call it under "
+                           "torch.no_grad()")
+    if (tuple(addend.shape) != (*x.shape[:-1], n) or addend.dtype not in (torch.float32, torch.bfloat16)
+            or addend.device != x.device):
+        raise RuntimeError(f"neuronspark.ops.linear_add: addend must be fp32 or bf16 {(*x.shape[:-1], n)} on "
+                           f"{x.device}, got {addend.dtype} {tuple(addend.shape)} on {addend.device}")
+    if x_scale is not None and (tuple(x_scale.shape) != tuple(x.shape) or x_scale.device != x.device
+                                or x.dtype != torch.bfloat16 or x_scale.dtype != torch.bfloat16):
+        raise RuntimeError(f"neuronspark.ops.linear_add: x and x_scale must be bf16 tensors of one shape, got "
+                           f"{x.dtype} {tuple(x.shape)} and {x_scale.dtype} {tuple(x_scale.shape)}")
+    if (x.is_cuda and x.numel() == k > 0 and x.dtype == torch.bfloat16 and x.stride(-1) == 1
+            and addend.stride(-1) == 1 and not addend.is_neg()
+            and (x_scale is None or (x_scale.stride(-1) == 1 and not x_scale.is_neg()))):
+        from neuronspark.ops.triton.linear_row import linear_row, takes_row
+        w = _cached_bf16(weight)
+        if w is None:
+            w = _inference_bf16(weight)
+        x2 = x.reshape(1, k)
+        if takes_row(x2, w, n):
+            return linear_row(x2, w, n, None if x_scale is None else x_scale.reshape(1, k),
+                              addend.reshape(1, n)).view(addend.shape)
+        return _inference(x if x_scale is None else x * x_scale, weight, w) + addend
+    return _inference(x if x_scale is None else x * x_scale, weight) + addend
+
+
+def linear_add_ref(x: torch.Tensor, weight: torch.Tensor, addend: torch.Tensor,
+                   x_scale: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Pure-torch reference of :func:`linear_add`: ``addend + linear_ref(x, weight)`` (``x * x_scale`` for ``x``)."""
+    return linear_ref(x if x_scale is None else x * x_scale, weight) + addend
 
 
 def linear_ref(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:

@@ -62,6 +62,10 @@ _SPECS: List[OpSpec] = [
     _op("linear", "neuronspark.ops.linear", "x weight",
         "(..., N) bf16; backward: dx in x.dtype, dW fp32 as weight.grad", "train prefill decode",
         doc="x (..., K) fp32|bf16, weight (N, K) fp32; inference: the bf16 weight cache when present"),
+    _op("linear_add", "neuronspark.ops.linear", "x weight addend x_scale",
+        "(..., N) in addend's dtype = addend + linear(x [* x_scale], weight), a new tensor", "decode",
+        doc="x (..., K) fp32|bf16, weight (N, K) fp32, addend (..., N) fp32|bf16, x_scale None or bf16 of x's shape "
+            "(x bf16 then)"),
     # ---------------------------------------------------------------------------------------------- dendritic neuron
     # layer
     _op("dendritic_norm", _T + "dendritic_prenorm", "h gain eps",

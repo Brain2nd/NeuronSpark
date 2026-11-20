@@ -427,6 +427,8 @@ class DendriticNeurons(nn.Module):
         A, theta = self._step_constants.get((self.A_log, self.rho), lambda: (self.A(), self.theta()))
         xs = o.dendritic_step_core(proj, state.conv, state.ssm, self.conv_weight, self.conv_bias, A, self.dt_bias,
                                    self.D, theta, self.gamma, self.norm_eps)             # (B, 9216) bf16
+        if B == 1:                                       # one sequence: the residual addition in the product's kernel
+            return o.linear_add(xs, self.W_out, hc).unsqueeze(0)
         return o.dendritic_res_add(hc.unsqueeze(0), o.linear(xs, self.W_out).unsqueeze(0))   # h + upd, one kernel
 
     # ------------------------------------------------------------------------------------------------ inference cache

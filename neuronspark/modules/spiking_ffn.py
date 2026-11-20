@@ -73,7 +73,8 @@ class SpikingFFN(nn.Module):
             zg, zu, zk = stacked_bands(lin(z, stack), sources)
             g = self.gate_neuron(zg, gate_state, pos)
             u = self.up_neuron(zu, up_state, pos)
-            return lin(g * u, self.down_proj.weight) + zk
+            # lin(g * u, down) + zk; one sequence: the product of the spikes and the skip term in the product's kernel
+            return self._ops.linear_add(g, self.down_proj.weight, zk, u)
         g = self.gate_neuron(lin(z, self.gate_proj.weight), gate_state, pos)
         u = self.up_neuron(lin(z, self.up_proj.weight), up_state, pos)
         if probe is not None:

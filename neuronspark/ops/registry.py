@@ -359,6 +359,10 @@ _DECODE_STEP_SPECS: List[OpSpec] = [
     _op("pkm_tail_step", _T + "hippo_step", "h ffn y rho",
         "(B, 1536) fp32", "decode",
         doc="h (B, 1536) fp32, ffn / y (B, 1536) bf16, rho (B,) fp32"),
+    _op("lexical_step", _T + "lex_step", "ids win tables orders hash_mult hash_add hash_wrap vocab_size scale",
+        "(B, 160) fp32 lexical vector of one token", "decode", mutates="win",
+        doc="ids (B,) int64, win (B, 2) int64 the rows' last ids, tables 5 x (rows, d) fp32, orders (1, 2, 2, 3, 3), "
+            "hash_mult / hash_add / hash_wrap (4,) int64, vocab_size 151669, scale 50.0"),
     _op("pkm_scores_step", _T + "pkm_step", "q kh",
         "(B, 4, 2, 128) fp32", "decode",
         doc="q (B, 512) bf16 query projection, kh (4, 2, 128, 64) fp32 unit sub-keys"),

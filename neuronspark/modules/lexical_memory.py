@@ -37,6 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from neuronspark.modules import mechanism_init_seed
+from neuronspark.ops import namespace
 from neuronspark.utils.cache import LexicalState
 
 __all__ = ["LexicalMemory", "lexical_hash_reference", "LEXICAL_LAUNCH_SEED_BASE", "LEXICAL_INITS"]
@@ -192,9 +193,11 @@ class LexicalMemory(nn.Module):
         ids = token_ids.transpose(0, 1)                                    # (T, B)
         return self.lookup(self.buckets(ids))
 
-    def session_vector(self, token_ids: torch.Tensor, state: LexicalState) -> torch.Tensor:
+    def session_vector(self, token_ids: torch.Tensor, state: LexicalState, ops=None) -> torch.Tensor:
         """Inference call: ``token_ids`` (B, T >= 1) -> ``m`` (T, B, M) fp32 of the call, the n-gram keys reading the
-        carried window ``state.win`` (B, n_max - 1); the window is advanced in place to the last n_max - 1 ids."""
+        carried window ``state.win`` (B, n_max - 1); the window is advanced in place to the last n_max - 1 ids.
+        ``ops``: the operator namespace of the model (:func:`neuronspark.ops.namespace`; None = the kernels), whose
+        ``lexical_step`` reads one token (T == 1: the same integers and the same gather, one kernel per table)."""
         if token_ids.dim() != 2:
             raise ValueError(f"LexicalMemory: expected (B, T) token ids, got {tuple(token_ids.shape)}")
         win = state.win                                                    # (B, k), oldest first
@@ -202,6 +205,12 @@ class LexicalMemory(nn.Module):
         if k != self.n_max - 1 or int(win.shape[0]) != int(token_ids.shape[0]) or win.dtype != torch.int64:
             raise RuntimeError(f"LexicalMemory: the window must be ({int(token_ids.shape[0])}, {self.n_max - 1}) "
                                f"int64, got {tuple(win.shape)} {win.dtype}")
+        if int(token_ids.shape[1]) == 1 and k >= 1 and (ops is not None or token_ids.is_cuda):
+            o = namespace("kernel") if ops is None else ops
+            m = o.lexical_step(token_ids[:, 0].to(torch.int64).contiguous(), win, list(self.tables),
+                               [n for n, _, _ in self.spec], self.hash_mult, self.hash_add, self.hash_wrap,
+                               self.vocab_size, self.scale)
+            return m.unsqueeze(0)
         ids = token_ids.transpose(0, 1)                                    # (T, B)
         ext = torch.cat([win.t(), ids.to(torch.int64)], dim=0)            # (k + T, B): ext[k + t] = x_t
         bk = [b[k:] for b in self.buckets(ext)]

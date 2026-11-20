@@ -33,7 +33,8 @@ Regime differences kept explicitly in the code paths (each regime has its own nu
 * match gain gq: bf16 in the whole row (q is bf16 when the gain is formed); fp32 for the six heads in prefill and
   decode (the gain multiplies the fp32 unit query); the extra queries form their gain in the bf16 query dtype in every
   regime;
-* whole row: one ``ops.pool_read`` per layer reads every head and the extra queries (the bias and the induction
+* whole row: one ``ops.pool_attend`` per layer forms the heads' unit keys, gained unit queries and tagged values and
+  the extra queries in the read's layouts and reads every head and the extra queries (the bias and the induction
   matches formed per tile from the clocks and the id windows of ``induction_token_windows``; nothing T x T is
   materialised);
   prefill and decode write each call's events into per-head rings (unit keys, tagged values, absolute clocks; capacity
@@ -158,6 +159,30 @@ def value_residual_anchor(pair: Sequence[float], d_value: int, heads: int, devic
             v = a + (b - a) * (h / (heads - 1))
         out[h * dvh:(h + 1) * dvh].fill_(float(v))
     return out
+
+
+# ------------------------------------------------------------------------------------------------ last-head addend
+class _AddLastHeadFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, attn, addend):
+        ctx.mark_dirty(attn)
+        attn[..., int(attn.shape[-1]) - int(addend.shape[-1]):].add_(addend)
+        ctx.width, ctx.dtype = int(addend.shape[-1]), addend.dtype
+        return attn
+
+    @staticmethod
+    def backward(ctx, g):
+        return g, g[..., int(g.shape[-1]) - ctx.width:].to(ctx.dtype)
+
+
+def add_last_head(attn: torch.Tensor, addend: torch.Tensor) -> torch.Tensor:
+    """``attn`` (T, B, H dv) fp32 with ``addend`` (T, B, dv) added to the last head's channels, in place (``attn`` is
+    returned): the last head's read plus its extra queries' addend.  The addend's gradient is the last head's slice of
+    attn's, in the addend's dtype."""
+    if attn.dtype != torch.float32 or tuple(addend.shape[:-1]) != tuple(attn.shape[:-1]):
+        raise RuntimeError(f"pool attention: attn fp32 (T, B, H dv) and addend (T, B, dv), got {attn.dtype} "
+                           f"{tuple(attn.shape)}, {tuple(addend.shape)}")
+    return _AddLastHeadFn.apply(attn, addend)
 
 
 # ------------------------------------------------------------------------------------------------ the mixin
@@ -472,58 +497,39 @@ class PoolAttentionMixin:
         # write gate, decay
         gate = self.gate_neuron(z)
         a = self._memory_decay(lin(z.float().reshape(T * B, D), self.W_decay.weight).view(T, B, -1))
-        # per-head pool constants and the head preparation
+        # per-head pool constants and the H clocks (one scan)
         gains = self.pool_bias_gains()
         qgain = self.pool_query_gain(q.dtype)
         wbias = self.pool_write_bias_total()
-        qn, kn, gn = o.pool_heads(q, k, gate, qgain, wbias, H, dk)
-        if self.probe is not None:
-            self.probe.attention(self, a, gn, gate, gains[:H], qn, kn)
-        vs = o.value_split(v, H, dv)
-        # one pool read for the layer: the H heads, then the last head's extra queries (its keys, tagged values,
-        # clock and induction term)
-        xq = self._extra_queries_train(z, cos, sin, qgain[H - 1])
-        q_all = torch.cat([torch.stack(qn, dim=2), xq.to(qn[0].dtype)], dim=2)          # (T, B, H + M, dk)
-        gv = torch.stack([self._tagged_values(gn[i], vs[i]) for i in range(H)], dim=2)  # (T, B, H, dv) bf16
-        cum = o.cumsum0(self._trace_increments(a, T, B, gains[:H]))                       # the H clocks, one scan
-        k_all = torch.stack(kn, dim=2)                                                   # (T, B, H, dk)
-        if self.probe is not None:                                   # (the weights by distance, off these inputs)
+        cum = o.cumsum0(self._trace_increments(a, T, B, gains[:H]))
+        # one operator for the layer's read: the head preparation (unit keys, gained unit queries, tagged values), the
+        # last head's extra queries (its keys, tagged values, clock and induction term) and the pool read
+        xq, psi = self._extra_query_projections(zc)
+        attn, xreads, q_all, k_all = o.pool_attend(q, k, gate, v, qgain, wbias, self.write_sparsity, xq, psi,
+                                                   self._xq_band(cos), self._xq_band(sin), cum, self.induction_beta(),
+                                                   qtok, ktok, self.induction_orders, self.match_scale)
+        if self.probe is not None:                 # (the weights by distance, off the read's queries, keys and clocks)
+            gn = [gate[..., i * dk:(i + 1) * dk] + wbias[i] for i in range(H)]
+            self.probe.attention(self, a, gn, gate, gains[:H], [q_all[:, :, i] for i in range(H)],
+                                 [k_all[:, :, i] for i in range(H)])
             self.probe.pool_scores(self, q_all[:, :, :H], k_all, cum, self.induction_beta(), qtok, ktok,
                                    self.induction_orders, self.match_scale)
-        reads = o.pool_read(q_all, k_all, gv, cum, self.induction_beta(), qtok, ktok,
-                            self.induction_orders, self.match_scale)                    # (T, B, H + M, dv) bf16
-        heads = [reads[:, :, i].to(torch.float32) for i in range(H)]
-        heads[-1] = heads[-1] + self._extra_query_out_train(reads[:, :, H:])
-        attn = torch.cat(heads, dim=-1)
+        if self.xq_count:                          # the last head's read plus its extra queries' addend
+            attn = add_last_head(attn, lin(lin(xreads, self.pool_xq_out_in).contiguous(), self.pool_xq_out))
         # zero-centred output norm x sigmoid gate (the gate reads h), output projection, centring
         gate_logits = lin(h.reshape(T * B, D), self.attn_out_gate.weight).view(T, B, -1)
         attn = o.out_norm_gate(attn, self.attn_out_norm.weight, gate_logits, self.attn_out_norm.eps)
         return self._out_proj_centred(attn), carry_out
 
-    def _extra_queries_train(self, z, cos, sin, head_gain) -> torch.Tensor:
-        """(T, B, M, dk) the last head's extra queries (whole row): SiLU of the rank-r projections, RoPE on the head's
-        band, normalised, times exp(clamp(psi)) and the head's match gain."""
-        o = self._ops
-        lin = o.linear
-        M, r = self.xq_count, self.xq_rank
-        cos5, sin5 = self._xq_band(cos), self._xq_band(sin)
-        zc = z.contiguous()
-        u = lin(zc, self.pool_xq_a)
-        psi = lin(zc, self.pool_xq_gain_proj).to(torch.float32).clamp(-XQ_PSI_CLAMP, XQ_PSI_CLAMP)
-        queries = []
-        for m in range(M):
-            q_m = F.silu(lin(u[..., m * r:(m + 1) * r].contiguous(), self.pool_xq_b[m]))
-            q_m = F.normalize(o.rope_paired(q_m, cos5.to(q_m.dtype), sin5.to(q_m.dtype)), dim=-1)
-            g = torch.exp(psi[..., m:m + 1]) * head_gain.to(torch.float32)
-            queries.append(q_m * g.to(q_m.dtype))
-        return torch.stack(queries, dim=2)
-
-    def _extra_query_out_train(self, reads: torch.Tensor) -> torch.Tensor:
-        """Whole-row addend (T, B, dv) of the last head from its extra queries' reads (T, B, M, dv) bf16."""
+    def _extra_query_projections(self, zc):
+        """(the M bf16 (T, B, dk) rank-r projections of the last head's extra queries, their bf16 (T, B, M) log-gain
+        projection psi) of the whole row from the contiguous copy of z; ``ops.pool_attend`` forms the queries from
+        them."""
         lin = self._ops.linear
-        T, B = int(reads.shape[0]), int(reads.shape[1])
-        r = reads.reshape(T, B, self.xq_count * self.hippocampal_value_head_dim).to(torch.float32)
-        return lin(lin(r, self.pool_xq_out_in).contiguous(), self.pool_xq_out)
+        M, r = self.xq_count, self.xq_rank
+        u = lin(zc, self.pool_xq_a)
+        psi = lin(zc, self.pool_xq_gain_proj)
+        return tuple(lin(u[..., m * r:(m + 1) * r].contiguous(), self.pool_xq_b[m]) for m in range(M)), psi
 
     # ------------------------------------------------------------------------------------------------ prefill
     def _short_conv_two(self, qkv: torch.Tensor, hist: torch.Tensor) -> torch.Tensor:

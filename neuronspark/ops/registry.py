@@ -115,18 +115,9 @@ _SPECS: List[OpSpec] = [
     _op("nov_norm", _T + "hippo_norms", "r eps",
         "(T, B, 1536) fp32", "train",
         doc="r (T, B, 1536) bf16"),
-    # ---------------------------------------------------------------------------------------------- memory heads / rope
-    _op("pool_heads", _T + "hippo_heads", "q k gate gain wbias H dk",
-        "(qn [H x (T, B, dk) fp32], kn [H x (T, B, dk) fp32], g [H x (T, B) fp32])", "train",
-        doc="q, k (T, B, 1536) bf16 after RoPE, gate (T, B, 1536) fp32, gain (6,) bf16 match gain, wbias (6,) fp32"),
-    _op("value_split", _T + "hippo_heads", "v H dv",
-        "H tensors (T, B, dv) bf16", "train",
-        doc="v (T, B, 1536) bf16"),
+    # ---------------------------------------------------------------------------------------------- memory rope
     _op("silu_rope", _T + "hippo_rope", "x cos sin",
         "(T, B, C) bf16 = rope(silu(x))", "train",
-        doc="x (T, B, C) bf16, cos / sin (T, 768) bf16"),
-    _op("rope_paired", _T + "hippo_rope", "x cos sin",
-        "(T, B, C) bf16", "train",
         doc="x (T, B, C) bf16, cos / sin (T, 768) bf16"),
     _op("rope_interleaved", _T + "hippo_rope", "x cos sin",
         "(T, B, C) bf16", "prefill",
@@ -166,6 +157,14 @@ _SPECS: List[OpSpec] = [
         "(B, 4608) bf16", "decode", mutates="hist",
         doc="x (B, 4608) bf16, hist (B, 4608, 3) fp32, weight (4608, 1, 4) fp32"),
     # ---------------------------------------------------------------------------------------------- pool attention (train)
+    _op("pool_attend", "neuronspark.ops.pool_attend",
+        "q k gate v gain wbias sparsity xq psi cos sin cum beta qtok ktok orders scale",
+        "(heads (T, B, 1536) fp32, xreads (T, B, 1024) bf16, q_all (T, B, 10, 256) bf16, k_all (T, B, 6, 256) bf16)",
+        "train",
+        doc="q, k (T, B, 1536) bf16 after SiLU and RoPE, gate (T, B, 1536) fp32 write-gate spikes, v (T, B, 1536) "
+            "bf16, gain (6,) bf16 match gain, wbias (6,) fp32, sparsity 2.0, xq 4 x (T, B, 256) bf16 extra-query "
+            "projections, psi (T, B, 4) bf16, cos / sin (T, 128) bf16 last-head RoPE band, then the operands of "
+            "pool_read: the head preparation, the tagged values, the extra queries and the read"),
     _op("pool_read", "neuronspark.ops.pool_read", "q k gv cum beta qtok ktok orders scale",
         "(T, B, 10, 256) bf16: the 6 heads' reads, then the last head's 4 extra-query reads", "train",
         doc="q (T, B, 10, 256) fp32 gained unit queries (6 heads, 4 extra queries), k (T, B, 6, 256) fp32 unit keys, "

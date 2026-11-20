@@ -4,8 +4,6 @@ Operators (registry names):
 
 * ``silu_rope(x, cos, sin)`` (training): ``rope(bf16(silu(x)))`` for the bf16 (T, B, C) q or k slice of the short
   conv's output, forward and backward.
-* ``rope_paired(x, cos, sin)`` (training): ``rope(x)`` for a bf16 (T, B, C) x (the extra queries of the last head),
-  forward and backward.
 * ``rope_interleaved(x, cos, sin)`` (prefill, no autograd): ``rope(x)`` for a bf16 (T, B, C) x, one kernel per call.
 
 ``rope`` is the interleaved layout: pair ``p`` = channels ``(2p, 2p + 1)``, ``c = cos[t, p]``,
@@ -53,13 +51,11 @@ from neuronspark.ops.triton.hippo_norms import (  # noqa: F401  (jit helpers res
     _meta,
 )
 
-__all__ = ["SiluRopeFn", "silu_rope", "silu_rope_ref", "RopePairedFn", "rope_paired", "rope_paired_ref",
-           "rope_interleaved", "rope_interleaved_ref"]
+__all__ = ["SiluRopeFn", "silu_rope", "silu_rope_ref", "rope_interleaved", "rope_interleaved_ref"]
 
 # ------------------------------------------------------------------------------------------------ fixed constants
 SROPE_FWD_CFG = (16, 64, 4)   # silu_rope forward (BT positions, BP pairs, warps): channel-contiguous tiles
 SROPE_BWD_CFG = (16, 64, 4)   # silu_rope backward (x, gy, gx all channel-contiguous tiles)
-ROPE_CFG = (16, 64, 4)        # rope_paired forward / backward
 # rope_interleaved (prefill): BLOCK_P = min(64, pow2(C / 2)) pairs, BLOCK_R = 16 rows (32 when BLOCK_P < 64), 4 warps
 
 
@@ -125,64 +121,6 @@ def _silu_rope_bwdx_kernel(GY, X, C, S, GX, T, P, gs0, gs1, xs0, xs1, cs0, cs1, 
     tl.store(GX + (tb * os0 + b64 * os1) + (i[:, None] * os0 + c2[None, :]), o2, mask=m2)
 
 
-@triton.jit
-def _rope_fwdp_kernel(X, C, S, Y, T, P, xs0, xs1, cs0, cs1, cs2, ss0, ss1, ss2, ys0, ys1,
-                      BT: tl.constexpr, BP: tl.constexpr):
-    """rope(x) with x read and y written as ONE contiguous (BT, 2 BP) channel tile each (channel stride 1, 32-bit
-    offsets within the tile), program (t tile, b, pair tile)."""
-    i = tl.arange(0, BT)
-    t = tl.program_id(0) * BT + i
-    b = tl.program_id(1)
-    tb = (tl.program_id(0) * BT).to(tl.int64)                       # 64-bit tile base, 32-bit offsets in the tile
-    b64 = b.to(tl.int64)
-    p = tl.program_id(2) * BP + tl.arange(0, BP)
-    c2 = tl.program_id(2) * (2 * BP) + tl.arange(0, 2 * BP)
-    m = (t < T)[:, None] & (p < P)[None, :]
-    m2 = (t < T)[:, None] & (c2 < 2 * P)[None, :]
-    x2 = tl.load(X + (tb * xs0 + b64 * xs1) + (i[:, None] * xs0 + c2[None, :]), mask=m2, other=0.0)
-    xe16, xd16 = tl.split(tl.reshape(x2, [BT, BP, 2]))
-    xe = _g_w(xe16)
-    xd = _g_w(xd16)
-    c = _g_w(tl.load(C + (t[:, None] * cs0 + b * cs1 + p[None, :] * cs2), mask=m, other=0.0))
-    s = _g_w(tl.load(S + (t[:, None] * ss0 + b * ss1 + p[None, :] * ss2), mask=m, other=0.0))
-    pp = _g_r16(_g_mul(xe, c))
-    q = _g_r16(_g_mul(xd, s))
-    r = _g_r16(_g_mul(xd, c))
-    u = _g_r16(_g_mul(xe, s))
-    y2 = tl.reshape(tl.join(_g_n(_g_sub(pp, q)), _g_n(_g_add(r, u))), [BT, 2 * BP])
-    tl.store(Y + (tb * ys0 + b64 * ys1) + (i[:, None] * ys0 + c2[None, :]), y2, mask=m2)
-
-
-@triton.jit
-def _rope_bwdp_kernel(GY, C, S, GX, T, P, gs0, gs1, cs0, cs1, cs2, ss0, ss1, ss2, os0, os1,
-                      BT: tl.constexpr, BP: tl.constexpr):
-    """rope backward with gy read and gx written as contiguous (BT, 2 BP) channel tiles: g_e = bf16(bf16(gA c) +
-    bf16(gB s)) + 0, g_o = bf16(bf16(-gA s) + bf16(gB c)) + 0."""
-    i = tl.arange(0, BT)
-    t = tl.program_id(0) * BT + i
-    b = tl.program_id(1)
-    tb = (tl.program_id(0) * BT).to(tl.int64)                       # 64-bit tile base, 32-bit offsets in the tile
-    b64 = b.to(tl.int64)
-    p = tl.program_id(2) * BP + tl.arange(0, BP)
-    c2 = tl.program_id(2) * (2 * BP) + tl.arange(0, 2 * BP)
-    m = (t < T)[:, None] & (p < P)[None, :]
-    m2 = (t < T)[:, None] & (c2 < 2 * P)[None, :]
-    g2 = tl.load(GY + (tb * gs0 + b64 * gs1) + (i[:, None] * gs0 + c2[None, :]), mask=m2, other=0.0)
-    ga16, gb16 = tl.split(tl.reshape(g2, [BT, BP, 2]))
-    ga = _g_w(ga16)
-    gb = _g_w(gb16)
-    c = _g_w(tl.load(C + (t[:, None] * cs0 + b * cs1 + p[None, :] * cs2), mask=m, other=0.0))
-    s = _g_w(tl.load(S + (t[:, None] * ss0 + b * ss1 + p[None, :] * ss2), mask=m, other=0.0))
-    pp = _g_r16(_g_mul(ga, c))
-    q = _g_r16(_g_mul(_g_neg(ga), s))
-    r = _g_r16(_g_mul(gb, c))
-    u = _g_r16(_g_mul(gb, s))
-    ge = _g_r16(_g_add(pp, u))
-    gd = _g_r16(_g_add(q, r))
-    o2 = tl.reshape(tl.join(_g_n(_g_add(ge, 0.0)), _g_n(_g_add(gd, 0.0))), [BT, 2 * BP])
-    tl.store(GX + (tb * os0 + b64 * os1) + (i[:, None] * os0 + c2[None, :]), o2, mask=m2)
-
-
 # ================================================================================================ prefill kernel
 @triton.jit
 def _rope_interleaved_kernel(X, COS, SIN, Y, R, D2, s_x_r, s_y_r, s_c_t, s_c_b, s_s_t, s_s_b, B,
@@ -242,7 +180,7 @@ def _tab_st(t: torch.Tensor):
     return (int(t.stride(0)) if t.shape[0] != 1 else 0, int(t.stride(1)) if t.shape[1] != 1 else 0, int(t.stride(2)))
 
 
-TILE_T = max(SROPE_FWD_CFG[0], SROPE_BWD_CFG[0], ROPE_CFG[0])
+TILE_T = max(SROPE_FWD_CFG[0], SROPE_BWD_CFG[0])
 
 
 def _paired_ok(what: str, **ts) -> None:
@@ -349,80 +287,6 @@ def silu_rope_ref(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torc
     """``apply_rope_interleaved_ref(F.silu(x), cos, sin)`` in bf16."""
     c3, s3 = _tables(cos, sin, x, "silu_rope_ref")
     return apply_rope_interleaved_ref(F.silu(x), c3, s3)
-
-
-# ================================================================================================ rope_paired
-@torch.library.custom_op("neuronspark::hippo_rope_paired_fwd", mutates_args=(),
-                         schema="(Tensor x, Tensor cos, Tensor sin) -> Tensor")
-def _rope_fwd(x, cos, sin):
-    T, B, D = (int(v) for v in x.shape)
-    y = torch.empty_like(x)
-    _paired_ok("rope_paired", x=x, y=y)
-    bt, bp, nw = ROPE_CFG
-    _rope_fwdp_kernel[(triton.cdiv(T, bt), B, triton.cdiv(D // 2, bp))](
-        x, cos, sin, y, T, D // 2, int(x.stride(0)), int(x.stride(1)), *_tab_st(cos), *_tab_st(sin),
-        int(y.stride(0)), int(y.stride(1)), BT=bt, BP=bp, num_warps=nw, enable_fp_fusion=False)
-    return y
-
-
-@_rope_fwd.register_fake
-def _rope_fwd_fake(x, cos, sin):
-    return torch.empty_like(x)
-
-
-@torch.library.custom_op("neuronspark::hippo_rope_paired_bwd", mutates_args=(),
-                         schema="(Tensor gy, Tensor cos, Tensor sin) -> Tensor")
-def _rope_bwd(gy, cos, sin):
-    T, B, D = (int(v) for v in gy.shape)
-    gx = torch.empty((T, B, D), dtype=torch.bfloat16, device=gy.device)
-    _paired_ok("rope_paired backward", gy=gy, gx=gx)
-    bt, bp, nw = ROPE_CFG
-    _rope_bwdp_kernel[(triton.cdiv(T, bt), B, triton.cdiv(D // 2, bp))](
-        gy, cos, sin, gx, T, D // 2, int(gy.stride(0)), int(gy.stride(1)), *_tab_st(cos), *_tab_st(sin),
-        int(gx.stride(0)), int(gx.stride(1)), BT=bt, BP=bp, num_warps=nw, enable_fp_fusion=False)
-    return gx
-
-
-@_rope_bwd.register_fake
-def _rope_bwd_fake(gy, cos, sin):
-    return torch.empty(tuple(gy.shape), dtype=torch.bfloat16, device=gy.device)
-
-
-class RopePairedFn(torch.autograd.Function):
-    """rope(x) for a dense bf16 (T, B, C) x with channel stride 1; backward the bf16 gradient (contiguous)."""
-
-    @staticmethod
-    def forward(ctx, x, cos, sin):
-        ctx.set_materialize_grads(False)
-        ctx.save_for_backward(cos, sin)
-        ctx.xshape = tuple(int(v) for v in x.shape)
-        return _rope_fwd(x, cos, sin)
-
-    @staticmethod
-    def backward(ctx, gy):
-        if gy is None:
-            return None, None, None
-        cos, sin = ctx.saved_tensors
-        if gy.dtype != torch.bfloat16 or tuple(gy.shape) != ctx.xshape:
-            raise RuntimeError(f"neuronspark.rope_paired backward: gradient {gy.dtype} {tuple(gy.shape)} for "
-                               f"{ctx.xshape}")
-        return _rope_bwd(gy, cos, sin), None, None
-
-
-def rope_paired(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    """``rope(x)`` (interleaved layout) for a dense bf16 (T, B, C) CUDA ``x`` with channel stride 1 (the extra queries'
-    projections); ``cos`` / ``sin`` bf16 (T, C / 2) or (T|1, B|1, C / 2) tables (the last head's column slice).
-    Training regime."""
-    _check_x(x, "rope_paired")
-    if torch.empty_like(x).stride() != x.stride():
-        raise RuntimeError(f"neuronspark.rope_paired: x strides {tuple(x.stride())} are not preserved by empty_like")
-    c3, s3 = _tables(cos, sin, x, "rope_paired")
-    return RopePairedFn.apply(x, c3, s3)
-
-
-def rope_paired_ref(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-    c3, s3 = _tables(cos, sin, x, "rope_paired_ref")
-    return apply_rope_interleaved_ref(x, c3, s3)
 
 
 # ================================================================================================ rope_interleaved

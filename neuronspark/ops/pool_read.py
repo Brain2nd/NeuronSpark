@@ -17,7 +17,8 @@ shared by the layers); the memory is linear in T.
 
 Kernels (Gluon, Blackwell): the forward (:mod:`neuronspark.ops.gluon.pool_read_fwd`: online softmax over the key
 tiles, the output in bf16 and fp32 and the row log-sum-exp), then the backward (:mod:`neuronspark.ops.gluon.
-pool_read_bwd`): D = dO . O from the unrounded output, the values' gradient (key-major), the keys' gradient with the
+pool_read_bwd`): D = dO . O from the unrounded output (:func:`neuronspark.ops.triton.pool_pack.read_delta`), the
+values' gradient (key-major), the keys' gradient with the
 clock's column sums and the beta sums (key-major), the queries' gradient (query-major).  The clock gradient is
 ``-(column sums)``: the row sums of dS vanish (softmax is invariant to a shift of a row) and are not formed.  No
 atomics: the results do not depend on the scheduling.
@@ -38,8 +39,9 @@ from neuronspark.modules.induction import induction_window_matches
 from neuronspark.ops.gluon.pool_read_bwd import pool_read_dk_gluon, pool_read_dq_gluon, pool_read_dv_gluon
 from neuronspark.ops.gluon.pool_read_fwd import pool_read_fwd_gluon
 from neuronspark.ops.triton import require_cuda
+from neuronspark.ops.triton.pool_pack import read_delta
 
-__all__ = ["pool_read", "pool_read_ref", "PoolReadFn", "MAX_ORDER"]
+__all__ = ["pool_read", "pool_read_ref", "PoolReadFn", "read_backward", "MAX_ORDER", "NB"]
 
 MAX_ORDER = 4
 NB = MAX_ORDER + 1           # beta slots per head (slot n = order n; slot 0 unused)
@@ -77,15 +79,23 @@ class PoolReadFn(torch.autograd.Function):
         q16, k16, gv, cum_t, beta_slots, qtok, ktok, ktok_t, out32, lse = ctx.saved_tensors
         ordmask, scale, q_dtype, k_dtype = ctx.meta
         do16 = dout.to(torch.bfloat16).contiguous()
-        # D = sum_j P dP = dO . (P V) from the unrounded output (the bf16 output's rounding would bias every dS)
-        delta = (do16.float() * out32).sum(-1).permute(1, 2, 0).contiguous()               # (B, HQ, T)
-        qtok_t = _by_head_row(qtok.permute(1, 0, 2))
-        dgv = pool_read_dv_gluon(q16, k16, do16, lse, cum_t, qtok_t, ktok, beta_slots, ordmask, scale,
-                                 int(gv.shape[-1]))
-        dk, dcum, dslots = pool_read_dk_gluon(q16, k16, gv, do16, lse, delta, cum_t, qtok_t, ktok, beta_slots,
-                                              ordmask, scale)
-        dq = pool_read_dq_gluon(q16, k16, gv, do16, lse, delta, cum_t, ktok_t, qtok, beta_slots, ordmask, scale)
+        dq, dk, dgv, dcum, dslots = read_backward(do16, read_delta(do16, out32), q16, k16, gv, cum_t, beta_slots, qtok,
+                                                  ktok, ktok_t, lse, ordmask, scale)
         return dq.to(q_dtype), dk.to(k_dtype), dgv, dcum, dslots, None, None, None, None
+
+
+def read_backward(do16, delta, q16, k16, gv, cum_t, beta_slots, qtok, ktok, ktok_t, lse, ordmask: int, scale: float):
+    """The read's backward from the contiguous bf16 output gradient ``do16``, the row term ``delta`` (B, HQ, T) =
+    D = sum_j P dP = dO . (P V) formed from the unrounded output (the bf16 output's rounding would bias every dS) and
+    the forward's operands and results: (dq (T, B, HQ, dk) fp32, dk (T, B, H, dk) fp32, dgv (T, B, H, dv) bf16, dcum
+    (T, B, H) fp32, the beta-slot sums (H, NB) fp32)."""
+    qtok_t = _by_head_row(qtok.permute(1, 0, 2))
+    dgv = pool_read_dv_gluon(q16, k16, do16, lse, cum_t, qtok_t, ktok, beta_slots, ordmask, scale,
+                             int(gv.shape[-1]))
+    dk, dcum, dslots = pool_read_dk_gluon(q16, k16, gv, do16, lse, delta, cum_t, qtok_t, ktok, beta_slots,
+                                          ordmask, scale)
+    dq = pool_read_dq_gluon(q16, k16, gv, do16, lse, delta, cum_t, ktok_t, qtok, beta_slots, ordmask, scale)
+    return dq, dk, dgv, dcum, dslots
 
 
 def pool_read(q: torch.Tensor, k: torch.Tensor, gv: torch.Tensor, cum: torch.Tensor, beta: torch.Tensor,

@@ -67,6 +67,7 @@ import torch.nn.functional as F
 
 from neuronspark.modules.linear import Linear
 from neuronspark.modules.plif import forked_rng, linear_init, rows_rmsnorm
+from neuronspark.ops.linear import stacked_bands, stacked_inference_weight
 from neuronspark.utils.cache import WeightConstants
 from neuronspark.utils.precision import regime_product
 
@@ -130,6 +131,7 @@ class PKMMixin:
         self.register_buffer("pkm_launch_entropy", torch.zeros((), **scalar))
         self._pkm_ready = False
         self._pkm_step_constants = WeightConstants()          # the decode step's constants, per weight version
+        self._pkm_step_stack = WeightConstants()              # the decode step's stacked projections of x_hat
 
     # ------------------------------------------------------------------------------------------------ readiness
     @property
@@ -250,8 +252,10 @@ class PKMMixin:
         self._require_pkm_ready()
         o = self._ops
         B = int(xb.shape[0])
-        q = o.linear(xb, self.pkm_q.weight)
-        glog = o.linear(xb, self.pkm_g.weight)
+        # the two projections of x_hat as one product over their stacked weights (kept per weight version)
+        sources = (self.pkm_q.weight, self.pkm_g.weight)
+        stack = self._pkm_step_stack.get(sources, lambda: (stacked_inference_weight(sources),))[0]
+        q, glog = stacked_bands(o.linear(xb, stack), sources)
         kh, gains, norm_gain = self._pkm_constants()    # unit sub-keys, score gains, ZCN gain: per weight version
         sc, w, u, ii, jj = o.pkm_topk_softmax_t1(o.pkm_scores_step(q, kh), gains, self.pkm_k)
         r = o.pkm_value_step(w.reshape(B, -1), u.reshape(B, -1), self.pkm_values, norm_gain, glog, PKM_EPS)

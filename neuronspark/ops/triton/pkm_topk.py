@@ -1,10 +1,11 @@
-"""PKM product-key top-k: the 16 best of the 128 x 128 product slots of every (token, head) row.
+"""PKM product-key top-k: the 16 best of the n x n product slots of every (token, head) row (n = 128 in the default
+configuration).
 
-For each row (t, b, h) with half-query scores s1, s2 (n = 128 each, fp32):
+For each row (t, b, h) with half-query scores s1, s2 (n each, fp32):
 
     t1, i1 = topk(s1, 16);  t2, i2 = topk(s2, 16)               (largest, sorted)
     cand   = (t1[:, None] + t2[None, :]).flatten()               256 fp32 sums (one rounding each)
-    sc, j  = topk(cand, 16);  ii = i1[j // 16];  jj = i2[j % 16];  u = ii * 128 + jj
+    sc, j  = topk(cand, 16);  ii = i1[j // 16];  jj = i2[j % 16];  u = ii * n + jj
 
 where the selection follows torch.topk's semantics (PyTorch 2.9.1, CUDA): the selected set is the 16 largest
 elements in the radix order of ``TopKTypeConfig<float>`` (an order of the bit patterns: -0 below +0, every NaN above
@@ -15,7 +16,7 @@ index).  No floating-point reduction is involved in the selection; the only arit
 
 Operators (regime: public function -> what runs):
 
-* train   :func:`pkm_topk_train` (s (T, B, H, 2, 128) fp32, any strides) -> :class:`PKMTopKFn`.  Forward: custom op
+* train   :func:`pkm_topk_train` (s (T, B, H, 2, n) fp32, any strides) -> :class:`PKMTopKFn`.  Forward: custom op
   ``neuronspark::pkm_topk_train_fwd``, 4 rows per program, 2 warps: composite int64 keys (radix key << 32 |
   (n - 1 - index)) through tl.topk give the selected set, a tl.sort the slot order, then the network compare-swap by
   compare-swap on the slot arrays.  The candidate top-k is taken over the 50 non-dominated pairs (i, j) with
@@ -23,7 +24,7 @@ Operators (regime: public function -> what runs):
   or above it by value and before it by index); a program with a non-finite or -0 half value runs all 256.
   Backward: custom op ``neuronspark::pkm_topk_train_bwd``, 2 rows per program, 2 warps: g_t1[a] / g_t2[c] = the sums
   of g_sc over the selected candidates of row a / column c (masked (BR, 16, 16) sums: fp32 reduction-order class
-  against autograd's), the (2, 128) gradient row zero-filled, then the 16 + 16 sums scatter-stored at i1 / i2 (each
+  against autograd's), the (2, n) gradient row zero-filled, then the 16 + 16 sums scatter-stored at i1 / i2 (each
   value ``sum + 0.0``, every other slot +0.0).
 * prefill :func:`pkm_topk_prefill` (s1, s2 (T, B, H, n) fp32 with unit inner stride): custom op
   ``neuronspark::pkm_topk_prefill``, one program per row with both halves batched as (2, n), 1 warp.  Each half's top-16
@@ -37,8 +38,13 @@ Operators (regime: public function -> what runs):
   16 selected scores (max, libdevice exp, 16-term sum, division: the sum is the only reordered arithmetic) in one
   kernel, 4 warps.  :func:`pkm_beta_table` forms the gain table.
 
-Outputs: sc (and the decode weights) fp32, u / ii / jj int64, each (..., 16) contiguous.  The prefill and decode
-kernels accept n in {16, 32, 64, 128, 256}; training is n = 128 only.  Tests: the per-operator tolerance rule of
+Outputs: sc (and the decode weights) fp32, u / ii / jj int64, each (..., 16) contiguous.
+
+Sub-key counts.  The kernels work on rows of a power-of-two width: training 16 <= n <= 128, prefill and decode
+16 <= n <= 256.  A count that is not a power of two (112 sub-keys) is loaded into the next power-of-two width with
+-inf in the lanes from n on.  Such a lane is never selected: it compares equal to a real -inf at most, torch's order
+among equal keys is the index order, the padding has the largest indices, and a row has at least 16 real lanes.  A
+power-of-two count compiles the unmasked load.  Tests: the per-operator tolerance rule of
 :mod:`neuronspark.utils.testing`.
 
 Pure-torch references (same signatures): :func:`pkm_topk_train_ref`, :func:`pkm_topk_prefill_ref`,
@@ -71,7 +77,7 @@ __all__ = [
 
 # ================================================================================================ fixed constants
 # Shapes of the default configuration and the launch configuration of the training and inference operators.
-#: sub-keys per half (n) and slots selected per head (k)
+#: sub-keys per half (n) of the default configuration = the training kernel's largest n; slots selected per head (k)
 N_SUB = 128
 TOPK = 16
 #: training forward: rows (t, b, h) per program, warps; the pruned candidate table (50 pairs, padded to 64 slots)
@@ -86,7 +92,7 @@ BWD_WARPS = 2
 PREFILL_WARPS = 1
 #: decode kernel (scaled top-k + softmax): one row per program, 4 warps
 DECODE_WARPS = 4
-#: half widths supported by the prefill / decode exact kernels
+#: row widths of the prefill / decode exact kernels (n is padded to the next of them)
 EXACT_N = (16, 32, 64, 128, 256)
 
 # documented first-call cache: the (64,) int32 pruned-pair table per device (built eagerly on the first call)
@@ -115,8 +121,8 @@ def _check_train(s: torch.Tensor, k: int) -> None:
     require_cuda(s, "pkm_topk_train")
     _need(s.dtype == torch.float32 and s.dim() == 5 and int(s.shape[3]) == 2,
           f"s must be an fp32 (T, B, H, 2, n) tensor, got {tuple(s.shape)} {s.dtype}")
-    _need(int(s.shape[4]) == N_SUB and int(k) == TOPK,
-          f"the training kernel covers n = {N_SUB}, k = {TOPK}, got n = {int(s.shape[4])}, k = {int(k)}")
+    _need(TOPK <= int(s.shape[4]) <= N_SUB and int(k) == TOPK,
+          f"the training kernel covers {TOPK} <= n <= {N_SUB}, k = {TOPK}, got n = {int(s.shape[4])}, k = {int(k)}")
     T, B, H = int(s.shape[0]), int(s.shape[1]), int(s.shape[2])
     _need(T * B * H < 2 ** 31 // TOPK, "too many rows")
 
@@ -124,7 +130,7 @@ def _check_train(s: torch.Tensor, k: int) -> None:
 def _topk_train_fwd(s: torch.Tensor):
     """(sc, u, ii, jj, i1, i2, j), each (T, B, H, 16) contiguous: the outputs and the backward's indices."""
     _check_train(s, TOPK)
-    T, B, H = int(s.shape[0]), int(s.shape[1]), int(s.shape[2])
+    T, B, H, n = int(s.shape[0]), int(s.shape[1]), int(s.shape[2]), int(s.shape[4])
     R = T * B * H
     dev = s.device
     sc = torch.empty((T, B, H, TOPK), dtype=torch.float32, device=dev)
@@ -134,7 +140,8 @@ def _topk_train_fwd(s: torch.Tensor):
     if R:
         _pkm_topk_kernel[(triton.cdiv(R, TRAIN_ROWS),)](
             s, sc, u, ii, jj, i1, i2, j, R, B, H, st[0], st[1], st[2], st[3], st[4], _pix(dev),
-            NL=N_SUB, KK=TOPK, BR=TRAIN_ROWS, ND=nd, NP=PRUNE_SLOTS, num_warps=TRAIN_WARPS, enable_fp_fusion=False)
+            NL=triton.next_power_of_2(n), NR=n, KK=TOPK, BR=TRAIN_ROWS, ND=nd, NP=PRUNE_SLOTS,
+            num_warps=TRAIN_WARPS, enable_fp_fusion=False)
     return sc, u, ii, jj, i1, i2, j
 
 
@@ -142,7 +149,7 @@ def _topk_train_bwd(g_sc: torch.Tensor, i1: torch.Tensor, i2: torch.Tensor, j: t
                     s_shape: Tuple[int, ...]) -> torch.Tensor:
     """The (T, B, H, 2, n) fp32 contiguous gradient of s from the gradient of sc."""
     T, B, H, two, n = (int(v) for v in s_shape)
-    _need(two == 2 and n == N_SUB and tuple(g_sc.shape) == (T, B, H, TOPK) and g_sc.dtype == torch.float32,
+    _need(two == 2 and TOPK <= n <= N_SUB and tuple(g_sc.shape) == (T, B, H, TOPK) and g_sc.dtype == torch.float32,
           f"backward shapes {tuple(s_shape)} / {tuple(g_sc.shape)} {g_sc.dtype} outside the kernel's scope")
     R = T * B * H
     g2 = g_sc.reshape(R, TOPK)
@@ -153,7 +160,7 @@ def _topk_train_bwd(g_sc: torch.Tensor, i1: torch.Tensor, i2: torch.Tensor, j: t
     if R:
         _pkm_topk_bwd3_kernel[(triton.cdiv(R, BWD_ROWS),)](
             g2, j2, a2, b2, out, R, g2.stride(0), j2.stride(0), a2.stride(0), b2.stride(0),
-            NL=N_SUB, KK=TOPK, BR=BWD_ROWS, num_warps=BWD_WARPS)
+            NL=n, NZ=triton.next_power_of_2(2 * n), KK=TOPK, BR=BWD_ROWS, num_warps=BWD_WARPS)
     return out
 
 
@@ -200,8 +207,8 @@ class PKMTopKFn(torch.autograd.Function):
 
 
 def pkm_topk_train(s: torch.Tensor, k: int = TOPK) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """(sc fp32, u, ii, jj int64), each (T, B, H, 16) contiguous, from the scaled half scores ``s`` (T, B, H, 2, 128)
-    fp32 (any strides); differentiable in ``s`` through ``sc``."""
+    """(sc fp32, u, ii, jj int64), each (T, B, H, 16) contiguous, from the scaled half scores ``s`` (T, B, H, 2, n)
+    fp32 (any strides; 16 <= n <= 128); differentiable in ``s`` through ``sc``."""
     _check_train(s, k)
     if torch.is_grad_enabled() and s.requires_grad:
         return PKMTopKFn.apply(s, int(k))
@@ -214,13 +221,13 @@ def _exact_supported(s1: torch.Tensor, s2: torch.Tensor, k: int) -> bool:
     n = int(s1.shape[-1]) if s1.dim() else 0
     return (s1.dim() == 4 and s2.dim() == 4 and tuple(s1.shape) == tuple(s2.shape) and int(s1.shape[0]) >= 1
             and s1.is_cuda and s2.is_cuda and s1.device == s2.device and s1.dtype == torch.float32
-            and s2.dtype == torch.float32 and int(k) == TOPK and n in EXACT_N)
+            and s2.dtype == torch.float32 and int(k) == TOPK and TOPK <= n <= EXACT_N[-1])
 
 
 def _topk_prefill(s1: torch.Tensor, s2: torch.Tensor, k: int):
     _need(_exact_supported(s1, s2, k),
           f"prefill top-k: unsupported operands {tuple(s1.shape)} {s1.dtype} / {tuple(s2.shape)} {s2.dtype}, k {k} "
-          f"(CUDA fp32 (T, B, H, n) halves of one shape, n in {EXACT_N}, k = {TOPK})")
+          f"(CUDA fp32 (T, B, H, n) halves of one shape, {TOPK} <= n <= {EXACT_N[-1]}, k = {TOPK})")
     T, B, H, n = (int(v) for v in s1.shape)
     if s1.stride(-1) != 1:
         s1 = s1.contiguous()
@@ -236,7 +243,7 @@ def _topk_prefill(s1: torch.Tensor, s2: torch.Tensor, k: int):
     if R:
         _product_topk_prefill_kernel[(R,)](
             s1, s2, sc, u, ii, jj, _pix(dev), s1.stride(0), s1.stride(1), s1.stride(2), s2.stride(0), s2.stride(1),
-            s2.stride(2), B, H, n, N=n, num_warps=PREFILL_WARPS)
+            s2.stride(2), B, H, n, N=triton.next_power_of_2(n), PAD=bool(n & (n - 1)), num_warps=PREFILL_WARPS)
     return sc, u, ii, jj
 
 
@@ -268,7 +275,8 @@ def _topk_softmax_t1(s_raw: torch.Tensor, beta: torch.Tensor, k: int):
     _need(two == 2 and s_raw.dtype == torch.float32 and s_raw.stride(3) == 1,
           f"s_raw must be fp32 (B, H, 2, n) with unit inner stride, got {tuple(s_raw.shape)} {s_raw.dtype} "
           f"{tuple(s_raw.stride())}")
-    _need(int(k) == TOPK and n in EXACT_N, f"k {k} / n {n} outside the kernel (k = {TOPK}, n in {EXACT_N})")
+    _need(int(k) == TOPK and TOPK <= n <= EXACT_N[-1],
+          f"k {k} / n {n} outside the kernel (k = {TOPK}, {TOPK} <= n <= {EXACT_N[-1]})")
     _need(tuple(beta.shape) == (H, 2) and beta.dtype == torch.float32 and beta.is_contiguous()
           and beta.device == s_raw.device, f"beta must be a contiguous fp32 ({H}, 2) tensor, got {tuple(beta.shape)}")
     shp = (B, H, TOPK)
@@ -280,7 +288,8 @@ def _topk_softmax_t1(s_raw: torch.Tensor, beta: torch.Tensor, k: int):
     jj = torch.empty(shp, dtype=torch.int64, device=dev)
     if B * H:
         _pkm_topk_sm_kernel[(B * H,)](s_raw, beta, sc, w, u, ii, jj, _pix(dev), s_raw.stride(0), s_raw.stride(1),
-                                      s_raw.stride(2), H, n, N=n, num_warps=DECODE_WARPS)
+                                      s_raw.stride(2), H, n, N=triton.next_power_of_2(n), PAD=bool(n & (n - 1)),
+                                      num_warps=DECODE_WARPS)
     return sc, w, u, ii, jj
 
 
@@ -463,10 +472,11 @@ def _pk_sorted16(kbits, vidx, KK: tl.constexpr, BR: tl.constexpr, ND: tl.constex
 
 @triton.jit
 def _pkm_topk_kernel(S, SC, U, II, JJ, I1, I2, JO, R, B, H, s_t, s_b, s_h, s_a, s_n, PIX,
-                     NL: tl.constexpr, KK: tl.constexpr, BR: tl.constexpr, ND: tl.constexpr,
+                     NL: tl.constexpr, NR: tl.constexpr, KK: tl.constexpr, BR: tl.constexpr, ND: tl.constexpr,
                      NP: tl.constexpr = 64):
     """BR rows (t, b, h) of s: the half top-16s, the pruned candidate top-16 (all 256 candidates in a program with a
-    non-finite or -0 half value), the gathers and u; also the backward's i1 / i2 / j."""
+    non-finite or -0 half value), the gathers and u; also the backward's i1 / i2 / j.  NR = n sub-keys per half in
+    rows of NL = next_power_of_2(n) lanes (the lanes from NR on hold -inf)."""
     pid = tl.program_id(0)
     rows = pid * BR + tl.arange(0, BR)
     rmask = rows < R
@@ -477,8 +487,13 @@ def _pkm_topk_kernel(S, SC, U, II, JJ, I1, I2, JO, R, B, H, s_t, s_b, s_h, s_a, 
     base = t.to(tl.int64) * s_t + b.to(tl.int64) * s_b + h.to(tl.int64) * s_h          # (BR,)
     col = tl.arange(0, NL)
     # ---- the two half top-ks
-    x1 = tl.load(S + base[:, None] + col[None, :].to(tl.int64) * s_n)                  # (BR, NL) fp32
-    x2 = tl.load(S + base[:, None] + s_a + col[None, :].to(tl.int64) * s_n)
+    if NR == NL:
+        x1 = tl.load(S + base[:, None] + col[None, :].to(tl.int64) * s_n)              # (BR, NL) fp32
+        x2 = tl.load(S + base[:, None] + s_a + col[None, :].to(tl.int64) * s_n)
+    else:
+        real = tl.broadcast_to((col < NR)[None, :], (BR, NL))
+        x1 = tl.load(S + base[:, None] + col[None, :].to(tl.int64) * s_n, mask=real, other=float("-inf"))
+        x2 = tl.load(S + base[:, None] + s_a + col[None, :].to(tl.int64) * s_n, mask=real, other=float("-inf"))
     o1 = _pk_slot_order(_pk_skey(x1.to(tl.int32, bitcast=True)), NL, KK, BR)            # (BR, KK) indices
     o2 = _pk_slot_order(_pk_skey(x2.to(tl.int32, bitcast=True)), NL, KK, BR)
     g1 = tl.load(S + base[:, None] + o1.to(tl.int64) * s_n)                             # slot-order values
@@ -518,7 +533,7 @@ def _pkm_topk_kernel(S, SC, U, II, JJ, I1, I2, JO, R, B, H, s_t, s_b, s_h, s_a, 
     oo = rr.to(tl.int64)[:, None] * KK + tl.arange(0, KK)[None, :]
     om = rmask[:, None]
     tl.store(SC + oo, scb.to(tl.float32, bitcast=True), mask=om)
-    tl.store(U + oo, iia * NL + jja, mask=om)
+    tl.store(U + oo, iia * NR + jja, mask=om)
     tl.store(II + oo, iia, mask=om)
     tl.store(JJ + oo, jja, mask=om)
     tl.store(I1 + oo, ti1.to(tl.int64), mask=om)
@@ -527,11 +542,12 @@ def _pkm_topk_kernel(S, SC, U, II, JJ, I1, I2, JO, R, B, H, s_t, s_b, s_h, s_a, 
 
 
 @triton.jit
-def _pkm_topk_bwd3_kernel(GSC, J, I1, I2, OUT, R, gss, js, i1s, i2s, NL: tl.constexpr, KK: tl.constexpr,
-                          BR: tl.constexpr):
-    """Rows r of (T, B, H): the (2, NL) output row zero-filled, then OUT[r, 0, i1[a]] = g_t1[a] + 0,
-    OUT[r, 1, i2[a]] = g_t2[a] + 0 (scatter stores at distinct slots, after a CTA barrier); g_t1[a] / g_t2[c] = the
-    masked (BR, KK, KK) row sums of g_sc over the candidates j with j // KK == a / j % KK == c."""
+def _pkm_topk_bwd3_kernel(GSC, J, I1, I2, OUT, R, gss, js, i1s, i2s, NL: tl.constexpr, NZ: tl.constexpr,
+                          KK: tl.constexpr, BR: tl.constexpr):
+    """Rows r of (T, B, H): the (2, NL) output row zero-filled (the first 2 NL of NZ = next_power_of_2(2 NL) lanes),
+    then OUT[r, 0, i1[a]] = g_t1[a] + 0, OUT[r, 1, i2[a]] = g_t2[a] + 0 (scatter stores at distinct slots, after a
+    CTA barrier); g_t1[a] / g_t2[c] = the masked (BR, KK, KK) row sums of g_sc over the candidates j with
+    j // KK == a / j % KK == c."""
     rr = (tl.program_id(0) * BR + tl.arange(0, BR)).to(tl.int64)
     rm = rr < R
     q = tl.arange(0, KK)
@@ -545,9 +561,13 @@ def _pkm_topk_bwd3_kernel(GSC, J, I1, I2, OUT, R, gss, js, i1s, i2s, NL: tl.cons
     gt2 = tl.sum(tl.where(jc[:, None, :] == a[None, :, None], g[:, None, :], 0.0), axis=2)
     i1v = tl.load(I1 + rr[:, None] * i1s + a[None, :], mask=m2, other=0).to(tl.int32)     # slot of half-row a
     i2v = tl.load(I2 + rr[:, None] * i2s + a[None, :], mask=m2, other=0).to(tl.int32)
-    p = tl.arange(0, 2 * NL)
+    p = tl.arange(0, NZ)
     ob = rr[:, None] * (2 * NL)
-    tl.store(OUT + (ob + p[None, :]), tl.zeros([BR, 2 * NL], dtype=tl.float32), mask=m2)   # +0.0 everywhere
+    if NZ == 2 * NL:
+        zm = m2
+    else:
+        zm = m2 & (p[None, :] < 2 * NL)
+    tl.store(OUT + (ob + p[None, :]), tl.zeros([BR, NZ], dtype=tl.float32), mask=zm)       # +0.0 everywhere
     tl.debug_barrier()
     tl.store(OUT + (ob + i1v), gt1 + 0.0, mask=m2)
     tl.store(OUT + (ob + NL + i2v), gt2 + 0.0, mask=m2)
@@ -732,8 +752,9 @@ def _product16(x, hb, beta, PIX, N: tl.constexpr, HAS_BETA: tl.constexpr):
 
 @triton.jit
 def _product_topk_prefill_kernel(S1, S2, SC, U, II, JJ, PIX, s1_t, s1_b, s1_h, s2_t, s2_b, s2_h, B, H, n_sub,
-                                 N: tl.constexpr):
-    # the product top-k of one (t, b, h) row, the two halves as a (2, N) batch
+                                 N: tl.constexpr, PAD: tl.constexpr):
+    # the product top-k of one (t, b, h) row, the two halves as a (2, N) batch (PAD: n_sub < N, the lanes from
+    # n_sub on hold -inf)
     row = tl.program_id(0)
     h = row % H
     b = (row // H) % B
@@ -743,7 +764,10 @@ def _product_topk_prefill_kernel(S1, S2, SC, U, II, JJ, PIX, s1_t, s1_b, s1_h, s
     base1 = S1 + t * s1_t + b * s1_b + h * s1_h
     base2 = S2 + t * s2_t + b * s2_b + h * s2_h
     hb = tl.where(half == 0, base1, base2)                                # (2, 1)
-    x = tl.load(hb + offs[None, :])                                       # (2, N): row 0 = s1, row 1 = s2
+    if PAD:
+        x = tl.load(hb + offs[None, :], mask=tl.broadcast_to((offs < n_sub)[None, :], (2, N)), other=float("-inf"))
+    else:
+        x = tl.load(hb + offs[None, :])                                   # (2, N): row 0 = s1, row 1 = s2
     sc, ii, jj = _product16(x, hb, x, PIX, N, False)
     ii64 = ii.to(tl.int64)
     jj64 = jj.to(tl.int64)
@@ -755,19 +779,24 @@ def _product_topk_prefill_kernel(S1, S2, SC, U, II, JJ, PIX, s1_t, s1_b, s1_h, s
 
 
 @triton.jit
-def _pkm_topk_sm_kernel(S, BETA, SC, W, U, II, JJ, PIX, s_b, s_h, s_a, H, n_sub, N: tl.constexpr):
+def _pkm_topk_sm_kernel(S, BETA, SC, W, U, II, JJ, PIX, s_b, s_h, s_a, H, n_sub, N: tl.constexpr,
+                        PAD: tl.constexpr):
     """_product_topk_prefill_kernel for one (b, h) row of the raw (B, H, 2, N) scores: the two halves scaled by
     beta[h, a] at the load (the `s * beta` fp32 multiply of the PKM read), the exact half / product top-16s, and the
-    softmax of the 16 selected scores (fp32: max, libdevice exp, sum, division)"""
+    softmax of the 16 selected scores (fp32: max, libdevice exp, sum, division); PAD as in the prefill kernel"""
     row = tl.program_id(0)
     h = row % H
     b = row // H
     offs = tl.arange(0, N)
     half = tl.arange(0, 2)[:, None]
     hb = S + b * s_b + h * s_h + half * s_a                                  # (2, 1): row 0 = half 0, row 1 = half 1
-    x = tl.load(hb + offs[None, :])                                          # (2, N)
     beta = tl.load(BETA + h * 2 + half)                                      # (2, 1) fp32
-    x = x * beta
+    if PAD:
+        real = tl.broadcast_to((offs < n_sub)[None, :], (2, N))
+        x = tl.where(real, tl.load(hb + offs[None, :], mask=real, other=0.0) * beta, float("-inf"))
+    else:
+        x = tl.load(hb + offs[None, :])                                      # (2, N)
+        x = x * beta
     sc, ii, jj = _product16(x, hb, beta, PIX, N, True)
     ii64 = ii.to(tl.int64)
     jj64 = jj.to(tl.int64)

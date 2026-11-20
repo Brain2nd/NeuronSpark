@@ -6,7 +6,9 @@
 
 ``z`` is the spike output of the layer's ``input_neuron2`` (fp32).  Every projection is the fp32-weight-gradient linear
 op (bf16 operands, fp32 accumulation, bf16 output).  The two neurons carry their own membranes in an inference call
-(``gate_state`` / ``up_state``, the ``ffn_gate`` / ``ffn_up`` entries of the layer's ``HippocampalState``).
+(``gate_state`` / ``up_state``, the ``ffn_gate`` / ``ffn_up`` entries of the layer's ``HippocampalState``).  A
+single-token inference call (the decode step) multiplies z once, by the stacked bf16 weights of gate_proj, up_proj and
+skip_proj (:func:`neuronspark.ops.linear.stacked_inference_weight`).
 
 Launch (``init="launch"``, global RNG stream, in this order): the four projections' PyTorch default draws, the gate
 neuron's and the up neuron's draws, then gate_proj / up_proj Xavier-uniform, down_proj N(0, out_std), skip_proj 0.
@@ -21,7 +23,8 @@ import torch.nn as nn
 from neuronspark.modules.linear import Linear
 from neuronspark.modules.plif import PLIFNeuron, check_init, linear_init
 from neuronspark.ops import namespace
-from neuronspark.utils.cache import PLIFState
+from neuronspark.ops.linear import stacked_bands, stacked_inference_weight
+from neuronspark.utils.cache import PLIFState, WeightConstants
 
 __all__ = ["SpikingFFN"]
 
@@ -38,6 +41,7 @@ class SpikingFFN(nn.Module):
         self.D, self.D_ff = int(D), int(D_ff)
         self.impl = impl
         self._ops = namespace(impl)
+        self._step_stack = WeightConstants()                  # the decode step's stacked projections of z
         li = linear_init(init)
         self.gate_proj = Linear(self.D, self.D_ff, device=device, dtype=dtype, init=li)
         self.up_proj = Linear(self.D, self.D_ff, device=device, dtype=dtype, init=li)
@@ -61,6 +65,15 @@ class SpikingFFN(nn.Module):
         if (gate_state is None) != (up_state is None):
             raise RuntimeError("SpikingFFN: pass both neuron states (inference) or neither (whole row)")
         lin = self._ops.linear
+        if gate_state is not None and probe is None and int(z.shape[0]) == 1:
+            # one decode token: the three projections of z as one product over their stacked weights, kept per
+            # weight version; each result is a column band of the product
+            sources = (self.gate_proj.weight, self.up_proj.weight, self.skip_proj.weight)
+            stack = self._step_stack.get(sources, lambda: (stacked_inference_weight(sources),))[0]
+            zg, zu, zk = stacked_bands(lin(z, stack), sources)
+            g = self.gate_neuron(zg, gate_state, pos)
+            u = self.up_neuron(zu, up_state, pos)
+            return lin(g * u, self.down_proj.weight) + zk
         g = self.gate_neuron(lin(z, self.gate_proj.weight), gate_state, pos)
         u = self.up_neuron(lin(z, self.up_proj.weight), up_state, pos)
         if probe is not None:

@@ -27,7 +27,7 @@ the SM count of the GPU.  Launch constants: forward 8 warps, backward dx 4 warps
 num_stages 3.
 
 Contract (anything else raises): CUDA fp32 ``h`` of 3 axes with unit last stride and both row strides divisible by
-16, contiguous or the transposed view of a contiguous tensor; 512 < D <= 16384, D % 16 == 0; fewer than 2^31
+16, contiguous or the transposed view of a contiguous tensor; 512 <= D <= 16384, D % 16 == 0; fewer than 2^31
 elements; ``gain`` a contiguous fp32 (D,) tensor on h's device; the incoming hn gradient bf16 of h's shape with unit
 last stride; for ``dendritic_resid_norm`` ``upd`` bf16 of h's shape with unit last stride, dense.
 
@@ -487,8 +487,8 @@ def _check_input(h: torch.Tensor, gain: torch.Tensor, what: str) -> None:
     if S0 * S1 == 0 or h.stride(-1) != 1 or h.stride(0) % 16 or h.stride(1) % 16:
         raise RuntimeError(f"neuronspark.{what}: h must be non-empty with unit last stride and row strides divisible "
                            f"by 16, got shape {tuple(h.shape)} strides {tuple(h.stride())}")
-    if not 512 < D <= 16384 or D % 16:
-        raise RuntimeError(f"neuronspark.{what}: the feature width must satisfy 512 < D <= 16384 and D % 16 == 0, "
+    if not 512 <= D <= 16384 or D % 16:
+        raise RuntimeError(f"neuronspark.{what}: the feature width must satisfy 512 <= D <= 16384 and D % 16 == 0, "
                            f"got D={D}")
     if h.numel() >= 2 ** 31 or max(h.stride(0) * (S0 - 1), 0) + max(h.stride(1) * (S1 - 1), 0) + D > 2 ** 31:
         raise RuntimeError(f"neuronspark.{what}: h must span fewer than 2^31 elements")

@@ -606,11 +606,12 @@ class PoolAttentionMixin:
                     torch.stack([w.detach().to(torch.bfloat16) for w in self.pool_xq_b], dim=0).contiguous())
         return self._pool_step_constants.get(sources, build)
 
-    def _attention_step(self, h: torch.Tensor, z: torch.Tensor, ind, carry, st: HippocampalState, pos0: torch.Tensor,
-                        ptr0: torch.Tensor, W: int):
+    def _attention_step(self, h: torch.Tensor, hb: torch.Tensor, z: torch.Tensor, zb: torch.Tensor, ind, carry,
+                        st: HippocampalState, pos0: torch.Tensor, ptr0: torch.Tensor, W: int):
         """Single-token attention sub-block over the carried rings: (the bf16 output projection (1, B, D) before its
-        centring -- ``ops.read_gain_step`` centres it --, carry_out).  Every state write is in place (CUDA-graph
-        replay safe)."""
+        centring -- ``ops.read_gain_step`` centres it --, carry_out).  ``h`` / ``z`` (1, B, D) fp32: the stream after
+        the lexical read and its frozen norm; ``hb`` / ``zb`` (B, D): their bf16 roundings (the operands of the
+        projections).  Every state write is in place (CUDA-graph replay safe)."""
         o = self._ops
         lin = o.linear
         T, B, D = (int(s) for s in h.shape)
@@ -628,7 +629,6 @@ class PoolAttentionMixin:
                                    f"{None if carry is None else (tuple(carry.shape), carry.dtype)}")
             carry_in = carry[0]
         lam0, qgain, xq_gain, wbias, gains, rate, beta, xq_wb = self._step_constants()
-        zb = z[0].to(torch.bfloat16)                                   # (B, D): the operand of the projections of z
         gl = lin(o.centred_step(z[0], st.vr_sum, pos0, torch.bfloat16), self.pool_vr_gate)   # (B, H) bf16
         gate = self.gate_neuron(z, st.gate_neuron, pos0)                                      # (1, B, D) fp32 spikes
         # the ring write: conv step, SiLU, RoPE, unit keys and gained unit queries, value-residual mix and GLU tail,
@@ -654,4 +654,6 @@ class PoolAttentionMixin:
         xq_add = lin(lin(r_x, self.pool_xq_out_in), self.pool_xq_out)
         last = (H - 1) * dv
         attn = torch.cat([base[..., :last], base[..., last:] + xq_add], dim=-1)
-        return lin(self._out_norm_gate_infer(attn, h), self.attn_out_proj.weight), carry_out
+        gated = o.rmsnorm_gate_rows(attn, self.attn_out_norm.eps, self.attn_out_norm.weight,
+                                    lin(hb, self.attn_out_gate.weight).unsqueeze(0))
+        return lin(gated, self.attn_out_proj.weight), carry_out

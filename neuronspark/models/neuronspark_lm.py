@@ -334,6 +334,7 @@ class NeuronSparkModel(nn.Module):
             ind = induction_session_match(ids, ip.induction, ip.ring_ptr, W, cfg.hippocampal_induction_bias_orders,
                                           ops=o)
             copy = copy_stats_session(lex, ip.copy, ip.ring_ptr, ip.pos, W, tuple(cfg.lexical_order1_slice), ops=o)
+            lex = lex.to(torch.bfloat16)                 # the operand of every layer's lexical projections, cast once
             carry: Optional[torch.Tensor] = None
             for layer in self.layers:
                 if isinstance(layer, HippocampalLayer):

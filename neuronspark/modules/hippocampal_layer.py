@@ -16,7 +16,8 @@ One call, residual stream h (T, B, D) fp32:
 
 ``forward(h, *, lex, ind, copy, carry=None, inference_params=None, aux_out=None, calib=None) -> (h_out, carry)``:
 
-* ``lex`` (T, B, 160) fp32: the model-level lexical vector of this call;
+* ``lex`` (T, B, 160) fp32: the model-level lexical vector of this call (inference: fp32 or its bf16 rounding, the
+  operand of the layer's lexical projections);
 * ``ind``: whole row, the two (B, T, max order) int32 id windows of ``induction_token_windows``; an inference call,
   one bool (B, T, W) ring-match tensor per induction order;
 * ``copy``: the model-level copy-detector statistics ``(maximum, lse)``, each (T, B) fp32;
@@ -35,9 +36,11 @@ A ``neuronspark.utils.probe.HippocampalProbe`` attached to a layer (``layer.prob
 whole-row forward, the pool attention's decay and write gate, the copy arbitration's factors, the FFN neurons' spikes
 and the PKM read's slot weights; it changes nothing in the forward.
 
-A decode step (T == 1) runs steps 12 - 16 and 19 (the centring of the attention output, the copy confidence, the
-novelty, the read gain, the FFN norm and rho) as ``ops.read_gain_step`` and step 20 as ``ops.pkm_tail_step``, one
-kernel each; the layer's two copy constants (32 tau, the gate strength) are read from a per-weight-version cache.
+A decode step (T == 1) runs the lexical read after its projections with the frozen norm of its result as
+``ops.lex_read_step`` (the stream and its norm in fp32 and in bf16, the operands of the layer's projections), steps
+12 - 16 and 19 (the centring of the attention output, the copy confidence, the novelty, the read gain, the FFN norm
+and rho) as ``ops.read_gain_step`` and step 20 as ``ops.pkm_tail_step``, one kernel each; the layer's two copy
+constants (32 tau, the gate strength) are read from a per-weight-version cache.
 
 The forward must run inside a bf16 CUDA autocast region (``neuronspark.utils.precision.regime``), which selects the
 regime's TF32 setting as well; it raises otherwise.
@@ -224,10 +227,10 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
         T, B, _ = (int(s) for s in h.shape)
         self._check_copy(copy, T, B)
         pos0, ptr0, W = ip.pos, ip.ring_ptr, int(ip.max_seqlen)
+        if step:
+            return self._forward_step(h, lex, ind, copy, carry, st, pos0, ptr0, W)
         h = self._lexical_read_infer(h, lex)
         z = rows_rmsnorm(o, h, self.norm_eps, out_dtype=h.dtype)
-        if step:
-            return self._forward_step(h, z, ind, copy, carry, st, pos0, ptr0, W)
         r, carry_out = self._attention_prefill(h, z, ind, carry, st, pos0, ptr0, W)
         f, rho = self.copy_factors_prefill(copy, z, r)            # the same factors, one operator after the products
         with torch.autocast(h.device.type, enabled=False):
@@ -243,10 +246,14 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
             y = (y.float() * rho.unsqueeze(-1)).to(y.dtype)
         return h + (ffn + (y - y.mean(dim=-1, keepdim=True))), carry_out
 
-    def _forward_step(self, h, z, ind, copy, carry, st: HippocampalState, pos0, ptr0, W: int):
-        """The decode step after the lexical read and the frozen norm (h, z: (1, B, D) fp32)."""
+    def _forward_step(self, h, lex, ind, copy, carry, st: HippocampalState, pos0, ptr0, W: int):
+        """The decode step (h (1, B, D) fp32): the lexical read with the frozen norm of its result, the attention
+        sub-block, the residual read, the FFN and the PKM read."""
         o = self._ops
-        r, carry_out = self._attention_step(h, z, ind, carry, st, pos0, ptr0, W)
+        # the stream after the lexical read and its frozen norm, each in fp32 and in bf16 (the projections' operands)
+        h2, hb, z2, zb = self._lexical_read_step(h, lex, self.norm_eps)
+        h, z = h2.unsqueeze(0), z2.unsqueeze(0)
+        r, carry_out = self._attention_step(h, hb, z, zb, ind, carry, st, pos0, ptr0, W)
         sink, strength = self._copy_step_constants.get(
             (self.pkm_copy_tau, self.pkm_copy_strength),
             lambda: ((COPY_LOGIT_SCALE * self.pkm_copy_tau.float()).reshape(1),

@@ -375,6 +375,10 @@ _DECODE_STEP_SPECS: List[OpSpec] = [
     _op("pkm_value_step", _T + "pkm_step", "w u values gain glog eps",
         "(B, 768) bf16", "decode",
         doc="w (B, 64) fp32, u (B, 64) int64, values (16384, 768) fp32, gain (768,) fp32, glog (B, 768) bf16, eps 1e-6"),
+    _op("lex_read_step", _T + "lex_read_step", "h q_raw k_raw o q_gain k_gain beta eps eps_z",
+        "(h' (B, 1536) fp32, h' bf16, z (B, 1536) fp32 frozen norm of h', z bf16)", "decode",
+        doc="h (B, 1536) fp32, q_raw / k_raw (B, 64) bf16, o (B, 1536) bf16, q_gain / k_gain (64,) fp32, beta (1,) "
+            "fp32, eps = 1e-6, eps_z the frozen norm's eps"),
 ]
 for _decode_spec in _DECODE_STEP_SPECS:
     if _decode_spec.name in OPS:

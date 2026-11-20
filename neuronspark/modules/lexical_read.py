@@ -72,9 +72,9 @@ class LexicalReadMixin:
 
     def _check_lex(self, h: torch.Tensor, lex: torch.Tensor) -> None:
         if (not isinstance(lex, torch.Tensor) or tuple(lex.shape[:2]) != tuple(h.shape[:2])
-                or int(lex.shape[-1]) != self.lex_dim or lex.dtype != torch.float32):
+                or int(lex.shape[-1]) != self.lex_dim or lex.dtype not in (torch.float32, torch.bfloat16)):
             raise RuntimeError("lexical read: the hippocampal layer needs the model-level lexical vector of this call, "
-                               f"fp32 (T, B, {self.lex_dim}) for h {tuple(h.shape)}, got "
+                               f"fp32 (or its bf16 rounding) (T, B, {self.lex_dim}) for h {tuple(h.shape)}, got "
                                f"{None if not isinstance(lex, torch.Tensor) else (tuple(lex.shape), lex.dtype)}")
 
     def _lexical_gate(self, q_raw: torch.Tensor, k_raw: torch.Tensor) -> torch.Tensor:
@@ -108,3 +108,14 @@ class LexicalReadMixin:
         k_raw = o.linear(m_b, self.lex_k.weight)
         o_raw = o.linear(m_b, self.lex_o.weight)
         return o.lex_read_prefill(h, q_raw, k_raw, o_raw, self.lex_q_gain, self.lex_k_gain, self.lex_beta, LEX_EPS)
+
+    def _lexical_read_step(self, h: torch.Tensor, lex: torch.Tensor, norm_eps: float):
+        """Decode form (T == 1): the read and the frozen norm of its result in ``ops.lex_read_step`` -> (h' (B, D)
+        fp32, its bf16 rounding, z = rmsnorm(h') (B, D) fp32, its bf16 rounding)."""
+        self._check_lex(h, lex)
+        o = self._ops
+        hn = rows_rmsnorm(o, h[0], LEX_EPS, out_dtype=torch.bfloat16)       # the operand of the lex_q projection
+        m_in = lex[0].to(torch.bfloat16)                                    # the operand of the two projections of m
+        return o.lex_read_step(h[0], o.linear(hn, self.lex_q.weight), o.linear(m_in, self.lex_k.weight),
+                               o.linear(m_in, self.lex_o.weight), self.lex_q_gain, self.lex_k_gain, self.lex_beta,
+                               LEX_EPS, norm_eps)

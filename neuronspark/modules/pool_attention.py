@@ -461,10 +461,11 @@ class PoolAttentionMixin:
         T, B, D = (int(s) for s in h.shape)
         H, dk, dv = self.hippocampal_heads, self.hippocampal_head_dim, self.hippocampal_value_head_dim
         qtok, ktok = self._check_windows(ind, B, T)
-        # the layer input's norm is a (T, B, D) view of batch-major memory: one row-major copy serves every projection
-        zc = z.contiguous()
+        # the layer input's norm is an fp32 (T, B, D) view of batch-major memory: one row-major bf16 operand serves the
+        # six projections that read it (their gradients are summed in fp32)
+        z_qkv, z_glu_a, z_glu_b, z_decay, z_xq, z_psi = o.shared_operand(z, 6)
         # qkv projection (on the (T * B, D) view) and the causal short conv
-        qkv = lin(zc.view(T * B, D), self.qkv_proj.weight).view(T, B, -1)
+        qkv = lin(z_qkv.reshape(T * B, D), self.qkv_proj.weight).view(T, B, -1)
         qkv = o.short_conv_train(qkv, self.qkv_conv.weight)
         q, k, v = qkv.split([self.D_key, self.D_key, self.D_value], dim=-1)
         # value residual: the static mix plus the per-token, per-head gate (tanh of the projection of z minus the mean
@@ -472,7 +473,7 @@ class PoolAttentionMixin:
         if not self.value_residual_first:
             self._check_carry(carry, v)
         vr_gate = lin(o.centred_past(z.float()), self.pool_vr_gate)
-        gp = F.silu(lin(zc, self.pool_glu_a).float()) * lin(zc, self.pool_glu_b).float()
+        gp = F.silu(lin(z_glu_a, self.pool_glu_a).float()) * lin(z_glu_b, self.pool_glu_b).float()
         gv_add = lin(gp.to(z.dtype).contiguous(), self.pool_glu_u)
         v, v_act = o.value_residual(v, self.value_residual_lambda0(), vr_gate,
                                     None if self.value_residual_first else carry, gv_add)
@@ -487,12 +488,12 @@ class PoolAttentionMixin:
         gains = self.pool_bias_gains()
         qgain = self.pool_query_gain(q.dtype)
         wbias = self.pool_write_bias_total()
-        decay_logit = lin(zc.view(T * B, D), self.W_decay.weight).view(T, B, -1)
+        decay_logit = lin(z_decay.reshape(T * B, D), self.W_decay.weight).view(T, B, -1)
         rate = torch.exp(self.decay_A_log).to(decay_logit.dtype)
         cum = o.cumsum0(o.clock_increments(decay_logit, rate, gains[:H], self.hippocampal_base_decay, DECAY_FLOOR))
         # one operator for the layer's read: the head preparation (unit keys, gained unit queries, tagged values), the
         # last head's extra queries (its keys, tagged values, clock and induction term) and the pool read
-        xq, psi = self._extra_query_projections(zc)
+        xq, psi = self._extra_query_projections(z_xq, z_psi)
         attn, xreads, q_all, k_all = o.pool_attend(q, k, gate, v, qgain, wbias, self.write_sparsity, xq, psi,
                                                    self._xq_band(cos), self._xq_band(sin), cum, self.induction_beta(),
                                                    qtok, ktok, self.induction_orders, self.match_scale)
@@ -504,19 +505,21 @@ class PoolAttentionMixin:
                                    self.induction_orders, self.match_scale)
         if self.xq_count:                          # the last head's read plus its extra queries' addend
             attn = add_last_head(attn, lin(lin(xreads, self.pool_xq_out_in).contiguous(), self.pool_xq_out))
-        # zero-centred output norm x sigmoid gate (the gate reads h), output projection, centring
-        gate_logits = lin(h.reshape(T * B, D), self.attn_out_gate.weight).view(T, B, -1)
+        # zero-centred output norm x sigmoid gate (the gate reads h: its row-major bf16 operand), output projection,
+        # centring
+        (h_gate,) = o.shared_operand(h, 1)
+        gate_logits = lin(h_gate.reshape(T * B, D), self.attn_out_gate.weight).view(T, B, -1)
         attn = o.out_norm_gate(attn, self.attn_out_norm.weight, gate_logits, self.attn_out_norm.eps)
         return o.centre_rows(lin(attn, self.attn_out_proj.weight)), carry_out
 
-    def _extra_query_projections(self, zc):
+    def _extra_query_projections(self, z_xq, z_psi):
         """(the M bf16 (T, B, dk) rank-r projections of the last head's extra queries, their bf16 (T, B, M) log-gain
-        projection psi) of the whole row from the contiguous copy of z; ``ops.pool_attend`` forms the queries from
-        them."""
+        projection psi) of the whole row from two uses of z's bf16 operand; ``ops.pool_attend`` forms the queries
+        from them."""
         lin = self._ops.linear
         M, r = self.xq_count, self.xq_rank
-        u = lin(zc, self.pool_xq_a)
-        psi = lin(zc, self.pool_xq_gain_proj)
+        u = lin(z_xq, self.pool_xq_a)
+        psi = lin(z_psi, self.pool_xq_gain_proj)
         return tuple(lin(u[..., m * r:(m + 1) * r].contiguous(), self.pool_xq_b[m]) for m in range(M)), psi
 
     # ------------------------------------------------------------------------------------------------ prefill

@@ -168,6 +168,10 @@ _SPECS: List[OpSpec] = [
             "bf16, gain (6,) bf16 match gain, wbias (6,) fp32, sparsity 2.0, xq 4 x (T, B, 256) bf16 extra-query "
             "projections, psi (T, B, 4) bf16, cos / sin (T, 128) bf16 last-head RoPE band, then the operands of "
             "pool_read: the head preparation, the tagged values, the extra queries and the read"),
+    _op("shared_operand", _T + "shared_operand", "x uses",
+        "uses x (T, B, 1536) bf16 row-major: the bf16 operand of the projections that read x", "train",
+        doc="x (T, B, 1536) fp32 (any strides), uses the number of projections (1 .. 8); x's gradient is the fp32 "
+            "sum of the uses' bf16 gradients"),
     _op("clock_increments", _T + "pool_clock", "logit rate gains base floor",
         "(T, B, 6) fp32 = gains mean_c log(max(exp(-rate softplus(logit)) base, floor))", "train",
         doc="logit (T, B, 256) bf16 decay projection, rate (256,) bf16, gains (6,) fp32 eligibility slopes, base the "

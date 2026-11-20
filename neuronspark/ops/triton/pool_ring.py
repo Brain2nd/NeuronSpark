@@ -72,8 +72,8 @@ from neuronspark.ops.triton._ptx import (  # noqa: F401  (Triton resolves the he
 __all__ = [
     "RING2_QUERY_ROWS", "RING2_CONFIGS", "XQ_FORM_WARPS", "RING_WRITE_HEAD_DIM",
     "RING_WRITE_ROWS", "RING_WRITE_WARPS", "RECALL_BT", "RECALL_BT_SHORT", "RECALL_BW", "RECALL_WARPS",
-    "RECALL_STAGES", "RECALL_STATS_SPLIT", "RECALL_STATS_WARPS", "RECALL_STATS_STAGES", "RECALL_VALUE_WARPS", "RECALL_VALUE_STAGES",
-    "RECALL_VALUE_BDV",
+    "RECALL_STAGES", "RECALL_STATS_SPLIT", "RECALL_STATS_WARPS", "RECALL_STATS_WARPS_ONE_ROW", "RECALL_STATS_STAGES",
+    "RECALL_VALUE_WARPS", "RECALL_VALUE_STAGES", "RECALL_VALUE_BDV",
     "ring_read_t1", "ring_read_t1_ref",
     "xq_form_t1", "xq_form_t1_ref", "xq_weight_stack", "xq_head_gain",
     "ring_write_prefill", "ring_write_prefill_ref",
@@ -105,13 +105,15 @@ RECALL_BW = 128
 RECALL_WARPS = 8
 RECALL_STAGES = 1
 # prefill recall, two-launch form (T >= 64): statistics pass (its W slots split over gcd(RECALL_STATS_SPLIT, W / RECALL_BW)
-# programs), value pass, value columns per value program
+# programs; warps for a call of several rows / of one row, whose grid leaves SMs free), value pass, value columns per
+# value program
 RECALL_STATS_SPLIT = 4
 RECALL_STATS_WARPS = 4
+RECALL_STATS_WARPS_ONE_ROW = 8
 RECALL_STATS_STAGES = 1
 RECALL_VALUE_WARPS = 8
 RECALL_VALUE_STAGES = 1
-RECALL_VALUE_BDV = 256
+RECALL_VALUE_BDV = 128
 
 _OUT_TL = {torch.float32: tl.float32, torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
 
@@ -1137,7 +1139,7 @@ def _ring_recall_prefill_fwd(q4: torch.Tensor, k_ring: torch.Tensor, gv_ring: to
         _ring_stats_kernel[(nT, B * G, nsp)](
             *qs, *ks, *cs, p0, float(scale), T, W, G, int(hr), *inds, scr, mst, lst, vfl,
             XQ=bool(xq), DK=dk, BT=BT, BW=BW, N_IND=n_ind, NSPLIT=nsp,
-            num_warps=RECALL_STATS_WARPS, num_stages=RECALL_STATS_STAGES)
+            num_warps=RECALL_STATS_WARPS_ONE_ROW if B == 1 else RECALL_STATS_WARPS, num_stages=RECALL_STATS_STAGES)
         _ring_value_kernel[(nT, B * G, dv // RECALL_VALUE_BDV)](
             *gs, out, out.stride(0), out.stride(1), out.stride(2), T, W, G, int(hr), scr, mst, lst, vfl,
             XQ=bool(xq), DV=dv, BT=BT, BW=BW, OUT_DTYPE=_OUT_TL[out_dtype], BDV=RECALL_VALUE_BDV,

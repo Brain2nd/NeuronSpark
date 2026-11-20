@@ -608,8 +608,9 @@ class PoolAttentionMixin:
 
     def _attention_step(self, h: torch.Tensor, z: torch.Tensor, ind, carry, st: HippocampalState, pos0: torch.Tensor,
                         ptr0: torch.Tensor, W: int):
-        """Single-token attention sub-block over the carried rings: (r bf16 centred residual, carry_out).  Every
-        state write is in place (CUDA-graph replay safe)."""
+        """Single-token attention sub-block over the carried rings: (the bf16 output projection (1, B, D) before its
+        centring -- ``ops.read_gain_step`` centres it --, carry_out).  Every state write is in place (CUDA-graph
+        replay safe)."""
         o = self._ops
         lin = o.linear
         T, B, D = (int(s) for s in h.shape)
@@ -652,4 +653,4 @@ class PoolAttentionMixin:
         xq_add = lin(lin(r_x, self.pool_xq_out_in), self.pool_xq_out)
         last = (H - 1) * dv
         attn = torch.cat([base[..., :last], base[..., last:] + xq_add], dim=-1)
-        return self._out_proj_centred(self._out_norm_gate_infer(attn, h)), carry_out
+        return lin(self._out_norm_gate_infer(attn, h), self.attn_out_proj.weight), carry_out

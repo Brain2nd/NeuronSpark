@@ -35,6 +35,10 @@ A ``neuronspark.utils.probe.HippocampalProbe`` attached to a layer (``layer.prob
 whole-row forward, the pool attention's decay and write gate, the copy arbitration's factors, the FFN neurons' spikes
 and the PKM read's slot weights; it changes nothing in the forward.
 
+A decode step (T == 1) runs steps 12 - 16 and 19 (the centring of the attention output, the copy confidence, the
+novelty, the read gain, the FFN norm and rho) as ``ops.read_gain_step`` and step 20 as ``ops.pkm_tail_step``, one
+kernel each; the layer's two copy constants (32 tau, the gate strength) are read from a per-weight-version cache.
+
 The forward must run inside a bf16 CUDA autocast region (``neuronspark.utils.precision.regime``), which selects the
 regime's TF32 setting as well; it raises otherwise.
 
@@ -52,6 +56,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from neuronspark.modules.copy_detector import COPY_LOGIT_SCALE
 from neuronspark.modules.copy_gate import CopyGateMixin, NOVELTY_RMS_EPS
 from neuronspark.modules.lexical_read import LexicalReadMixin
 from neuronspark.modules.linear import Linear
@@ -62,7 +67,7 @@ from neuronspark.modules.pool_attention import PoolAttentionMixin
 from neuronspark.modules.spiking_ffn import SpikingFFN
 from neuronspark.ops import namespace
 from neuronspark.ops.triton.hippo_residual import PKM_TAIL_MIN_ROWS
-from neuronspark.utils.cache import InferenceParams, HippocampalState
+from neuronspark.utils.cache import InferenceParams, HippocampalState, WeightConstants
 
 __all__ = ["HippocampalLayer"]
 
@@ -118,6 +123,7 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
         self._build_copy_gate(config, device, dtype, init)
         self._build_induction_bias(config, device, dtype, init)
         self._build_pkm(config, self.layer_idx, device, dtype, init)
+        self._copy_step_constants = WeightConstants()         # (32 tau, gate strength) of the decode step
 
     # ------------------------------------------------------------------------------------------------ checkpoint
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys,
@@ -221,24 +227,38 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
         h = self._lexical_read_infer(h, lex)
         z = rows_rmsnorm(o, h, self.norm_eps, out_dtype=h.dtype)
         if step:
-            r, carry_out = self._attention_step(h, z, ind, carry, st, pos0, ptr0, W)
-            pi = self.copy_confidence(copy)
-            c = self.copy_novelty(z, r, lambda t: rows_rmsnorm(o, t, NOVELTY_RMS_EPS, out_dtype=torch.float32))
-            with torch.autocast(h.device.type, enabled=False):
-                f = self.read_gain_factor(pi, c)
-                rho = self.pkm_copy_rho(pi)
-        else:
-            r, carry_out = self._attention_prefill(h, z, ind, carry, st, pos0, ptr0, W)
-            f, rho = self.copy_factors_prefill(copy, z, r)        # the same factors, one operator after the products
+            return self._forward_step(h, z, ind, copy, carry, st, pos0, ptr0, W)
+        r, carry_out = self._attention_prefill(h, z, ind, carry, st, pos0, ptr0, W)
+        f, rho = self.copy_factors_prefill(copy, z, r)            # the same factors, one operator after the products
         with torch.autocast(h.device.type, enabled=False):
             h = o.read_gain_residual(h, r, f)
         x_hat = rows_rmsnorm(o, h, self.ffn_norm.eps, weight=self.ffn_norm.weight, out_dtype=h.dtype)
         # the spikes in bf16: their only consumers are the FFN's bf16 projections (the rounding of their input cast)
         zs = self.input_neuron2(x_hat, st.input_neuron2, pos0, out_dtype=torch.bfloat16)
         ffn = o.linear(self.snn_ffn(zs, st.ffn_gate, st.ffn_up, pos0), self.ffn_out_proj.weight)
-        y = self._pkm_read_step(x_hat) if step else self._pkm_read_prefill(x_hat)
+        y = self._pkm_read_prefill(x_hat)
         if T * B >= PKM_TAIL_MIN_ROWS:
             return o.pkm_tail(h, ffn, y, rho), carry_out
         with torch.autocast(h.device.type, enabled=False):
             y = (y.float() * rho.unsqueeze(-1)).to(y.dtype)
         return h + (ffn + (y - y.mean(dim=-1, keepdim=True))), carry_out
+
+    def _forward_step(self, h, z, ind, copy, carry, st: HippocampalState, pos0, ptr0, W: int):
+        """The decode step after the lexical read and the frozen norm (h, z: (1, B, D) fp32)."""
+        o = self._ops
+        r, carry_out = self._attention_step(h, z, ind, carry, st, pos0, ptr0, W)
+        sink, strength = self._copy_step_constants.get(
+            (self.pkm_copy_tau, self.pkm_copy_strength),
+            lambda: ((COPY_LOGIT_SCALE * self.pkm_copy_tau.float()).reshape(1),
+                     self.pkm_copy_strength.float().reshape(1)))
+        # the centring of r, the copy confidence, the novelty, the read gain, the residual addition, the FFN norm (fp32
+        # and its bf16 rounding, the operand of the PKM projections) and the PKM copy gate
+        h2, x_hat, xb, rho = o.read_gain_step(h[0], z[0], r[0], copy[0][0], copy[1][0], sink, strength,
+                                              self.copy_novelty_w, self.copy_novelty_v, self.copy_novelty_b,
+                                              self.ffn_norm.weight, self.read_copy_gain, COPY_LOGIT_SCALE,
+                                              NOVELTY_RMS_EPS, self.ffn_norm.eps)
+        # the spikes in bf16: their only consumers are the FFN's bf16 projections (the rounding of their input cast)
+        zs = self.input_neuron2(x_hat.unsqueeze(0), st.input_neuron2, pos0, out_dtype=torch.bfloat16)
+        ffn = o.linear(self.snn_ffn(zs, st.ffn_gate, st.ffn_up, pos0), self.ffn_out_proj.weight)
+        y = self._pkm_read_step(xb)
+        return o.pkm_tail_step(h2, ffn[0], y, rho).unsqueeze(0), carry_out

@@ -351,6 +351,20 @@ _DECODE_STEP_SPECS: List[OpSpec] = [
             "bf16 tables, pos (B,) int64, ring_ptr (1,) int64, gate (B, 1536) fp32 spikes, gl (B, 6) bf16, lam0 (1536,), "
             "carry (B, 1536) bf16 or None, ga / gb (B, 128) bf16, glu_u (256, 128), dlog (B, 256) bf16, rate (256,) "
             "bf16, base_decay, gains / qgain / wbias (6,), sparsity, the rings and the carried clocks"),
+    _op("read_gain_step", _T + "hippo_step",
+        "h z r cmax clse sink strength nov_w nov_v nov_b norm_weight kappa scale eps_r eps_n",
+        "(h' (B, 1536) fp32, x_hat (B, 1536) fp32, x_hat (B, 1536) bf16, rho (B,) fp32)", "decode",
+        doc="h, z (B, 1536) fp32, r (B, 1536) bf16 output projection, cmax / clse (B,) fp32, sink / strength (1,), "
+            "nov_w / nov_v (1536,), nov_b (1,), norm_weight (1536,), kappa 4.0, scale 32.0, eps 1e-6 / 1e-6"),
+    _op("pkm_tail_step", _T + "hippo_step", "h ffn y rho",
+        "(B, 1536) fp32", "decode",
+        doc="h (B, 1536) fp32, ffn / y (B, 1536) bf16, rho (B,) fp32"),
+    _op("pkm_scores_step", _T + "pkm_step", "q kh",
+        "(B, 4, 2, 128) fp32", "decode",
+        doc="q (B, 512) bf16 query projection, kh (4, 2, 128, 64) fp32 unit sub-keys"),
+    _op("pkm_value_step", _T + "pkm_step", "w u values gain glog eps",
+        "(B, 768) bf16", "decode",
+        doc="w (B, 64) fp32, u (B, 64) int64, values (16384, 768) fp32, gain (768,) fp32, glog (B, 768) bf16, eps 1e-6"),
 ]
 for _decode_spec in _DECODE_STEP_SPECS:
     if _decode_spec.name in OPS:

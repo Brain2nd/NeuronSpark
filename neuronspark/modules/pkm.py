@@ -23,8 +23,9 @@ Ops per regime:
   deterministic backward); torch normalisation / softmax / ZCN;
 * prefill (T >= 2): ``ops.pkm_topk_prefill`` (exact top-k) + torch softmax; ``ops.pkm_weighted_sum``;
   ``ops.rmsnorm_rows`` for the ZCN;
-* decode (T == 1): ``ops.pkm_topk_softmax_t1`` (the gain multiply, the exact top-k and the softmax in one kernel);
-  ``F.embedding`` + an fp32 einsum for the value sum; torch ZCN.
+* decode (T == 1): ``ops.pkm_scores_step`` (the unit half-queries and their cosines), ``ops.pkm_topk_softmax_t1``
+  (the gain multiply, the exact top-k and the softmax in one kernel), ``ops.pkm_value_step`` (the weighted value sum,
+  the ZCN and the gate).
 
 The prefill and the decode step read the unit sub-keys, the score gains and (decode) the ZCN gain from a
 per-weight-version cache (:class:`neuronspark.utils.cache.WeightConstants`).
@@ -156,7 +157,7 @@ class PKMMixin:
 
     def _pkm_raw_scores(self, qh: torch.Tensor, kh: Optional[torch.Tensor] = None) -> torch.Tensor:
         """(T, B, H, 2, n) fp32 cosines of the unit half-queries with the unit sub-keys (before the gain); ``kh`` = the
-        unit sub-keys when the caller holds them (the decode step).  With autograd the einsum's backward runs under the
+        unit sub-keys when the caller holds them (the prefill).  With autograd the einsum's backward runs under the
         TF32 setting of this call (:func:`regime_product`)."""
         if kh is None:
             kh = F.normalize(self.pkm_subkeys.to(torch.float32), dim=-1)
@@ -239,22 +240,15 @@ class PKMMixin:
         return self._pkm_out(r, x_hat)
 
     # ------------------------------------------------------------------------------------------------ decode
-    def _pkm_read_step(self, x_hat: torch.Tensor) -> torch.Tensor:
-        """Single-token read (T == 1, no autograd) y (1, B, D) bf16."""
+    def _pkm_read_step(self, xb: torch.Tensor) -> torch.Tensor:
+        """Single-token read (no autograd) y (B, D) bf16 from the bf16 rounding (B, D) of the FFN input x_hat (the
+        operand of the two projections)."""
         self._require_pkm_ready()
         o = self._ops
-        T, B, _ = (int(s) for s in x_hat.shape)
-        H, k = self.pkm_heads, self.pkm_k
-        q = o.linear(x_hat, self.pkm_q.weight)
-        glog = o.linear(x_hat, self.pkm_g.weight)
-        with torch.autocast(x_hat.device.type, enabled=False):
-            kh, gains, norm_gain = self._pkm_constants()
-            qh = self._pkm_queries(q, T, B)
-            s_raw = self._pkm_raw_scores(qh, kh)
-            sc, w, u, ii, jj = o.pkm_topk_softmax_t1(s_raw[0], gains, k)
-            w, u = w.unsqueeze(0), u.unsqueeze(0)
-            vals = F.embedding(u.reshape(T, B, H * k), self.pkm_values)
-            val = torch.einsum("tbm,tbmd->tbd", w.reshape(T, B, H * k), vals.to(torch.float32))
-            r = val * torch.rsqrt(val.pow(2).mean(dim=-1, keepdim=True) + PKM_EPS) * norm_gain
-            r = r * torch.sigmoid(glog.to(torch.float32))
-        return self._pkm_out(r, x_hat)
+        B = int(xb.shape[0])
+        q = o.linear(xb, self.pkm_q.weight)
+        glog = o.linear(xb, self.pkm_g.weight)
+        kh, gains, norm_gain = self._pkm_constants()    # unit sub-keys, score gains, ZCN gain: per weight version
+        sc, w, u, ii, jj = o.pkm_topk_softmax_t1(o.pkm_scores_step(q, kh), gains, self.pkm_k)
+        r = o.pkm_value_step(w.reshape(B, -1), u.reshape(B, -1), self.pkm_values, norm_gain, glog, PKM_EPS)
+        return o.linear(r, self.pkm_o.weight)

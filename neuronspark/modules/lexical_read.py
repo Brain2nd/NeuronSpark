@@ -12,9 +12,9 @@ with ZCN(x, g) = x rsqrt(mean(x^2) + 1e-6) (1 + g) in fp32 (zero-centred gain, n
 read is per token, so both regimes run the same arithmetic per position).
 
 Ops per regime: whole row -- ``ops.row_rmsnorm`` for hn and the lex_q projection on the (T * B, D) view of hn, the
-64-wide ZCN norms, alpha and the residual in torch; prefill (T >= 2) -- ``ops.rmsnorm_rows`` for hn, then
+64-wide ZCN norms, alpha and the residual in torch; prefill and decode (T >= 1) -- ``ops.rmsnorm_rows`` for hn, then
 ``ops.lex_read_prefill`` for the ZCN norms, alpha and the residual after the three projections (one kernel per call,
-:mod:`neuronspark.ops.triton.lex_read`); decode (T == 1) -- ``ops.rmsnorm_rows`` for hn, the rest in torch.
+:mod:`neuronspark.ops.triton.lex_read`).
 
 Parameters (keys, flat on the layer): ``lex_q.weight`` (64, 1536), ``lex_k.weight`` (64, 160), ``lex_o.weight``
 (1536, 160), ``lex_q_gain`` / ``lex_k_gain`` (64,) = 0, ``lex_beta`` (1,) = ``lexical_memory_gate_bias`` (-2.0).
@@ -98,17 +98,13 @@ class LexicalReadMixin:
         return h + (alpha * o.linear(m_in, self.lex_o.weight).float()).to(h.dtype)
 
     def _lexical_read_infer(self, h: torch.Tensor, lex: torch.Tensor) -> torch.Tensor:
-        """Prefill / decode form (any T >= 1): the same expressions per token; a prefill call (T >= 2) runs the norms,
-        the gate and the residual after the projections as ``ops.lex_read_prefill``."""
+        """Prefill / decode form (any T >= 1): the same expressions per token; the norms, the gate and the residual
+        after the projections run as ``ops.lex_read_prefill``."""
         self._check_lex(h, lex)
         o = self._ops
         hn = rows_rmsnorm(o, h, LEX_EPS, out_dtype=torch.bfloat16)          # its only consumer is the bf16 lex_q projection
-        m_in = lex.to(h.dtype)
-        if int(h.shape[0]) > 1:
-            m_b = m_in.to(torch.bfloat16)         # the projections' operand: the rounding of their input cast, once
-            q_raw = o.linear(hn, self.lex_q.weight)
-            k_raw = o.linear(m_b, self.lex_k.weight)
-            o_raw = o.linear(m_b, self.lex_o.weight)
-            return o.lex_read_prefill(h, q_raw, k_raw, o_raw, self.lex_q_gain, self.lex_k_gain, self.lex_beta, LEX_EPS)
-        alpha = self._lexical_gate(o.linear(hn, self.lex_q.weight), o.linear(m_in, self.lex_k.weight))
-        return h + (alpha * o.linear(m_in, self.lex_o.weight).float()).to(h.dtype)
+        m_b = lex.to(torch.bfloat16)              # the projections' operand: the rounding of their input cast, once
+        q_raw = o.linear(hn, self.lex_q.weight)
+        k_raw = o.linear(m_b, self.lex_k.weight)
+        o_raw = o.linear(m_b, self.lex_o.weight)
+        return o.lex_read_prefill(h, q_raw, k_raw, o_raw, self.lex_q_gain, self.lex_k_gain, self.lex_beta, LEX_EPS)

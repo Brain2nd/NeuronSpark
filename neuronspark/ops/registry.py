@@ -473,6 +473,12 @@ _TENSOR_PARALLEL_SPECS: List[OpSpec] = [
         "(T, batch, 1536) fp32 contiguous every row: this GPU's rows [lo, lo + n) and the peer's", "prefill",
         doc="x (T, n, 1536) fp32 with unit last stride, part_peer (>= T (batch - n), 1536) fp32 contiguous the peer's "
             "rows in (t, row) order, flag / epoch int64 (1,), lo 0 or batch - n"),
+    _op("tp_state_pull", _T + "tp_bulk", "dst src_peer flag epoch",
+        "None: dst set to the peer's block src_peer once this GPU's flag word holds the epoch", "prefill",
+        mutates="dst",
+        doc="dst / src_peer (18, 4, 589824) bf16 (the 18 dendritic layers' SSM states of 72 heads for 4 rows) or (18, "
+            "4, 13824) fp32 (conv taps of 4,608 channels), unit last stride, src_peer read through the peer's mapping; "
+            "flag / epoch int64 (1,)"),
 ]
 for _tp_spec in _TENSOR_PARALLEL_SPECS:
     if _tp_spec.name in OPS:

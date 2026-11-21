@@ -41,17 +41,23 @@ Ops (inference, no autograd):
   in fp32 and rounded once, as the one-GPU product is) and ``h_new = h + f32(upd)`` for the fp32 residual stream ``h``
   (T, B, D): a new (T, B, D) fp32 tensor, the same on both GPUs (``a + b`` is one fp32 number either way).  The
   programs wait on ``flag`` (this GPU's word for the site) for ``epoch``.
-* ``tp_prefill_gather(x, part_peer, flag, epoch, lo, batch) -> h``: the end of a prefill call's layer whose batch is
-  split between the GPUs (a hippocampal layer): ``x`` (T, n, D) fp32 holds this GPU's rows [lo, lo + n) of the
-  ``batch`` rows, the peer's rows are the rest (those before this GPU's, or those after them), (T, batch - n, D) in
-  the first rows of the peer's buffer ``part_peer`` (T (batch - n) rows in (t, row) order); ``h`` a new (T, batch, D)
-  fp32 tensor of every row, the same on both GPUs.  The programs wait on ``flag`` for ``epoch``.
+* ``tp_prefill_gather(x, part_peer, flag, epoch, lo, batch) -> h``: the end of a prefill call whose batch is split
+  between the GPUs: ``x`` (T, n, D) fp32 holds this GPU's rows [lo, lo + n) of the ``batch`` rows, the peer's rows are
+  the rest (those before this GPU's, or those after them), (T, batch - n, D) in the first rows of the peer's buffer
+  ``part_peer`` (T (batch - n) rows in (t, row) order); ``h`` a new (T, batch, D) fp32 tensor of every row, the same on
+  both GPUs.  The programs wait on ``flag`` for ``epoch``.
+* ``tp_state_pull(dst, src_peer, flag, epoch)``: ``dst`` (L, R, W) set to the peer's block ``src_peer`` (L, R, W) of the
+  same dtype (any strides but a unit last one, no element in two rows of ``dst``; ``src_peer`` read through the peer's
+  mapping): the recurrent states of a
+  prefill whose batch is split between the GPUs moved between the head split and the row split.  The programs wait on
+  ``flag`` for ``epoch``.
 
-Launch constants: ``JOIN_ROWS`` x ``JOIN_BLOCK`` values per program, ``JOIN_WARPS`` warps.
+Launch constants: ``JOIN_ROWS`` x ``JOIN_BLOCK`` values per program, ``JOIN_WARPS`` warps; ``PULL_BLOCK`` values per
+program of a state pull, ``PULL_WARPS`` warps.
 
-A one-GPU call passes its own buffer as ``part_peer`` and its own word as the flag.  References (the kernels'
-arguments; a flag word a kernel would wait for must hold the epoch already): :func:`tp_fence_ref`,
-:func:`tp_release_ref`, :func:`tp_prefill_join_ref`, :func:`tp_prefill_gather_ref`.
+A one-GPU call passes its own buffer as ``part_peer`` / ``src_peer`` and its own word as the flag.  References (the
+kernels' arguments; a flag word a kernel would wait for must hold the epoch already): :func:`tp_fence_ref`,
+:func:`tp_release_ref`, :func:`tp_prefill_join_ref`, :func:`tp_prefill_gather_ref`, :func:`tp_state_pull_ref`.
 """
 from __future__ import annotations
 
@@ -61,12 +67,15 @@ import triton.language as tl
 
 from neuronspark.ops.triton import require_cuda, require_no_grad
 
-__all__ = ["JOIN_ROWS", "JOIN_BLOCK", "JOIN_WARPS", "tp_fence", "tp_fence_ref", "tp_release", "tp_release_ref",
-           "tp_prefill_join", "tp_prefill_join_ref", "tp_prefill_gather", "tp_prefill_gather_ref"]
+__all__ = ["JOIN_ROWS", "JOIN_BLOCK", "JOIN_WARPS", "PULL_BLOCK", "PULL_WARPS", "tp_fence", "tp_fence_ref",
+           "tp_release", "tp_release_ref", "tp_prefill_join", "tp_prefill_join_ref", "tp_prefill_gather",
+           "tp_prefill_gather_ref", "tp_state_pull", "tp_state_pull_ref"]
 
 JOIN_ROWS = 8
 JOIN_BLOCK = 512
 JOIN_WARPS = 4
+PULL_BLOCK = 8192
+PULL_WARPS = 4
 
 
 # ================================================================================================ flag words
@@ -153,6 +162,20 @@ def _prefill_gather_kernel(X, Q, OUT, FLAG, EP, B, D, lo, hi, peer_lo, n_peer, s
     tl.store(OUT + r.to(tl.int64)[:, None] * D + c[None, :], tl.where(mo, x, q), mask=m)
 
 
+@triton.jit
+def _state_pull_kernel(DST, SRC, FLAG, EP, R, W, s_dl, s_dr, s_sl, s_sr,
+                       BLOCK: tl.constexpr, LANES: tl.constexpr):
+    e = tl.load(EP)
+    _wait_epoch(FLAG, e, LANES)
+    row = tl.program_id(0)                                          # l * R + r
+    l = (row // R).to(tl.int64)
+    r = (row % R).to(tl.int64)
+    c = tl.program_id(1).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    m = c < W
+    v = tl.load(SRC + l * s_sl + r * s_sr + c, mask=m, volatile=True)   # the peer's, written by another GPU
+    tl.store(DST + l * s_dl + r * s_dr + c, v, mask=m)
+
+
 # ================================================================================================ launchers
 def _check_word(t: torch.Tensor, name: str, device) -> None:
     if t.dtype != torch.int64 or tuple(t.shape) != (1,) or t.device != device:
@@ -233,6 +256,38 @@ def tp_prefill_gather(x: torch.Tensor, part_peer: torch.Tensor, flag: torch.Tens
     return out
 
 
+def _check_block(dst: torch.Tensor, src_peer: torch.Tensor) -> None:
+    for name, t in (("dst", dst), ("src_peer", src_peer)):
+        if t.dim() != 3 or t.stride(-1) != 1:
+            raise RuntimeError(f"neuronspark.tp_state_pull: {name} must be (L, R, W) with unit last stride, got "
+                               f"{tuple(t.shape)} stride {tuple(t.stride())}")
+    if tuple(src_peer.shape) != tuple(dst.shape) or src_peer.dtype != dst.dtype or src_peer.device != dst.device:
+        raise RuntimeError(f"neuronspark.tp_state_pull: src_peer must match dst {dst.dtype} {tuple(dst.shape)} on "
+                           f"{dst.device}, got {src_peer.dtype} {tuple(src_peer.shape)} on {src_peer.device}")
+    if dst.numel():                                                 # the outer strides nest: no element in two rows
+        extent = int(dst.shape[2])
+        for stride, size in sorted((int(dst.stride(i)), int(dst.shape[i])) for i in (0, 1) if int(dst.shape[i]) > 1):
+            if stride < extent:
+                raise RuntimeError(f"neuronspark.tp_state_pull: the rows of dst must not overlap, got "
+                                   f"{tuple(dst.shape)} stride {tuple(dst.stride())}")
+            extent += stride * (size - 1)
+
+
+def tp_state_pull(dst: torch.Tensor, src_peer: torch.Tensor, flag: torch.Tensor, epoch: torch.Tensor) -> None:
+    """``dst`` set to the peer's block ``src_peer`` once ``flag`` holds the epoch (see the module docstring)."""
+    require_cuda(dst, "tp_state_pull")
+    _check_block(dst, src_peer)
+    _check_word(flag, "flag", dst.device)
+    _check_word(epoch, "epoch", dst.device)
+    require_no_grad("tp_state_pull", dst, src_peer)
+    L, R, W = (int(s) for s in dst.shape)
+    if L * R and W:
+        with torch.cuda.device(dst.device.index):
+            _state_pull_kernel[(L * R, triton.cdiv(W, PULL_BLOCK))](
+                dst, src_peer, flag, epoch, R, W, dst.stride(0), dst.stride(1), src_peer.stride(0),
+                src_peer.stride(1), BLOCK=PULL_BLOCK, LANES=32 * PULL_WARPS, num_warps=PULL_WARPS)
+
+
 # ================================================================================================ reference
 def _passed_ref(flag: torch.Tensor, epoch: torch.Tensor, what: str) -> None:
     """The word ``flag`` must hold at least the epoch: the kernel waits until it does, a reference cannot."""
@@ -270,3 +325,10 @@ def tp_prefill_gather_ref(x: torch.Tensor, part_peer: torch.Tensor, flag: torch.
     T, n, D = (int(s) for s in x.shape)
     peer = part_peer[:T * (int(batch) - n)].view(T, int(batch) - n, D)
     return torch.cat([x, peer] if int(lo) == 0 else [peer, x], dim=1).contiguous()
+
+
+def tp_state_pull_ref(dst: torch.Tensor, src_peer: torch.Tensor, flag: torch.Tensor, epoch: torch.Tensor) -> None:
+    """Pure torch: ``dst`` set to ``src_peer``; ``flag`` must hold at least the epoch."""
+    _check_block(dst, src_peer)
+    _passed_ref(flag, epoch, "tp_state_pull_ref")
+    dst.copy_(src_peer)

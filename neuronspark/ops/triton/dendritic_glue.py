@@ -4,17 +4,16 @@
 ``bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB, dC, dA_cumsum, dt_sp, CB, states_passed)
 -> (dx, ddt, dA, dB, dC, dD, ddt_bias)`` is the backward of the chunked scan of the dendritic-layer call (no gate, no
 initial / final states, dt softplus with limit (0, inf), ngroups 1, D (nheads,)) on the tensors the forward kept
-(dA_cumsum, softplus'd dt, CB, the fp32 passed states) instead of recomputing them. Inputs: dout (b, l, h, P) bf16 (the
+(dA_cumsum, softplus'd dt, CB, the bf16 passed states) instead of recomputing them. Inputs: dout (b, l, h, P) bf16 (the
 gated norm's input gradient), x (b, l, h, P) bf16 / B, C (b, l, 1, N) bf16 views of the conv output, dt_raw (b, l, h)
 bf16 view of the projection, A / D / dt_bias (h,) fp32, dx / ddt / dB / dC the output buffers (views of the projection
 and conv-input gradients, written in place), dA_cumsum / dt_sp (b, h, nc, chunk) fp32, CB (b, nc, 1, chunk, chunk) fp32,
-states_passed (b, nc, h, P, N) fp32 (the state entering each chunk). Returns dx, ddt, dB, dC (the given buffers), dA,
+states_passed (b, nc, h, P, N) bf16 (the state entering each chunk, as the chunk scan read it). Returns dx, ddt, dB, dC (the given buffers), dA,
 dD, ddt_bias (h,) fp32. Whole chunks only (l % chunk == 0, the training regime; the chunk-scan input backward is a
 whole-chunk Gluon kernel): otherwise it raises.
 
 The sequence (each step's order and operands are fixed):
-  1. ``gluon.dendritic_dstates.dstates_train``: dstates (bf16), the state-passing ddA workspace, the passed states
-  (bf16); 2. ``gluon.dendritic_chunk_scan_dx.chunk_scan_dx_gluon``: dx, ddt (fp32 per position), dD; 3.
+  1. ``gluon.dendritic_dstates.dstates_train``: dstates (bf16), the state-passing ddA workspace; 2. ``gluon.dendritic_chunk_scan_dx.chunk_scan_dx_gluon``: dx, ddt (fp32 per position), dD; 3.
   ``dendritic_states.db_tma`` / ``dc_tma``: dB / dC head-split partials and the ddA_next / ddA_prev workspaces; 4.
   ``gluon.dendritic_dda.dda_gluon``: dCB head-split partials and the V grid of the intra-chunk ddA; 5. ``splits_sum``:
   dB, dC, dCB = sums over the head-split axis (one launch); 6. ``dendritic_chunk.chunk_cb_bwd`` twice: dB += dCB^T C,
@@ -208,12 +207,11 @@ def bwd_store_glue(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt, dB
     dB_given, dC_given, ddt_given = dB, dC, ddt
     dt = dt_sp
     # dstates GEMM + both state-passing passes
-    dstates, ws_sp, nv_sp, states = dstates_train(states_passed, dA_cumsum, dout, C, x.dtype)
-    states = states.unflatten(-1, (headdim, dstate))
+    dstates, ws_sp, nv_sp = dstates_train(states_passed, dA_cumsum, dout, C, x.dtype)
     dstates = dstates.unflatten(-1, (headdim, dstate))
     dx, ddt, dD = chunk_scan_dx_gluon(x, dt, dA_cumsum, B, CB, dout, dstates, D, dx)
     dB_p, ws_db, nt_db = db_tma(x, dt, dA_cumsum, dstates, B, ngroups)
-    dC_p, ws_dc, nt_dc = dc_tma(states.to(x.dtype), dA_cumsum, dout, C, ngroups)
+    dC_p, ws_dc, nt_dc = dc_tma(states_passed, dA_cumsum, dout, C, ngroups)
     dcb_p, ddA_v = dda_gluon(x, dt, dA_cumsum, dout, CB)
     dB, dC, dCB = splits_sum((dB_p, 2), (dC_p, 2), (dcb_p, 2))
     dCB = dCB.to(CB.dtype)
@@ -232,8 +230,8 @@ def bwd_store_glue_ref(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt
     :func:`bwd_store_glue`), each step by its piece reference -- float64 between the kernels' rounding points, which
     are reproduced:
 
-      1. ``dstates_train_ref``: dstates (bf16, from bf16(dout exp(dA)) C sums), the state-passing ddA block sums, the
-         passed states (bf16);
+      1. ``dstates_train_ref``: dstates (bf16, from bf16(dout exp(dA)) C sums), the state-passing ddA block sums on
+         the bf16 passed states;
       2. ``chunk_scan_dx_ref``: dx, ddt_out, dD (the dot operand bf16(CB[k, m] decay) of the dx kernel);
       3. ``db_tma_ref`` / ``dc_tma_ref``: dB / dC summed over heads, ddA_next / ddA_prev;
       4. ``dda_ref``: dCB and the intra-chunk ddA;
@@ -251,14 +249,13 @@ def bwd_store_glue_ref(dout, x, dt_raw, A, B, C, chunk_size, D, dt_bias, dx, ddt
     dstate = int(B.shape[-1])
     L = nchunks * chunk
     # 1. dstates + both state-passing passes
-    dstates, ws_sp, nv_sp, states = dstates_train_ref(states_passed, dA_cumsum, dout, C, x.dtype)
+    dstates, ws_sp, nv_sp = dstates_train_ref(states_passed, dA_cumsum, dout, C, x.dtype)
     dstates = dstates.unflatten(-1, (headdim, dstate))
-    states = states.unflatten(-1, (headdim, dstate))
     # 2. dx / ddt_out / dD
     dx_r, ddt_out, dD = chunk_scan_dx_ref(x, dt_sp, dA_cumsum, B, CB, dout, dstates, D, None)
     # 3. dB / dC head sums and the ddA_next / ddA_prev workspaces
     dB_h, ddA_next = db_tma_ref(x, dt_sp, dA_cumsum, dstates, B, 1)
-    dC_h, ddA_prev = dc_tma_ref(states, dA_cumsum, dout, C, 1)
+    dC_h, ddA_prev = dc_tma_ref(states_passed, dA_cumsum, dout, C, 1)
     # 4. dCB and the intra-chunk ddA
     dCB, ddA_intra = dda_ref(x, dt_sp, dA_cumsum, dout, CB)
     # 5. dB += C^T dCB, dC += dCB B (bf16 dot operands, fp32 residual)

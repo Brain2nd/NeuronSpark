@@ -9,8 +9,8 @@ For chunk c of an item (chunk length CS, dA_last = dA_cumsum[b, h, c, CS - 1]):
 the chunk-state body (the bf16 rounding point of the scaled B, fp32 accumulation) and the state-passing step.
 Forms:
 
-* :func:`chunk_states_train` (no initial state): ``states_pre[c] = A_c`` fp32 (or, with ``passed_fp32``, the passed
-  state ``s_c`` fp32) and ``states[c] = s_c`` in the output dtype (``states[0] = 0``; the final state is not stored);
+* :func:`chunk_states_train` (no initial state): ``states[c] = s_c`` in the output dtype (``states[0] = 0``; the final
+  state is not stored) -- the states the chunk scan reads and the training backward's state gradients take;
 * :func:`chunk_states_prefill` (the carried state ``s_0``, or zero): ``states[c] = s_c`` in the output dtype and the final
   state ``s_nc`` fp32 -- the same quantities from the initial state.
 
@@ -66,13 +66,13 @@ _GL_DT = {torch.bfloat16: gl.bfloat16, torch.float32: gl.float32}
 
 # ------------------------------------------------------------------------------------------------ partitions
 @gluon.jit
-def _epilogue_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, PRP, FNP,
+def _epilogue_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, FNP,
                         n_items, seqlen, nchunks,
                         H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
-                        R: gl.constexpr, NWC: gl.constexpr, HAS_INIT: gl.constexpr, STORE_PRE: gl.constexpr,
-                        STORE_FIN: gl.constexpr, INIT_BYTES: gl.constexpr, PASSED: gl.constexpr):
-    """Default partition (4 warps): per item the carried state s; per chunk the state entering it and (training) the
-    fp32 passed state or the chunk's own state A_c, written from registers by plain stores."""
+                        R: gl.constexpr, NWC: gl.constexpr, HAS_INIT: gl.constexpr,
+                        STORE_FIN: gl.constexpr, INIT_BYTES: gl.constexpr):
+    """Default partition (4 warps): per item the carried state s (fp32); per chunk the state entering it in the output
+    dtype, written from registers by plain stores; (prefill) the final state in fp32."""
     AL: gl.constexpr = get_tmem_32x32b_reg_layout(P, N, [P, N], 4)
     rows = gl.arange(0, P, layout=gl.SliceLayout(1, AL))
     cols = gl.arange(0, N, layout=gl.SliceLayout(0, AL))
@@ -104,8 +104,6 @@ def _epilogue_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, 
             _tc_fence(0, 4)
             gl.thread_barrier()
             mbarrier.arrive(acc_free.index(u))
-            if STORE_PRE:
-                gl.store(PRP + offs, s if PASSED else ac)              # PASSED: the fp32 state entering the chunk
             s = gl.exp(da_last) * s + ac                               # the state-passing step
             cc += 1
         if STORE_FIN:
@@ -114,11 +112,11 @@ def _epilogue_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, 
 
 
 @gluon.jit
-def _load_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, PRP, FNP,
+def _load_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, FNP,
                     n_items, seqlen, nchunks,
                     H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
-                    R: gl.constexpr, NWC: gl.constexpr, HAS_INIT: gl.constexpr, STORE_PRE: gl.constexpr,
-                    STORE_FIN: gl.constexpr, INIT_BYTES: gl.constexpr, PASSED: gl.constexpr):
+                    R: gl.constexpr, NWC: gl.constexpr, HAS_INIT: gl.constexpr,
+                    STORE_FIN: gl.constexpr, INIT_BYTES: gl.constexpr):
     """Load warp: per item its initial state (prefill form), per K step the (BK, P) x tile of head h and the (BK, N) B
     tile into the ring."""
     NKT: gl.constexpr = CS // BK
@@ -148,11 +146,11 @@ def _load_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init
 
 
 @gluon.jit
-def _compute_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, PRP, FNP,
+def _compute_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, FNP,
                        n_items, seqlen, nchunks,
                        H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
-                       R: gl.constexpr, NWC: gl.constexpr, HAS_INIT: gl.constexpr, STORE_PRE: gl.constexpr,
-                       STORE_FIN: gl.constexpr, INIT_BYTES: gl.constexpr, PASSED: gl.constexpr):
+                       R: gl.constexpr, NWC: gl.constexpr, HAS_INIT: gl.constexpr,
+                       STORE_FIN: gl.constexpr, INIT_BYTES: gl.constexpr):
     """Compute partition (NWC warps): B_tile[k, :] *= exp(min(dA_last - dA[k], 0)) dt[k], rounded to bf16, in place."""
     NKT: gl.constexpr = CS // BK
     L: gl.constexpr = gl.BlockedLayout([1, 8], [2, 16], [NWC, 1], [1, 0])
@@ -188,11 +186,11 @@ def _compute_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, i
 
 
 @gluon.jit
-def _mma_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, PRP, FNP,
+def _mma_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, FNP,
                    n_items, seqlen, nchunks,
                    H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
-                   R: gl.constexpr, NWC: gl.constexpr, HAS_INIT: gl.constexpr, STORE_PRE: gl.constexpr,
-                   STORE_FIN: gl.constexpr, INIT_BYTES: gl.constexpr, PASSED: gl.constexpr):
+                   R: gl.constexpr, NWC: gl.constexpr, HAS_INIT: gl.constexpr,
+                   STORE_FIN: gl.constexpr, INIT_BYTES: gl.constexpr):
     """MMA warp: A_c (P, N) = sum over the chunk's K steps of x_tile^T (P, BK) . B_tile (BK, N)."""
     NKT: gl.constexpr = CS // BK
     G = gl.num_programs(0)
@@ -216,10 +214,10 @@ def _mma_partition(x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_
 
 # ------------------------------------------------------------------------------------------------ kernel
 @gluon.jit
-def _chunk_states_kernel(xd, bd, initd, DT, DA, STP, PRP, FNP, n_items, seqlen, nchunks,
+def _chunk_states_kernel(xd, bd, initd, DT, DA, STP, FNP, n_items, seqlen, nchunks,
                          H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                          R: gl.constexpr, NWC: gl.constexpr, REGS_W: gl.constexpr, REGS_C: gl.constexpr,
-                         HAS_INIT: gl.constexpr, STORE_PRE: gl.constexpr, STORE_FIN: gl.constexpr, INIT_BYTES: gl.constexpr, PASSED: gl.constexpr):
+                         HAS_INIT: gl.constexpr, STORE_FIN: gl.constexpr, INIT_BYTES: gl.constexpr):
     TL: gl.constexpr = TensorMemoryLayout(block=(P, N), unpacked=True)
     BL: gl.constexpr = mbarrier.MBarrierLayout()
     XL: gl.constexpr = gl.NVMMASharedLayout.get_default_for([BK, P], gl.bfloat16)
@@ -254,11 +252,11 @@ def _chunk_states_kernel(xd, bd, initd, DT, DA, STP, PRP, FNP, n_items, seqlen, 
     fence_async_shared()
     acc = allocate_tensor_memory(gl.float32, [2, P, N], TL)
     gl.warp_specialize(
-        (x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, PRP, FNP,
-         n_items, seqlen, nchunks, H, P, N, CS, BK, R, NWC, HAS_INIT, STORE_PRE, STORE_FIN, INIT_BYTES, PASSED),
+        (x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, FNP,
+         n_items, seqlen, nchunks, H, P, N, CS, BK, R, NWC, HAS_INIT, STORE_FIN, INIT_BYTES),
         _epilogue_partition,
-        (x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, PRP, FNP,
-         n_items, seqlen, nchunks, H, P, N, CS, BK, R, NWC, HAS_INIT, STORE_PRE, STORE_FIN, INIT_BYTES, PASSED),
+        (x_s, b_s, ready, scaled, free, acc_done, acc_free, acc, init_s, init_bar, init_free, xd, bd, initd, DT, DA, STP, FNP,
+         n_items, seqlen, nchunks, H, P, N, CS, BK, R, NWC, HAS_INIT, STORE_FIN, INIT_BYTES),
         [_load_partition, _compute_partition, _mma_partition],
         [1, NWC, 1],
         [REGS_W, REGS_C, REGS_W])
@@ -289,7 +287,7 @@ def _check(B, x, dt, dA_cumsum, name):
     return batch, seqlen, nheads, headdim, nchunks, chunk, dstate
 
 
-def _launch(B, x, dt, dA_cumsum, init, pre, states, fin, dims, passed=False):
+def _launch(B, x, dt, dA_cumsum, init, states, fin, dims):
     batch, seqlen, nheads, headdim, nchunks, chunk, dstate = dims
     # 3-D views (batch, seqlen, .): any batch stride (time slices of a longer buffer); rows past seqlen read as zeros
     xd = TensorDescriptor(x, [batch, seqlen, nheads * headdim], [x.stride(0), x.stride(1), 1], [1, BK, headdim],
@@ -310,25 +308,24 @@ def _launch(B, x, dt, dA_cumsum, init, pre, states, fin, dims, passed=False):
     G = min(CTAS_PER_SM * num_sms(x.device), n_items)
     with torch.cuda.device(x.device.index):
         _chunk_states_kernel[(G,)](
-            xd, bd, initd, dt, dA_cumsum, states, pre if pre is not None else states, fin if fin is not None else states,
+            xd, bd, initd, dt, dA_cumsum, states, fin if fin is not None else states,
             n_items, seqlen, nchunks,
             H=nheads, P=headdim, N=dstate, CS=chunk, BK=BK, R=R, NWC=NWC, REGS_W=REGS_W, REGS_C=REGS_C,
-            HAS_INIT=has_init, STORE_PRE=pre is not None, STORE_FIN=fin is not None,
-            INIT_BYTES=headdim * dstate * (init.element_size() if has_init else 0), PASSED=passed, num_warps=4)
+            HAS_INIT=has_init, STORE_FIN=fin is not None,
+            INIT_BYTES=headdim * dstate * (init.element_size() if has_init else 0), num_warps=4)
 
 
-def chunk_states_train(B, x, dt, dA_cumsum, out_dtype, passed_fp32=False):
-    """(states_pre (b, nc, h, P, N) fp32, states (b, nc, h, P, N) in out_dtype): see the module docstring.
-    ``passed_fp32``: the fp32 output holds the passed states s_c (the state entering chunk c, s_0 = 0) instead of the
-    chunks' own states -- the input of :func:`neuronspark.ops.gluon.dendritic_dstates.dstates_train`."""
+def chunk_states_train(B, x, dt, dA_cumsum, out_dtype):
+    """states (b, nc, h, P, N) in out_dtype: the state entering each chunk (``states[0] = 0``), see the module
+    docstring.  In bf16 it is both the chunk scan's operand and the input of
+    :func:`neuronspark.ops.gluon.dendritic_dstates.dstates_train`."""
     dims = _check(B, x, dt, dA_cumsum, "chunk_states_train")
     batch, seqlen, nheads, headdim, nchunks, chunk, dstate = dims
     if out_dtype not in (torch.bfloat16, torch.float32):
         raise RuntimeError(f"neuronspark.chunk_states_train: out_dtype {out_dtype}")
-    pre = torch.empty((batch, nchunks, nheads, headdim, dstate), device=x.device, dtype=torch.float32)
     states = torch.empty((batch, nchunks, nheads, headdim, dstate), device=x.device, dtype=out_dtype)
-    _launch(B, x, dt, dA_cumsum, None, pre, states, None, dims, passed=passed_fp32)
-    return pre, states
+    _launch(B, x, dt, dA_cumsum, None, states, None, dims)
+    return states
 
 
 def chunk_states_prefill(B, x, dt, dA_cumsum, initial_state, out_dtype):
@@ -345,14 +342,14 @@ def chunk_states_prefill(B, x, dt, dA_cumsum, initial_state, out_dtype):
                            f"{tuple(initial_state.shape)}")
     states = torch.empty((batch, nchunks, nheads, headdim, dstate), device=x.device, dtype=out_dtype)
     fin = torch.empty((batch, nheads, headdim, dstate), device=x.device, dtype=torch.float32)
-    _launch(B, x, dt, dA_cumsum, initial_state, None, states, fin, dims)
+    _launch(B, x, dt, dA_cumsum, initial_state, states, fin, dims)
     return states, fin
 
 
 def chunk_states_train_ref(B, x, dt, dA_cumsum, out_dtype):
-    """Pure-torch reference: :func:`neuronspark.ops.triton.dendritic_states.csp_fused_ref`."""
+    """Pure-torch reference: the states of :func:`neuronspark.ops.triton.dendritic_states.csp_fused_ref`."""
     from neuronspark.ops.triton.dendritic_states import csp_fused_ref
-    return csp_fused_ref(B, x, dt, dA_cumsum, out_dtype)
+    return csp_fused_ref(B, x, dt, dA_cumsum, out_dtype)[1]
 
 
 def chunk_states_prefill_ref(B, x, dt, dA_cumsum, initial_state, out_dtype):

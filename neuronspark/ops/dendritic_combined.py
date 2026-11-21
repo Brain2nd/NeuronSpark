@@ -17,7 +17,7 @@ Forward:
   1. causal conv k4 + SiLU on x|B|C (:mod:`neuronspark.ops.triton.dendritic_conv`), output (B, T, C) bf16 kept;
   2. dt = softplus(dt + dt_bias) and its per-chunk cumsum of dt A (``dendritic_chunk.chunk_dt_cumsum``);
   3. chunk states + state passing (Gluon ``chunk_states_train``, Blackwell): the passed states (the state entering each
-     chunk) kept in fp32 for the backward's state gradients, and in bf16 for the chunk scan;
+     chunk) in bf16, read by the chunk scan and kept for the backward's state gradients;
   4. CB = C B^T per chunk (``dendritic_chunk.chunk_cb``, fp32), kept;
   5. the chunk scan (Gluon ``chunk_scan_fwd_gluon``, Blackwell), y bf16 kept;
   6. gated RMSNorm (unit weight, eps 1e-5) + bipolar soma + gamma (``dendritic_gated_norm.gated_norm_soma_fwd``, the
@@ -35,7 +35,7 @@ Function as a whole is checked against :func:`dendritic_chunk_scan_soma_ref` wit
 capture raises), autocast-agnostic (every dtype is explicit; the training regime runs it under bf16 autocast).
 
 Memory kept from forward to backward per call (default configuration, B 8, T 1024): zxbcdt 309 MB (the input), the conv
-output 155 MB, y and n 151 MB each, the fp32 passed states 151 MB, CB 8.4 MB, dt / dA_cumsum 4.7 MB each.
+output 155 MB, y and n 151 MB each, the bf16 passed states 75.5 MB, CB 8.4 MB, dt / dA_cumsum 4.7 MB each.
 """
 from __future__ import annotations
 
@@ -92,7 +92,7 @@ def _geometry(zxbcdt, conv_w, D, theta):
            "Tensor gamma, int chunk_size) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)")
 def _dendritic_chunk_scan_soma_fwd_op(zxbcdt, conv_w, conv_b, dt_bias, A, D, theta, gamma, chunk_size):
     """(xs (B T, d_inner) bf16, y (B, T, H, P) bf16, rstd (B T,) fp32, conv output (B, T, C) bf16, dt (B, H, nc, cs)
-    fp32, dA_cumsum (B, H, nc, cs) fp32, CB (B, nc, 1, cs, cs) fp32, passed states (B, nc, H, P, N) fp32, n (B T,
+    fp32, dA_cumsum (B, H, nc, cs) fp32, CB (B, nc, 1, cs, cs) fp32, passed states (B, nc, H, P, N) bf16, n (B T,
     d_inner) bf16)"""
     nheads, dim, headdim, dstate = _geometry(zxbcdt, conv_w, D, theta)
     batch, seqlen, _ = zxbcdt.shape
@@ -111,9 +111,9 @@ def _dendritic_chunk_scan_soma_fwd_op(zxbcdt, conv_w, conv_b, dt_bias, A, D, the
     if B.stride(-1) != 1 or C.stride(-1) != 1 or (x.stride(-1) != 1 and x.stride(1) != 1) or D.stride(-1) != 1:
         raise RuntimeError("neuronspark.dendritic_chunk_scan_soma: x / B / C / D are not in the dendritic-layer layout")
     dA_cumsum, dt_sp = chunk_dt_cumsum(dt, A, chunk_size, dt_bias=dt_bias, softplus=True, dt_limit=_DT_LIMIT)
-    states_passed, states = chunk_states_train(B, x, dt_sp, dA_cumsum, C.dtype, passed_fp32=True)
+    states_passed = chunk_states_train(B, x, dt_sp, dA_cumsum, C.dtype)
     CB = chunk_cb(C, B, chunk_size)
-    out_x = chunk_scan_fwd_gluon(CB, x, dt_sp, dA_cumsum, C, states, D)
+    out_x = chunk_scan_fwd_gluon(CB, x, dt_sp, dA_cumsum, C, states_passed, D)
     x_rms = out_x.view(batch * seqlen, dim)
     z_rms = z.view(batch * seqlen, dim)
     xs, rstd, n = gated_norm_soma_fwd(x_rms, NORM_EPS, z_rms, theta, gamma)
@@ -134,7 +134,7 @@ def _dendritic_chunk_scan_soma_fwd_fake(zxbcdt, conv_w, conv_b, dt_bias, A, D, t
             e((batch, nheads, nchunks, chunk_size), dtype=torch.float32, device=dev),
             e((batch, nheads, nchunks, chunk_size), dtype=torch.float32, device=dev),
             e((batch, nchunks, 1, chunk_size, chunk_size), dtype=torch.float32, device=dev),
-            e((batch, nchunks, nheads, headdim, dstate), dtype=torch.float32, device=dev),
+            e((batch, nchunks, nheads, headdim, dstate), dtype=torch.bfloat16, device=dev),
             e((batch * seqlen, dim), dtype=torch.bfloat16, device=dev))
 
 

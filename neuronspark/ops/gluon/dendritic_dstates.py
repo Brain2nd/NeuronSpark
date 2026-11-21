@@ -2,28 +2,28 @@
 chunk-scan dstates product and the state-passing backward of one (b, h) item walking its chunks in reverse, the gradient
 carried on chip.
 
-For an item with the forward's passed states ``s_c`` (fp32, the state entering chunk c; ``s_0 = 0``) and chunk length CS
+For an item with the forward's passed states ``s_c`` (bf16, the state entering chunk c; ``s_0 = 0``) and chunk length CS
 (``dA_end[c] = dA_cumsum[b, h, c, CS - 1]``), for k = nc - 1 .. 1 (``d = 0`` before the first)::
 
-    conv[k]  = s_k                                                     (the passed state, output dtype)
     ws[k, j] = exp(dA_end[k]) sum_{(p, n) in block j} s_k[p, n] d[p, n]     (blocks of 4 rows of P, fp32)
     A_k      = sum_t bf16(dout[t] exp(dA_cumsum[t]))^T C[t]            (P, N) fp32
     d        = exp(dA_end[k]) d + A_k ;  dstates[k - 1] = d           (output dtype)
 
-with ``dstates[nc - 1] = 0``, ``conv[0] = 0`` and ``ws[0] = 0`` -- the state gradients (the dout scaling rounded to
-bf16, fp32 accumulation) and their backward passing through the chunks (no final / initial state gradients), on the
-forward's stored passed states (``chunk_states_train(.., passed_fp32=True)``: fp32, nothing recomputed).
+with ``dstates[nc - 1] = 0`` and ``ws[0] = 0`` -- the state gradients (the dout scaling rounded to bf16, fp32
+accumulation) and their backward passing through the chunks (no final / initial state gradients), on the forward's
+stored passed states (the bf16 states of ``chunk_states_train`` that the chunk scan reads; nothing recomputed).
 
 Per CTA (persistent, items (b, h) in round-robin): a load warp streams the (BK, P) dout and (BK, N) C tiles of each K step
 through an R-deep mbarrier ring and each chunk's passed-state tile; a compute partition scales each dout tile in place
 (one row factor per token, bf16); an MMA warp issues A_k += dout_tile^T . C_tile (the dout tile as a permuted MN-major
-view) into one of two TMEM accumulators; the default partition (4 warps) carries d and stores the outputs through
+view) into one of two TMEM accumulators; the default partition (4 warps) carries d and stores the dstates through
 shared tiles and TMA stores (the 16 workspace values per chunk by plain stores, each the sum of its 4 row sums read
 back from a shared buffer by one thread).  No partition uses an operation that needs compiler scratch memory (a layout
 conversion, a reduction across warps): the allocator places such scratch over the warp_specialize capture buffer, which
 partitions that start later still read.
 
-Numerics: the reference's expressions and rounding points; the fp32 accumulation order of the tensor cores and of the
+Numerics: the reference's expressions and rounding points (the block sums read the bf16 passed state, converted to
+fp32); the fp32 accumulation order of the tensor cores and of the
 block sums (the per-operator rule class of :mod:`neuronspark.utils.testing` against :func:`dstates_train_ref`).  A
 partial last chunk is supported (its rows past the sequence get a zero scaled dout).
 
@@ -57,12 +57,12 @@ _GL_DT = {torch.bfloat16: gl.bfloat16, torch.float32: gl.float32}
 
 # ------------------------------------------------------------------------------------------------ partitions
 @gluon.jit
-def _epilogue_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s, ws_s,
-                        dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
+def _epilogue_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, ws_s,
+                        dod, cd, sd, dstd, DA, WS, n_items, seqlen, nchunks,
                         H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                         R: gl.constexpr, NWC: gl.constexpr, NBLK: gl.constexpr, WSR: gl.constexpr):
-    """Default partition (4 warps): per item the carried gradient d; per chunk the converted state, the workspace block
-    sums, the gradient update and the dstates store."""
+    """Default partition (4 warps): per item the carried gradient d; per chunk the workspace block sums, the gradient
+    update and the dstates store."""
     AL: gl.constexpr = get_tmem_32x32b_reg_layout(P, N, [P, N], 4)
     # the block sums read the row sums back from ws_s, each thread one block of WSR rows (no reduction across threads:
     # no partition uses compiler scratch memory, which the allocator places over the warp_specialize capture buffer)
@@ -75,14 +75,12 @@ def _epilogue_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc,
         b = it // H
         h = it - b * H
         d = gl.zeros([P, N], gl.float32, layout=AL)
-        # dstates[nc - 1] = 0, conv[0] = 0, ws[0] = 0 (the staging buffers free before and after: once per item)
+        # dstates[nc - 1] = 0, ws[0] = 0 (the staging buffer free before and after: once per item)
         tma.store_wait(0)
         dst_s.index(0).store(d.to(dst_s.dtype))
-        cv_s.index(0).store(d.to(cv_s.dtype))
         fence_async_shared()
         gl.thread_barrier()
         tma.async_copy_shared_to_global(dstd, [((b * nchunks + nchunks - 1) * H + h) * P, 0], dst_s.index(0))
-        tma.async_copy_shared_to_global(cvd, [((b * nchunks) * H + h) * P, 0], cv_s.index(0))
         tma.store_wait(0)
         gl.store(WS + ((b * H + h) * nchunks) * NBLK + blk, gl.zeros([NBLK], gl.float32, layout=gl.SliceLayout(1, LW)))
         for i in range(nchunks - 1):
@@ -91,17 +89,14 @@ def _epilogue_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc,
             da_end = gl.load(DA + ((b * H + h) * nchunks + k) * CS + (CS - 1))
             scale = gl.exp(da_end)
             mbarrier.wait(s_bar, sc_ & 1)
-            s = s_s.load(AL)
+            s = s_s.load(AL).to(gl.float32)
             sc_ += 1
             u = cc % 2
-            tma.store_wait(3)                                          # the buffers' stores of two chunks ago are done
-            cv_s.index(u).store(s.to(cv_s.dtype))
             fence_async_shared()
             gl.thread_barrier()
-            # s_s is released only after every thread's values of it were consumed (the conv tile above) and the proxy fence:
-            # the load warp's next TMA write into s_s must not overtake this partition's reads of it
+            # s_s is released only after every thread read it and the proxy fence: the load warp's next TMA write into
+            # s_s must not overtake this partition's reads of it
             mbarrier.arrive(s_free)
-            tma.async_copy_shared_to_global(cvd, [row, 0], cv_s.index(u))
             # ws[k, j] = exp(dA_end) sum over block j of s * d (the gradient before this chunk's update)
             ws_s.store(gl.reshape(gl.sum(s * d, axis=1), [NBLK, WSR]))  # the row sums, (NBLK, WSR)
             gl.thread_barrier()
@@ -114,7 +109,7 @@ def _epilogue_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc,
             gl.thread_barrier()
             mbarrier.arrive(acc_free.index(u))
             d = scale * d + ak                                         # the state-passing backward step
-            tma.store_wait(3)
+            tma.store_wait(1)                                          # the store of this buffer two chunks ago is done
             dst_s.index(u).store(d.to(dst_s.dtype))
             fence_async_shared()
             gl.thread_barrier()
@@ -124,8 +119,8 @@ def _epilogue_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc,
 
 
 @gluon.jit
-def _load_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s, ws_s,
-                    dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
+def _load_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, ws_s,
+                    dod, cd, sd, dstd, DA, WS, n_items, seqlen, nchunks,
                     H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                     R: gl.constexpr, NWC: gl.constexpr, NBLK: gl.constexpr, WSR: gl.constexpr):
     """Load warp: per chunk (in reverse) its passed-state tile, then per K step the (BK, P) dout tile of head h and the
@@ -140,7 +135,7 @@ def _load_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s
         for i in range(nchunks - 1):
             k = nchunks - 1 - i
             mbarrier.wait(s_free, (sc_ & 1) ^ 1)
-            mbarrier.expect(s_bar, P * N * 4)
+            mbarrier.expect(s_bar, P * N * 2)
             tma.async_copy_global_to_shared(sd, [((b * nchunks + k) * H + h) * P, 0], s_bar, s_s)
             sc_ += 1
             for kt in gl.static_range(NKT):
@@ -154,8 +149,8 @@ def _load_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s
 
 
 @gluon.jit
-def _compute_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s, ws_s,
-                       dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
+def _compute_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, ws_s,
+                       dod, cd, sd, dstd, DA, WS, n_items, seqlen, nchunks,
                        H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                        R: gl.constexpr, NWC: gl.constexpr, NBLK: gl.constexpr, WSR: gl.constexpr):
     """Compute partition (NWC warps): dout_tile[t, :] *= exp(dA_cumsum[t]), rounded to bf16, in place."""
@@ -189,8 +184,8 @@ def _compute_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, 
 
 
 @gluon.jit
-def _mma_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s, ws_s,
-                   dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
+def _mma_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, ws_s,
+                   dod, cd, sd, dstd, DA, WS, n_items, seqlen, nchunks,
                    H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                    R: gl.constexpr, NWC: gl.constexpr, NBLK: gl.constexpr, WSR: gl.constexpr):
     """MMA warp: A_k (P, N) = sum over the chunk's K steps of dout_tile^T (P, BK) . C_tile (BK, N)."""
@@ -216,7 +211,7 @@ def _mma_partition(do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s,
 
 # ------------------------------------------------------------------------------------------------ kernel
 @gluon.jit
-def _dstates_kernel(dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
+def _dstates_kernel(dod, cd, sd, dstd, DA, WS, n_items, seqlen, nchunks,
                     H: gl.constexpr, P: gl.constexpr, N: gl.constexpr, CS: gl.constexpr, BK: gl.constexpr,
                     R: gl.constexpr, NWC: gl.constexpr, NBLK: gl.constexpr, WSR: gl.constexpr,
                     REGS_W: gl.constexpr, REGS_C: gl.constexpr):
@@ -224,9 +219,8 @@ def _dstates_kernel(dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
     BL: gl.constexpr = mbarrier.MBarrierLayout()
     do_s = gl.allocate_shared_memory(gl.bfloat16, [R, BK, P], dod.layout)
     c_s = gl.allocate_shared_memory(gl.bfloat16, [R, BK, N], cd.layout)
-    s_s = gl.allocate_shared_memory(gl.float32, [P, N], sd.layout)
+    s_s = gl.allocate_shared_memory(gl.bfloat16, [P, N], sd.layout)
     dst_s = gl.allocate_shared_memory(dstd.dtype, [2, P, N], dstd.layout)
-    cv_s = gl.allocate_shared_memory(cvd.dtype, [2, P, N], cvd.layout)
     ready = gl.allocate_shared_memory(gl.int64, [R, 1], BL)
     scaled = gl.allocate_shared_memory(gl.int64, [R, 1], BL)
     free = gl.allocate_shared_memory(gl.int64, [R, 1], BL)
@@ -247,11 +241,11 @@ def _dstates_kernel(dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
     fence_async_shared()
     acc = allocate_tensor_memory(gl.float32, [2, P, N], TL)
     gl.warp_specialize(
-        (do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s, ws_s,
-         dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks, H, P, N, CS, BK, R, NWC, NBLK, WSR),
+        (do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, ws_s,
+         dod, cd, sd, dstd, DA, WS, n_items, seqlen, nchunks, H, P, N, CS, BK, R, NWC, NBLK, WSR),
         _epilogue_partition,
-        (do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, cv_s, ws_s,
-         dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks, H, P, N, CS, BK, R, NWC, NBLK, WSR),
+        (do_s, c_s, ready, scaled, free, acc_done, acc_free, acc, s_s, s_bar, s_free, dst_s, ws_s,
+         dod, cd, sd, dstd, DA, WS, n_items, seqlen, nchunks, H, P, N, CS, BK, R, NWC, NBLK, WSR),
         [_load_partition, _compute_partition, _mma_partition],
         [1, NWC, 1],
         [REGS_W, REGS_C, REGS_W])
@@ -259,8 +253,8 @@ def _dstates_kernel(dod, cd, sd, dstd, cvd, DA, WS, n_items, seqlen, nchunks,
 
 # ------------------------------------------------------------------------------------------------ launcher
 def dstates_train(states, dA_cumsum, dout, C, out_dtype):
-    """(dstates (b, nc, h, P N) in out_dtype, ws (b, h, nc, P / 4) fp32, n_valid = P / 4, conv (b, nc, h, P N) in
-    out_dtype) from the forward's passed states ``states`` (b, nc, h, P, N) fp32 contiguous (``states[0] = 0``), dA_cumsum
+    """(dstates (b, nc, h, P N) in out_dtype, ws (b, h, nc, P / 4) fp32, n_valid = P / 4) from the forward's passed
+    states ``states`` (b, nc, h, P, N) bf16 contiguous (``states[0] = 0``), dA_cumsum
     (b, h, nc, chunk) fp32 contiguous, dout (b, l, h, P) bf16 with a contiguous (h, P) part and C (b, l, 1, N) bf16 with
     unit last stride (see the module docstring)."""
     require_cuda(dout, "dstates_train")
@@ -274,8 +268,8 @@ def dstates_train(states, dA_cumsum, dout, C, out_dtype):
         raise RuntimeError(f"neuronspark.dstates_train: shapes states {tuple(states.shape)} dout {tuple(dout.shape)} C "
                            f"{tuple(C.shape)} dA_cumsum {tuple(dA_cumsum.shape)} (P 64, N 128, >= 2 chunks of a multiple of "
                            f"{BK} tokens covering the sequence)")
-    if states.dtype != torch.float32 or not states.is_contiguous():
-        raise RuntimeError("neuronspark.dstates_train: contiguous fp32 passed states expected")
+    if states.dtype != torch.bfloat16 or not states.is_contiguous():
+        raise RuntimeError("neuronspark.dstates_train: contiguous bf16 passed states expected")
     if dout.dtype != torch.bfloat16 or C.dtype != torch.bfloat16 or out_dtype not in _GL_DT:
         raise RuntimeError(f"neuronspark.dstates_train: bf16 dout / C and an fp32 / bf16 out_dtype expected")
     if (dout.stride(3) != 1 or dout.stride(2) != headdim or dout.stride(0) != seqlen * dout.stride(1) or dout.stride(1) % 8
@@ -286,33 +280,31 @@ def dstates_train(states, dA_cumsum, dout, C, out_dtype):
     dev = dout.device
     nblk = headdim // WS_ROWS
     dstates = torch.empty((batch, nchunks, nheads, headdim * dstate), device=dev, dtype=out_dtype)
-    conv = torch.empty((batch, nchunks, nheads, headdim * dstate), device=dev, dtype=out_dtype)
     ws = torch.empty((batch, nheads, nchunks, nblk), device=dev, dtype=torch.float32)
     rows = batch * nchunks * nheads * headdim
-    b16, f32 = gl.bfloat16, gl.float32
+    b16 = gl.bfloat16
     dod = TensorDescriptor(dout, [batch * seqlen, nheads * headdim], [dout.stride(1), 1], [BK, headdim],
                            gl.NVMMASharedLayout.get_default_for([BK, headdim], b16))
     cd = TensorDescriptor(C, [batch * seqlen, dstate], [C.stride(1), 1], [BK, dstate],
                           gl.NVMMASharedLayout.get_default_for([BK, dstate], b16))
     sd = TensorDescriptor(states, [rows, dstate], [dstate, 1], [headdim, dstate],
-                          gl.NVMMASharedLayout.get_default_for([headdim, dstate], f32))
+                          gl.NVMMASharedLayout.get_default_for([headdim, dstate], b16))
     od = _GL_DT[out_dtype]
     dstd = TensorDescriptor(dstates.view(rows, dstate), [rows, dstate], [dstate, 1], [headdim, dstate],
                             gl.NVMMASharedLayout.get_default_for([headdim, dstate], od))
-    cvd = TensorDescriptor(conv.view(rows, dstate), [rows, dstate], [dstate, 1], [headdim, dstate],
-                           gl.NVMMASharedLayout.get_default_for([headdim, dstate], od))
     n_items = batch * nheads
     G = min(num_sms(dev), n_items)
     with torch.cuda.device(dev.index):
-        _dstates_kernel[(G,)](dod, cd, sd, dstd, cvd, dA_cumsum, ws, n_items, seqlen, nchunks,
+        _dstates_kernel[(G,)](dod, cd, sd, dstd, dA_cumsum, ws, n_items, seqlen, nchunks,
                               H=nheads, P=headdim, N=dstate, CS=chunk, BK=BK, R=R, NWC=NWC, NBLK=nblk, WSR=WS_ROWS,
                               REGS_W=REGS_W, REGS_C=REGS_C, num_warps=4)
-    return dstates, ws, nblk, conv
+    return dstates, ws, nblk
 
 
 def dstates_train_ref(states, dA_cumsum, dout, C, out_dtype):
     """Pure-torch reference (float64 sums; the scaled dout rounded to bf16 at the kernel's point, every exponential in
-    the kernels' fp32 form ``exp2(t log2 e)``): the returns of :func:`dstates_train` (ws of shape (b, h, nc, P / 4))."""
+    the kernels' fp32 form ``exp2(t log2 e)``; the block sums on the given (bf16) passed states): the returns of
+    :func:`dstates_train` (ws of shape (b, h, nc, P / 4))."""
     from neuronspark.ops.triton.dendritic_states import _exp_f32
     b, nc, h, p, n = states.shape
     L = int(dout.shape[1])
@@ -326,14 +318,11 @@ def dstates_train_ref(states, dA_cumsum, dout, C, out_dtype):
     ds = (do.float() * scale_t[..., None]).to(torch.bfloat16).double()  # bf16(dout exp(dA)) as the kernel's operand
     A = torch.einsum("bctgp,bctn->bcgpn", ds, cc)                      # (b, nc, h, P, N)
     dst = torch.zeros_like(s64)
-    conv = torch.zeros_like(s64)
     ws = torch.zeros((b, h, nc, p // WS_ROWS), dtype=torch.float64, device=states.device)
     d = torch.zeros((b, h, p, n), dtype=torch.float64, device=states.device)
     for k in range(nc - 1, 0, -1):
         e = end[:, :, k][..., None, None]                               # (b, h, 1, 1)
-        conv[:, k] = s64[:, k]
         ws[:, :, k] = (s64[:, k] * d).reshape(b, h, p // WS_ROWS, WS_ROWS * n).sum(-1) * e[..., 0]
         d = e * d + A[:, k]
         dst[:, k - 1] = d
-    return (dst.reshape(b, nc, h, p * n).to(out_dtype), ws.float(), p // WS_ROWS,
-            conv.reshape(b, nc, h, p * n).to(out_dtype))
+    return dst.reshape(b, nc, h, p * n).to(out_dtype), ws.float(), p // WS_ROWS

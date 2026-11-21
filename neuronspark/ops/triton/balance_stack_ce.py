@@ -7,21 +7,31 @@ of :mod:`neuronspark.ops.triton.lm_tail` runs the two kernels here for every sta
 (16, 32) and the scales whose readout balance has more projections, e.g. (4, 8, 32) or (4, 8, 128, 256).  The
 balanced logits are not materialised.
 
-* forward (``_stack_fwd_kernel``, one program per row, any number of rows): every balanced value is formed on the fly (the fp32 add and
-  the RNE to bf16 per width, in order), then a per-lane-group online softmax over tiles of ``FWD_TILE_GROUPS`` groups
-  of ``FWD_TILE_COLS`` consecutive columns, each group's running sum with compensated summation (a term is
+* forward (``_stack_fwd_kernel``, one program per row, any number of rows): every balanced value is formed on the
+  fly (the fp32 add and the RNE to bf16 per width, in order), then a per-lane-group online softmax over tiles of
+  ``FWD_TILE_GROUPS`` groups of ``FWD_TILE_COLS`` consecutive columns, each group's running sum with compensated summation (a term is
   ``2^((x - group max) log2 e)``: the difference is formed first, so a group of -inf columns adds nothing).
   Outputs: the row max, ``logsum = log(sum 2^((x - max) log2 e))`` and the
   per-token loss ``-((x_t - max) - logsum)`` (+0 for an ignored row; an out-of-range target traps, as the
   reference's device assert).
-* backward (``_stack_bwd_kernel``, one program per row, any number of rows): each balanced value again, ``logp = (x - max) - logsum``,
-  ``gI = gO - exp(logp) * sum(gO)`` with ``gO`` the nll gradient (``-g`` at the target), rounded to bf16 into a new
-  dense gradient of row length ``P >= V`` (the columns from V on are zeros); and the gradient of every contribution,
-  the sum over the columns ``v`` with ``v % w == c`` of that bf16 gradient: the row is accumulated in fp64 per lane
-  of a ``BWD_TILE``-column tile (every width divides the tile), the lanes are folded to each width and rounded to
-  bf16 once.  (fp64: a width sum holds the target's term and the largest column's term, of opposite signs and up to
-  the upstream gradient in size, beside many small ones; what is left after they cancel is the sum of the small
-  terms, which an fp32 running sum beside either large term drops.)
+* backward (``_stack_bwd_kernel``, one program per row, any number of rows): each balanced value again,
+  ``p = 2^((x - max) log2 e - logsum log2 e)`` (the difference first, as in the forward, then one fma into
+  ``ex2.approx.ftz``: the logits' common offset does not enter the rounding), ``gI = gO - p * sum(gO)`` with
+  ``gO`` the nll gradient (``-g`` at the target), rounded to bf16 into a new dense gradient of row length ``P >= V``
+  (the columns from V on are zeros); and the gradient of every contribution, the sum over the columns ``v`` with
+  ``v % w == c`` of that bf16 gradient: the row is accumulated in fp64 per lane of a ``BWD_TILE``-column tile (every
+  width divides the tile), the lanes are folded to each width and rounded to bf16 once.  (fp64: a width sum holds
+  the target's term and the largest column's term, of opposite signs and up to the upstream gradient in size, beside
+  many small ones; what is left after they cancel is the sum of the small terms, which an fp32 running sum beside
+  either large term drops.)  The full tiles of a row run as three loops, the tiles before the target's, the
+  target's tile and the tiles after it, so only the target's tile (and the masked tail) compares its columns with
+  the target.
+
+The kernels' time is set by the instructions per element and by the warps an SM holds, which the registers per
+thread decide: a thread of the backward holds 8 consecutive columns (16-byte loads and stores, 8 fp64 lanes) and
+the kernel is compiled with a register cap (``BWD_MAXNREG``).  The fp32 add and bf16 rounding of the balance chain
+compile to one packed bf16 addition per two elements; they are written as that add and cast and not as explicit
+conversions.
 
 Numerics: the balanced values and the row max follow the reference chain's rounding points.  The softmax
 denominator, the logarithm and the exponential are this kernel's (ex2.approx, Triton's log and exp); the width sums
@@ -29,7 +39,8 @@ are the reference's sums in another order, with one bf16 rounding where the refe
 the tail.  The reference is ``balance_ce_per_token_ref`` of :mod:`neuronspark.ops.triton.lm_tail` (the torch chain);
 tests: the per-operator tolerance rule of :mod:`neuronspark.utils.testing`.
 
-Contract (anything else raises): 1 to 4 widths, each a power of two with ``4 <= w <= BWD_TILE``; the logits a CUDA
+Contract (anything else raises): 1 to 4 widths, each a power of two with ``4 <= w <= STACK_MAX_WIDTH`` (a width
+divides the forward's tile and the backward's tile); the logits a CUDA
 bf16 (R, V) tensor with unit column stride and at least one forward tile of columns
 (``V >= FWD_TILE_GROUPS * FWD_TILE_COLS``: every lane group of the online softmax then holds a column of the first
 tile); every contribution a CUDA bf16 (R, w) tensor with unit column stride and
@@ -44,21 +55,24 @@ import triton.language as tl
 
 from neuronspark.ops.triton._ptx import _ex2ftz as _sc_ex2  # noqa: F401  (resolved through this module's globals)
 
-__all__ = ["STACK_MAX_WIDTHS", "FWD_TILE_GROUPS", "FWD_TILE_COLS", "FWD_WARPS", "BWD_TILE", "BWD_WARPS", "check_stack",
-           "stack_ce_fwd", "stack_ce_bwd"]
+__all__ = ["STACK_MAX_WIDTHS", "STACK_MAX_WIDTH", "FWD_TILE_GROUPS", "FWD_TILE_COLS", "FWD_WARPS", "BWD_TILE",
+           "BWD_WARPS", "BWD_MAXNREG", "check_stack", "stack_ce_fwd", "stack_ce_bwd"]
 
 LOG2E = tl.constexpr(1.4426950408889634)
 
 # ================================================================================================ fixed launch constants
 #: the most widths a stack has
 STACK_MAX_WIDTHS = 4
+#: the largest width of a stack
+STACK_MAX_WIDTH = 512
 #: forward: tiles of FWD_TILE_GROUPS lane groups x FWD_TILE_COLS consecutive columns, FWD_WARPS warps per row
 FWD_TILE_GROUPS = 128
 FWD_TILE_COLS = 8
 FWD_WARPS = 4
-#: backward: columns per tile (= the largest width), warps per row
-BWD_TILE = 512
-BWD_WARPS = 8
+#: backward: columns per tile (8 per thread), warps per row, registers per thread (12 programs resident per SM)
+BWD_TILE = 1024
+BWD_WARPS = 4
+BWD_MAXNREG = 40
 
 
 # ================================================================================================ kernels
@@ -166,11 +180,23 @@ def _stack_fwd_kernel(X, C0, C1, C2, C3, T, MX, LS, LOSS, SX, S0, S1, S2, S3, IG
 
 
 @triton.jit
-def _sc_grad(x, c0, c1, c2, c3, cols, tg32, mx, ls, v, NW: tl.constexpr):
-    """raw bf16 logits x -> the fp32 gradient before its bf16 rounding: gO - exp(logp) * sum(gO)."""
-    xf = _sc_bal(x.to(tl.float32), c0, c1, c2, c3, NW)
-    e = tl.exp((xf - mx) - ls)
-    return tl.where(cols == tg32, v, 0.0) - e * v
+def _sc_prob(x, c0, c1, c2, c3, mx, k, NW: tl.constexpr):
+    """raw bf16 logits x -> the softmax probability 2^((balanced x - max) * log2 e + k), k = -logsum * log2 e."""
+    return _sc_ex2((_sc_bal(x.to(tl.float32), c0, c1, c2, c3, NW) - mx) * LOG2E + k)
+
+
+@triton.jit
+def _sc_tile(X, DX, rx, rd, cols, c0, c1, c2, c3, mx, k, v, tg32, acc, NW: tl.constexpr, TARGET: tl.constexpr):
+    """One full tile: the gradient gO - p * sum(gO) stored as bf16 and added to the lanes' sums.  TARGET: the tile
+    may hold the target's column (gO = v there); otherwise gO is zero in the whole tile."""
+    e = _sc_prob(tl.load(X + rx + cols), c0, c1, c2, c3, mx, k, NW)
+    if TARGET:
+        gi = tl.where(cols == tg32, v, 0.0) - e * v
+    else:
+        gi = 0.0 - e * v
+    gb = gi.to(tl.bfloat16, fp_downcast_rounding="rtne")
+    tl.store(DX + rd + cols, gb)
+    return acc + gb.to(tl.float32).to(tl.float64)
 
 
 @triton.jit
@@ -210,21 +236,28 @@ def _stack_bwd_kernel(X, C0, C1, C2, C3, T, MX, LS, G, DX, D0, D1, D2, D3, SX, S
     g = tl.load(G + r * SG + z)
     valid = tg != IGNORE
     v = tl.where(valid, -g, 0.0)                                              # gO at the target = the row sum of gO
-    tg32 = tl.where(valid, tg, -1).to(tl.int32)
+    tg32 = tl.where(valid & (tg >= 0) & (tg < V), tg, -1).to(tl.int32)        # no column for a label outside [0, V)
+    k = ls * (-LOG2E)
     acc = tl.zeros([TILE], tl.float64)                                        # the lanes' sums of the bf16 gradient
     NFULL: tl.constexpr = V // TILE                                           # tiles with every column below V
     NT: tl.constexpr = (P + TILE - 1) // TILE
-    for i in range(0, NFULL):
-        cols = i * TILE + ar
-        x = tl.load(X + rx + cols)
-        gb = _sc_grad(x, c0, c1, c2, c3, cols, tg32, mx, ls, v, NW).to(tl.bfloat16, fp_downcast_rounding="rtne")
-        tl.store(DX + rd + cols, gb)
-        acc += gb.to(tl.float32).to(tl.float64)
+    # the full tiles: [0, n1) before the target's tile, [n1, n2) the target's tile (none when the row is ignored,
+    # the label is outside [0, V) or the target lies in the masked tail), [n2, NFULL) after it
+    tgs = tl.load(T + r)
+    it = tl.where((tgs != IGNORE) & (tgs >= 0) & (tgs < V), tgs // TILE, NFULL).to(tl.int32)
+    n1 = tl.minimum(it, NFULL)
+    n2 = tl.minimum(it + 1, NFULL)
+    for i in range(0, n1):
+        acc = _sc_tile(X, DX, rx, rd, i * TILE + ar, c0, c1, c2, c3, mx, k, v, tg32, acc, NW, False)
+    for i in range(n1, n2):
+        acc = _sc_tile(X, DX, rx, rd, i * TILE + ar, c0, c1, c2, c3, mx, k, v, tg32, acc, NW, True)
+    for i in range(n2, NFULL):
+        acc = _sc_tile(X, DX, rx, rd, i * TILE + ar, c0, c1, c2, c3, mx, k, v, tg32, acc, NW, False)
     for i in tl.static_range(NFULL, NT):
         cols = i * TILE + ar
         ok = cols < V
-        x = tl.load(X + rx + cols, mask=ok, other=0.0)
-        gi = tl.where(ok, _sc_grad(x, c0, c1, c2, c3, cols, tg32, mx, ls, v, NW), 0.0)
+        e = _sc_prob(tl.load(X + rx + cols, mask=ok, other=0.0), c0, c1, c2, c3, mx, k, NW)
+        gi = tl.where(ok, tl.where(cols == tg32, v, 0.0) - e * v, 0.0)
         gb = gi.to(tl.bfloat16, fp_downcast_rounding="rtne")
         tl.store(DX + rd + cols, gb, mask=cols < P)
         acc += gb.to(tl.float32).to(tl.float64)
@@ -248,9 +281,9 @@ def check_stack(R: int, V: int, contribs: Sequence[torch.Tensor], widths: Sequen
         raise RuntimeError(f"balance_ce_per_token: at least {FWD_TILE_GROUPS * FWD_TILE_COLS} columns (one forward "
                            f"tile) are needed, got V={V}")
     for w, t in zip(widths, contribs):
-        if w < 4 or w & (w - 1) or w > BWD_TILE:
+        if w < 4 or w & (w - 1) or w > STACK_MAX_WIDTH:
             raise RuntimeError(f"balance_ce_per_token: width {w} of the stack {widths} must be a power of two with "
-                               f"4 <= w <= {BWD_TILE}")
+                               f"4 <= w <= {STACK_MAX_WIDTH}")
         if (not isinstance(t, torch.Tensor) or t.dtype != torch.bfloat16 or t.device != device
                 or tuple(t.shape) != (R, w) or t.stride(1) != 1 or (R > 1 and t.stride(0) < w)):
             raise RuntimeError(f"balance_ce_per_token: the contribution of width {w} must be a CUDA bf16 ({R}, {w}) "
@@ -300,5 +333,5 @@ def stack_ce_bwd(logits: torch.Tensor, labels: torch.Tensor, mx: torch.Tensor, l
     _stack_bwd_kernel[(R,)](logits, c[0], c[1], c[2], c[3], labels, mx, ls, g, grad, d[0], d[1], d[2], d[3],
                             int(logits.stride(0)), P, int(g.stride(0)), s[0], s[1], s[2], s[3], int(ignore_index),
                             V=V, P=P, W0=w[0], W1=w[1], W2=w[2], W3=w[3], NW=len(widths), TILE=BWD_TILE,
-                            num_warps=BWD_WARPS)
+                            num_warps=BWD_WARPS, maxnreg=BWD_MAXNREG)
     return [grad] + outs

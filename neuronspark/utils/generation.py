@@ -21,7 +21,8 @@ Sampling (:func:`next_tokens`): ``top_k == 1`` is greedy (the first index on tie
 the temperature and filtered in this order -- the ``top_k`` largest (``top_k > 1``), the tokens whose probability is at
 least ``min_p`` times the largest one (``0 < min_p < 1``), the most probable tokens whose cumulative probability first
 reaches ``top_p`` (``0 < top_p < 1``) -- and one token is drawn from the remaining distribution.  ``teacher_outputs``
-(B, >= max_length) forces the tokens instead (teacher-forced decoding).
+(B, >= max_length) forces the tokens instead (teacher-forced decoding).  A model with ``agree_tokens(tokens)`` (a model
+split across GPUs, each process with its own random stream) is handed every drawn token and returns the one to use.
 """
 from __future__ import annotations
 
@@ -339,6 +340,7 @@ def decode(input_ids: torch.Tensor, model, max_length: int, top_k: int = 1, top_
     if streamer is not None:
         streamer.put(input_ids.cpu())
     forced = int(teacher_outputs.shape[1]) if teacher_outputs is not None else 0
+    agree = getattr(model, "agree_tokens", None)
     pieces, scores = [input_ids], []
     seen = input_ids
     if graph is not None:                                                                   # prefill
@@ -354,6 +356,8 @@ def decode(input_ids: torch.Tensor, model, max_length: int, top_k: int = 1, top_
             tok = teacher_outputs[:, pos]
         else:
             tok = next_tokens(logits, top_k=top_k, top_p=top_p, min_p=min_p, temperature=temperature)
+            if agree is not None and top_k != 1:
+                tok = agree(tok)
         tok = tok.to(torch.int64).unsqueeze(1)
         pieces.append(tok)
         if repetition_penalty != 1.0:

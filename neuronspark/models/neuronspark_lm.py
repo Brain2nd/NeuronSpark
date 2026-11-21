@@ -4,10 +4,10 @@
 Backbone (state-dict prefix ``backbone.``)::
 
     x    = embed_tokens(ids)                                  (T, B, D) fp32 residual stream
-    lex  = lexical_memory(ids)                                (T, B, 160) fp32, model level, read by every hippocampal
-    layer ind  = induction id windows (orders 2, 3, 4)              int32, model level copy = copy-detector statistics
-    (maximum, lse)            (T, B) fp32 each, model level for i in 0 .. 23:   x = DendriticNeuronLayer_i(x)
-    18 dendritic neuron layers (i not in 3, 7, 11, 15, 19, 23)
+    for i in 0 .. 23:   x = DendriticNeuronLayer_i(x)         18 dendritic neuron layers (i not in 3, 7, 11, 15, 19, 23)
+        before i = 3:   lex  = lexical_memory(ids)            (T, B, 160) fp32, model level
+                        ind  = induction id windows           orders 2, 3, 4, int32, model level
+                        copy = copy-detector statistics       (maximum, lse) of lex, (T, B) fp32 each, model level
                         x, carry = HippocampalLayer_i(x, lex, ind, copy, carry)     6 hippocampal layers (3:1 layout)
     h    = norm(x)                                            RMSNorm, eps 1e-6
     returned as (B, T, D) fp32
@@ -24,7 +24,8 @@ Regimes (decided in :meth:`NeuronSparkModel.forward`, one code path each):
   autocast, TF32 on for fp32 matmuls).  T must be a multiple of ``dendritic_chunk_size`` (256) on the kernel path; the
   residual stream is the (T, B, D) view of the contiguous (B, T, D) embedding output; consecutive dendritic neuron
   layers join one layer's residual addition with the next layer's pre-norm (``dendritic_resid_norm``) unless activation
-  checkpointing is active. Works with or without autograd.
+  checkpointing is active; ``lex``, ``ind`` and ``copy`` are made just before the first hippocampal layer (the backward
+  then completes the lexical tables' gradients right after that layer's).  Works with or without autograd.
 * ``inference_params`` given -> inference under ``regime("infer")`` (bf16 autocast, TF32 off, no reduced-precision bf16
   GEMM reductions) and ``torch.no_grad()``: T >= 2 is a prefill, T == 1 a decode step.  The stream is made contiguous
   T-major for T >= 2; the model-level session state (lexical window, induction keys ring, copy-operand ring) and every
@@ -263,9 +264,7 @@ class NeuronSparkModel(nn.Module):
             raise TypeError("NeuronSparkModel: aux_out must be a list")
         with regime("train"):
             x = self.embed_tokens(ids).transpose(0, 1)                       # (T, B, D) fp32, B-major storage
-            lex = self.lexical_memory(ids)                                   # (T, B, 160) fp32
-            ind = induction_token_windows(ids, cfg.hippocampal_induction_bias_orders, pad=int(cfg.vocab_size))
-            copy = copy_stats_whole_row(lex, tuple(cfg.lexical_order1_slice))
+            lex = ind = copy = None                                          # (made before the first hippocampal layer)
             n_dend = sum(1 for layer in self.layers if not isinstance(layer, HippocampalLayer))
             k = checkpointed_dendritic_layers(self.gradient_checkpointing, n_dend) if torch.is_grad_enabled() else 0
             ckpt_h = k == n_dend > 0 and bool(self.hippocampal_checkpointing)
@@ -282,6 +281,15 @@ class NeuronSparkModel(nn.Module):
                     if hn is not None:
                         raise RuntimeError(f"NeuronSparkModel: layer {i} is a hippocampal layer, but the previous "
                                            "dendritic layer prepared a dendritic-layer pre-norm for it")
+                    if lex is None:
+                        # the model-level operands of the hippocampal layers, made here rather than before the layers:
+                        # autograd runs the ready node created last first, so the backward then writes the lexical
+                        # tables' gradients right after this layer's backward, not after the layers below it (which
+                        # leaves data-parallel training their reduction to hide behind those layers' backward)
+                        lex = self.lexical_memory(ids)                       # (T, B, 160) fp32
+                        ind = induction_token_windows(ids, cfg.hippocampal_induction_bias_orders,
+                                                      pad=int(cfg.vocab_size))
+                        copy = copy_stats_whole_row(lex, tuple(cfg.lexical_order1_slice))
                     if ckpt_h:
                         x, carry = checkpoint(self._hippocampal_once(layer, lex, ind, copy, aux_out, calib), x, carry,
                                               use_reentrant=False, preserve_rng_state=False)

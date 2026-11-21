@@ -13,7 +13,7 @@ from typing import Tuple, Union
 
 import torch
 
-__all__ = ["device_capability", "num_sms", "require_cuda", "require_sm100", "SM100"]
+__all__ = ["device_capability", "num_sms", "require_cuda", "require_no_grad", "require_sm100", "SM100"]
 
 SM100 = (10, 0)
 
@@ -59,6 +59,13 @@ def require_cuda(t: torch.Tensor, what: str) -> None:
     """Raise unless ``t`` is a CUDA tensor."""
     if not isinstance(t, torch.Tensor) or not t.is_cuda:
         raise RuntimeError(f"neuronspark.{what}: CUDA tensors are required")
+
+
+def require_no_grad(what: str, *tensors) -> None:
+    """Raise if grad mode is on and an operand (``None`` skipped) requires grad: the inference operator ``what`` has no
+    backward, so its result would silently carry no gradient."""
+    if torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in tensors):
+        raise RuntimeError(f"neuronspark.{what}: an inference operator (no autograd): call it under torch.no_grad()")
 
 
 def require_sm100(dev: _Device, what: str) -> None:

@@ -36,15 +36,26 @@ Ops (inference, no autograd; ``send`` is the peer's region, ``recv`` this GPU's,
   in fp32 and rounded once, as the one-GPU product is), ``h_new = h + f32(upd)`` (fp32 residual stream, (B, D)), and
   with ``gain`` the next dendritic neuron layer's pre-norm ``hn = bf16(h_new * rstd * gain)``, ``rstd =
   1 / sqrt(mean(h_new^2) + eps)`` (else None).  One program per row (B * D words).
+* ``tp_tail_gather(h, ffn, y, rho, lo, batch, send, recv, gain=None, eps=1e-5) -> (h_out, hn)``: the end of a
+  hippocampal layer's decode step whose batch is split between the GPUs: this GPU's rows [lo, lo + n) of the
+  ``batch`` rows are the layer's last addition, formed here (``pkm_tail_step(h, ffn, y, rho)`` of
+  :mod:`neuronspark.ops.triton.hippo_step`, the same arithmetic: ``h`` (n, D) fp32, ``ffn`` / ``y`` (n, D) bf16,
+  ``rho`` (n,) fp32), the peer forms the others; ``h_out`` (batch, D) fp32 every row on both GPUs, and with ``gain``
+  the next dendritic neuron layer's pre-norm of every row (``tp_join``'s).  One program per row: a row of this GPU's
+  is formed and published (its words at row * D of the peer's region), a row of the peer's received (batch * D words;
+  every word has one writer, the GPU that holds its row, and one reader).
 
 With two GPUs ``a + b`` is the same fp32 number on both (addition is commutative), so both GPUs hold the same sums.
 
-Launch constants: ``JOIN_WARPS`` warps per row program, its block at least 32 x ``JOIN_WARPS`` columns; the greedy
+Launch constants: ``JOIN_WARPS`` warps per row program of ``tp_join``, its block at least 32 x ``JOIN_WARPS``
+columns; ``tp_tail_gather`` the warps of the one-GPU tail (``HIPPO_STEP_WARPS``), its block at least 32 x as many
+columns (at the model's widths, D >= 512, the tail kernel's own block: the same row sum, the same rows); the greedy
 pick's one warp holds a block of at least 32 rows (one word per thread).
 
-References: :func:`tp_join_ref` and :func:`tp_greedy_pick_ref` take the peer's values as arguments.  A one-GPU test
-passes the same buffer as ``send`` and ``recv`` (the program then reads its own words: the peer's values are its
-own).
+References: :func:`tp_join_ref`, :func:`tp_tail_gather_ref` and :func:`tp_greedy_pick_ref` take the peer's values as
+arguments.  A one-GPU test passes the same buffer as ``send`` and ``recv`` (the program then reads its own words: the
+peer's values are its own), or fills ``recv`` with the peer's flagged words before the call (``tp_tail_gather``: its
+received rows are words that this GPU does not publish).
 """
 from __future__ import annotations
 
@@ -54,10 +65,11 @@ import torch
 import triton
 import triton.language as tl
 
-from neuronspark.ops.triton import require_cuda
+from neuronspark.ops.triton import require_cuda, require_no_grad
+from neuronspark.ops.triton.hippo_step import HIPPO_STEP_WARPS, pkm_tail_row, pkm_tail_step_ref
 
-__all__ = ["JOIN_WARPS", "mailbox_swap", "mailbox_swap1", "tp_join", "tp_join_ref", "tp_greedy_pick",
-           "tp_greedy_pick_ref"]
+__all__ = ["JOIN_WARPS", "mailbox_send", "mailbox_recv", "mailbox_swap", "mailbox_swap1", "tp_join", "tp_join_ref",
+           "tp_tail_gather", "tp_tail_gather_ref", "tp_greedy_pick", "tp_greedy_pick_ref"]
 
 JOIN_WARPS = 4
 
@@ -80,18 +92,32 @@ def _poll(ptr, m):
 
 
 @triton.jit
-def mailbox_swap(x, send_ptrs, recv_ptrs, m):
-    """fp32 ``x`` (a block whose elements each live in one thread) to the peer's words ``send_ptrs``; returns the
-    peer's values from this GPU's words ``recv_ptrs`` (cleared after use).  ``m``: the block's mask (bool)."""
-    mi = m.to(tl.int32)
+def mailbox_send(x, send_ptrs, m):
+    """fp32 ``x`` (a block whose elements each live in one thread) to the peer's words ``send_ptrs`` where ``m``
+    (bool)."""
     bits = x.to(tl.int32, bitcast=True).to(tl.int64) & 4294967295
-    _publish(send_ptrs, bits | 4294967296, mi)
+    _publish(send_ptrs, bits | 4294967296, m.to(tl.int32))
+
+
+@triton.jit
+def mailbox_recv(recv_ptrs, m):
+    """The peer's fp32 values from this GPU's words ``recv_ptrs`` where ``m`` (bool), once every one is flagged; the
+    words cleared after the program's barrier."""
+    mi = m.to(tl.int32)
     w = _poll(recv_ptrs, mi)
     while tl.min((w >> 32).to(tl.int32)) == 0:
         w = _poll(recv_ptrs, mi)
     tl.debug_barrier()                       # every thread has its words before any thread clears one
     _publish(recv_ptrs, tl.zeros_like(w), mi)
     return (w & 4294967295).to(tl.int32).to(tl.float32, bitcast=True)
+
+
+@triton.jit
+def mailbox_swap(x, send_ptrs, recv_ptrs, m):
+    """fp32 ``x`` (a block whose elements each live in one thread) to the peer's words ``send_ptrs``; returns the
+    peer's values from this GPU's words ``recv_ptrs`` (cleared after use).  ``m``: the block's mask (bool)."""
+    mailbox_send(x, send_ptrs, m)
+    return mailbox_recv(recv_ptrs, m)
 
 
 @triton.jit
@@ -116,6 +142,25 @@ def _tp_join_kernel(P, H, G, HO, HN, SEND, RECV, D, eps, s_p, s_h, s_ho, s_hn,
     q = mailbox_swap(p, SEND + row * D + o, RECV + row * D + o, m)
     upd = (p + q).to(tl.bfloat16).to(tl.float32)
     h = tl.load(H + row * s_h + o, mask=m, other=0.0) + upd
+    tl.store(HO + row * s_ho + o, h, mask=m)
+    if NORM:
+        var = tl.sum(tl.where(m, h * h, 0.0), axis=0) / D
+        rstd = 1 / tl.sqrt(var + eps)
+        g = tl.load(G + o, mask=m, other=0.0)
+        tl.store(HN + row * s_hn + o, (h * rstd * g).to(tl.bfloat16), mask=m)
+
+
+@triton.jit
+def _tp_tail_gather_kernel(H, F, Y, RHO, G, HO, HN, SEND, RECV, D, lo, hi, eps, s_h, s_f, s_y, s_ho, s_hn,
+                           BD: tl.constexpr, NORM: tl.constexpr):
+    row = tl.program_id(0)
+    o = tl.arange(0, BD)
+    m = o < D
+    if (row >= lo) & (row < hi):                                     # this GPU's row: formed and published
+        h = pkm_tail_row(H, F, Y, RHO, (row - lo).to(tl.int64), s_h, s_f, s_y, D, o, m)
+        mailbox_send(h, SEND + row * D + o, m)
+    else:                                                            # the peer's row: received
+        h = mailbox_recv(RECV + row * D + o, m)
     tl.store(HO + row * s_ho + o, h, mask=m)
     if NORM:
         var = tl.sum(tl.where(m, h * h, 0.0), axis=0) / D
@@ -165,6 +210,7 @@ def tp_join(partial: torch.Tensor, h: torch.Tensor, send: torch.Tensor, recv: to
     if gain is not None and (tuple(gain.shape) != (D,) or gain.dtype != torch.float32 or not gain.is_contiguous()):
         raise RuntimeError(f"neuronspark.tp_join: gain must be contiguous fp32 ({D},)")
     _check_region(send, recv, B * D, partial.device)
+    require_no_grad("tp_join", partial, h, gain)
     ho = torch.empty((B, D), dtype=torch.float32, device=h.device)
     hn = torch.empty((B, D), dtype=torch.bfloat16, device=h.device) if gain is not None else None
     with torch.cuda.device(h.device.index):
@@ -173,6 +219,43 @@ def tp_join(partial: torch.Tensor, h: torch.Tensor, send: torch.Tensor, recv: to
                               hn.stride(0) if hn is not None else 0,
                               BD=max(triton.next_power_of_2(D), 32 * JOIN_WARPS),
                               NORM=gain is not None, num_warps=JOIN_WARPS)
+    return ho, hn
+
+
+def tp_tail_gather(h: torch.Tensor, ffn: torch.Tensor, y: torch.Tensor, rho: torch.Tensor, lo: int, batch: int,
+                   send: torch.Tensor, recv: torch.Tensor, gain: Optional[torch.Tensor] = None,
+                   eps: float = 1e-5) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """``(every row (batch, D) fp32, bf16 pre-norm of every row or None)``: this GPU's rows [lo, lo + n) the tail
+    ``pkm_tail_step(h, ffn, y, rho)`` of its n rows, the others the peer's (see the module docstring)."""
+    require_cuda(h, "tp_tail_gather")
+    if h.dim() != 2 or h.dtype != torch.float32 or h.stride(-1) != 1:
+        raise RuntimeError(f"neuronspark.tp_tail_gather: h must be fp32 (n, D) with unit last stride, got {h.dtype} "
+                           f"{tuple(h.shape)} stride {tuple(h.stride())}")
+    n, D = (int(s) for s in h.shape)
+    for name, t in (("ffn", ffn), ("y", y)):
+        if tuple(t.shape) != (n, D) or t.dtype != torch.bfloat16 or t.stride(-1) != 1 or t.device != h.device:
+            raise RuntimeError(f"neuronspark.tp_tail_gather: {name} must be bf16 ({n}, {D}) with unit last stride on "
+                               f"{h.device}, got {t.dtype} {tuple(t.shape)} stride {tuple(t.stride())}")
+    if tuple(rho.shape) != (n,) or rho.dtype != torch.float32 or not rho.is_contiguous() or rho.device != h.device:
+        raise RuntimeError(f"neuronspark.tp_tail_gather: rho must be a contiguous fp32 ({n},) tensor on {h.device}, "
+                           f"got {rho.dtype} {tuple(rho.shape)}")
+    B, lo = int(batch), int(lo)
+    if lo < 0 or lo + n > B or not 1 <= n < B:
+        raise RuntimeError(f"neuronspark.tp_tail_gather: this GPU's rows [{lo}, {lo + n}) must lie in the batch of "
+                           f"{B} rows, at least one row on each GPU")
+    if gain is not None and (tuple(gain.shape) != (D,) or gain.dtype != torch.float32 or not gain.is_contiguous()
+                             or gain.device != h.device):
+        raise RuntimeError(f"neuronspark.tp_tail_gather: gain must be contiguous fp32 ({D},) on {h.device}")
+    _check_region(send, recv, B * D, h.device)
+    require_no_grad("tp_tail_gather", h, ffn, y, rho, gain)
+    ho = torch.empty((B, D), dtype=torch.float32, device=h.device)
+    hn = torch.empty((B, D), dtype=torch.bfloat16, device=h.device) if gain is not None else None
+    with torch.cuda.device(h.device.index):
+        _tp_tail_gather_kernel[(B,)](h, ffn, y, rho, gain if gain is not None else ho, ho,
+                                     hn if hn is not None else ho, send, recv, D, lo, lo + n, float(eps), h.stride(0),
+                                     ffn.stride(0), y.stride(0), ho.stride(0), hn.stride(0) if hn is not None else 0,
+                                     BD=max(triton.next_power_of_2(D), 32 * HIPPO_STEP_WARPS), NORM=gain is not None,
+                                     num_warps=HIPPO_STEP_WARPS, enable_fp_fusion=False)
     return ho, hn
 
 
@@ -209,7 +292,27 @@ def tp_join_ref(partial: torch.Tensor, partial_peer: torch.Tensor, h: torch.Tens
     """Pure torch: ``upd = bf16(partial + partial_peer)``, ``h_new = h + f32(upd)``, the pre-norm in fp32 rounded to
     bf16 once."""
     h_new = h + (partial + partial_peer).to(torch.bfloat16).float()
+    return h_new, _prenorm_ref(h_new, gain, eps)
+
+
+def tp_tail_gather_ref(h: torch.Tensor, ffn: torch.Tensor, y: torch.Tensor, rho: torch.Tensor, x_peer: torch.Tensor,
+                       lo: int, gain: Optional[torch.Tensor] = None,
+                       eps: float = 1e-5) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Pure torch: rows [lo, lo + n) the tail of this GPU's rows (:func:`neuronspark.ops.triton.hippo_step
+    .pkm_tail_step_ref`), the others the peer's rows ``x_peer`` (its tails) in their order; the pre-norm in fp32
+    rounded to bf16 once."""
+    x = pkm_tail_step_ref(h, ffn, y, rho)
+    n, B = int(x.shape[0]), int(x.shape[0]) + int(x_peer.shape[0])
+    own = torch.zeros(B, dtype=torch.bool, device=x.device)
+    own[int(lo):int(lo) + n] = True
+    h = torch.empty((B, int(x.shape[1])), dtype=torch.float32, device=x.device)
+    h[own] = x.float()
+    h[~own] = x_peer.float()
+    return h, _prenorm_ref(h, gain, eps)
+
+
+def _prenorm_ref(h: torch.Tensor, gain: Optional[torch.Tensor], eps: float) -> Optional[torch.Tensor]:
     if gain is None:
-        return h_new, None
-    rstd = torch.rsqrt(h_new.pow(2).mean(dim=-1, keepdim=True) + eps)
-    return h_new, (h_new * rstd * gain).to(torch.bfloat16)
+        return None
+    rstd = torch.rsqrt(h.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return (h * rstd * gain).to(torch.bfloat16)

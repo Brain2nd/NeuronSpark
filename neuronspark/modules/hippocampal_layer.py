@@ -14,7 +14,8 @@ One call, residual stream h (T, B, D) fp32:
     19. rho = 2 sigmoid(-4 pi)
     20. h_out = h' + f32(bf16(ffn + bf16(y_g - mean_c y_g))),  y_g = bf16(f32(y) rho)
 
-``forward(h, *, lex, ind, copy, carry=None, inference_params=None, aux_out=None, calib=None) -> (h_out, carry)``:
+``forward(h, *, lex, ind, copy, carry=None, inference_params=None, aux_out=None, calib=None, tail=None) -> (h_out,
+carry)``:
 
 * ``lex`` (T, B, 160) fp32: the model-level lexical vector of this call (inference: fp32 or its bf16 rounding, the
   operand of the layer's lexical projections);
@@ -30,7 +31,11 @@ One call, residual stream h (T, B, D) fp32:
 * ``aux_out`` (whole row): a list that receives ``(z.detach(), r.detach(), pi)`` of this layer, the operands of the
   supervised copy switch;
 * ``calib`` (whole row): the launch-calibration capture object (protocol in :mod:`neuronspark.modules.pkm`); while
-  it is given, a layer whose PKM is not ready adds no PKM read and no read gain.
+  it is given, a layer whose PKM is not ready adds no PKM read and no read gain;
+* ``tail`` (a decode step only): a function of ``(h', ffn, y, rho)`` -- the stream after the read gain (B, D) fp32,
+  the FFN's output and the PKM read (B, D) bf16, the copy gate (B,) fp32 -- whose result the layer returns in place of
+  step 20 (``ops.pkm_tail_step``), for a caller that forms that addition in a kernel of its own (the tensor-parallel
+  join of a split batch, :mod:`neuronspark.utils.tensor_parallel`).
 
 A ``neuronspark.utils.probe.HippocampalProbe`` attached to a layer (``layer.probe``, None by default) reads, in the
 whole-row forward, the pool attention's decay and write gate, the copy arbitration's factors, the FFN neurons' spikes
@@ -54,7 +59,7 @@ registered flat on the layer by the four mixins, plus the submodules ``gate_neur
 """
 from __future__ import annotations
 
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -154,9 +159,12 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
     # ------------------------------------------------------------------------------------------------ forward
     def forward(self, h: torch.Tensor, *, lex: torch.Tensor, ind, copy: Tuple[torch.Tensor, torch.Tensor],
                 carry: Optional[torch.Tensor] = None, inference_params: Optional[InferenceParams] = None,
-                aux_out: Optional[List[tuple]] = None, calib=None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                aux_out: Optional[List[tuple]] = None, calib=None,
+                tail: Optional[Callable] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if h.dim() != 3 or int(h.shape[-1]) != self.D or h.dtype != torch.float32:
             raise RuntimeError(f"HippocampalLayer: h must be fp32 (T, B, {self.D}), got {tuple(h.shape)} {h.dtype}")
+        if tail is not None and (inference_params is None or int(h.shape[0]) != 1):
+            raise RuntimeError("HippocampalLayer: tail belongs to a decode step (inference_params given, T == 1)")
         _require_bf16_autocast(h)
         if inference_params is None:
             return self._forward_train(h, lex, ind, copy, carry, aux_out, calib)
@@ -174,7 +182,7 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
         if B != int(ip.max_batch_size) or tuple(st.pool_cum.shape[:1]) != (B,):
             raise RuntimeError(f"HippocampalLayer: batch {B} for a cache of {ip.max_batch_size} rows")
         if int(h.shape[0]) == 1:
-            return self._forward_infer(h, lex, ind, copy, carry, st, ip, step=True)
+            return self._forward_infer(h, lex, ind, copy, carry, st, ip, step=True, tail=tail)
         return self._forward_infer(h, lex, ind, copy, carry, st, ip, step=False)
 
     def _check_copy(self, copy, T: int, B: int) -> None:
@@ -223,13 +231,14 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
         return o.pkm_tail(h, ffn, y, rho), carry_out
 
     # ------------------------------------------------------------------------------------------------ inference
-    def _forward_infer(self, h, lex, ind, copy, carry, st: HippocampalState, ip: InferenceParams, step: bool):
+    def _forward_infer(self, h, lex, ind, copy, carry, st: HippocampalState, ip: InferenceParams, step: bool,
+                       tail: Optional[Callable] = None):
         o = self._ops
         T, B, _ = (int(s) for s in h.shape)
         self._check_copy(copy, T, B)
         pos0, ptr0, W = ip.pos, ip.ring_ptr, int(ip.max_seqlen)
         if step:
-            return self._forward_step(h, lex, ind, copy, carry, st, pos0, ptr0, W)
+            return self._forward_step(h, lex, ind, copy, carry, st, pos0, ptr0, W, tail)
         h = self._lexical_read_infer(h, lex)
         z = rows_rmsnorm(o, h, self.norm_eps, out_dtype=h.dtype)
         r, carry_out = self._attention_prefill(h, z, ind, carry, st, pos0, ptr0, W)
@@ -247,9 +256,10 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
             y = (y.float() * rho.unsqueeze(-1)).to(y.dtype)
         return h + (ffn + (y - y.mean(dim=-1, keepdim=True))), carry_out
 
-    def _forward_step(self, h, lex, ind, copy, carry, st: HippocampalState, pos0, ptr0, W: int):
+    def _forward_step(self, h, lex, ind, copy, carry, st: HippocampalState, pos0, ptr0, W: int,
+                      tail: Optional[Callable] = None):
         """The decode step (h (1, B, D) fp32): the lexical read with the frozen norm of its result, the attention
-        sub-block, the residual read, the FFN and the PKM read."""
+        sub-block, the residual read, the FFN and the PKM read; the last addition, or ``tail`` of its operands."""
         o = self._ops
         # the stream after the lexical read and its frozen norm, each in fp32 and in bf16 (the projections' operands)
         h2, hb, z2, zb = self._lexical_read_step(h, lex, self.norm_eps)
@@ -269,4 +279,6 @@ class HippocampalLayer(PoolAttentionMixin, LexicalReadMixin, CopyGateMixin, PKMM
         zs = self.input_neuron2(x_hat.unsqueeze(0), st.input_neuron2, pos0, out_dtype=torch.bfloat16)
         ffn = o.linear(self.snn_ffn(zs, st.ffn_gate, st.ffn_up, pos0), self.ffn_out_proj.weight)
         y = self._pkm_read_step(xb)
+        if tail is not None:
+            return tail(h2, ffn[0], y, rho), carry_out
         return o.pkm_tail_step(h2, ffn[0], y, rho).unsqueeze(0), carry_out

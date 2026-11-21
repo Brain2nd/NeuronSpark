@@ -27,7 +27,7 @@ import torch
 import triton
 import triton.language as tl
 
-from neuronspark.ops.triton import require_cuda
+from neuronspark.ops.triton import require_cuda, require_no_grad
 from neuronspark.ops.triton._ptx import _sr_bf16_to_f32, _sr_f32_to_bf16, _sr_mul_rn, _sr_release
 from neuronspark.ops.triton.dendritic_gated_norm import NUM_WARPS as GN_WARPS, THREADS as GN_THREADS, VEC as GN_VEC
 from neuronspark.ops.triton.dendritic_gated_norm import _rep_gate, _rep_load, _soma_store
@@ -174,6 +174,7 @@ def tp_step_core(proj: torch.Tensor, conv_state: torch.Tensor, ssm_state: torch.
         raise RuntimeError(f"neuronspark.tp_step_core: proj must be bf16 (b, {2 * di + 2 * N + H}), got "
                            f"{proj.dtype} {tuple(proj.shape)}")
     _region(send, recv, k2_words(b, di), proj.device, "tp_step_core")
+    require_no_grad("tp_step_core", proj, conv_state, ssm_state, conv_w, conv_b, A, dt_bias, D, theta, gamma)
     route = k1_route(b)
     bm, nw = k1_tile(b)
     with torch.cuda.device(proj.device.index):
@@ -213,6 +214,7 @@ def tp_gated_norm_soma(y: torch.Tensor, z: torch.Tensor, theta: torch.Tensor, ga
     if N > 16384:
         raise RuntimeError(f"neuronspark.tp_gated_norm_soma: at most 16384 channels per GPU, got {N}")
     _region(send, recv, M, y.device, "tp_gated_norm_soma")
+    require_no_grad("tp_gated_norm_soma", y, z, theta, gamma)
     if n_out is not None and (tuple(n_out.shape) != (M, N) or n_out.dtype != torch.bfloat16
                               or not n_out.is_contiguous()):
         raise RuntimeError(f"neuronspark.tp_gated_norm_soma: n_out must be contiguous bf16 ({M}, {N})")

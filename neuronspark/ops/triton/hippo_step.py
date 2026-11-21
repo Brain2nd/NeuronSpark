@@ -36,7 +36,8 @@ from neuronspark.ops.triton._ptx import (  # noqa: F401  (resolved by the kernel
     _sub_rn,
 )
 
-__all__ = ["HIPPO_STEP_WARPS", "read_gain_step", "read_gain_step_ref", "pkm_tail_step", "pkm_tail_step_ref"]
+__all__ = ["HIPPO_STEP_WARPS", "read_gain_step", "read_gain_step_ref", "pkm_tail_step", "pkm_tail_step_ref",
+           "pkm_tail_row"]
 
 # ================================================================================================ fixed constants
 #: one program per row over the whole width (a power-of-two block with a mask), warps
@@ -90,17 +91,25 @@ def _read_gain_step_kernel(H, Z, R, CMAX, CLSE, SINK, STR, NW, NV, NB, GW, HO, X
 
 
 @triton.jit
-def _pkm_tail_step_kernel(H, F, Y, RHO, HO, s_h, s_f, s_y, D, BD: tl.constexpr):
-    b = tl.program_id(0).to(tl.int64)
-    dd = tl.arange(0, BD)
-    m = dd < D
-    zero = tl.zeros([BD], tl.float32)
+def pkm_tail_row(H, F, Y, RHO, b, s_h, s_f, s_y, D, dd, m):
+    """Row ``b`` of ``pkm_tail_step`` over the block ``dd`` (mask ``m``): fp32 ``h + bf16(ffn + bf16(y_g - bf16(mean_c
+    y_g)))``, ``y_g = bf16(f(y) rho)``; also the tail of a split batch's rows in
+    :func:`neuronspark.ops.triton.tp_exchange.tp_tail_gather`."""
     y = tl.load(Y + b * s_y + dd, mask=m, other=0.0).to(tl.float32)
+    zero = tl.zeros_like(y)
     yg = _bf16(_mul_rn(y, zero + tl.load(RHO + b)))
     mean = _bf16(tl.sum(yg, axis=0) / D)
     d = _bf16(_sub_rn(yg, zero + mean))
     ff = _bf16(_add_rn(tl.load(F + b * s_f + dd, mask=m, other=0.0).to(tl.float32), d))
-    tl.store(HO + b * D + dd, _add_rn(tl.load(H + b * s_h + dd, mask=m, other=0.0), ff), mask=m)
+    return _add_rn(tl.load(H + b * s_h + dd, mask=m, other=0.0), ff)
+
+
+@triton.jit
+def _pkm_tail_step_kernel(H, F, Y, RHO, HO, s_h, s_f, s_y, D, BD: tl.constexpr):
+    b = tl.program_id(0).to(tl.int64)
+    dd = tl.arange(0, BD)
+    m = dd < D
+    tl.store(HO + b * D + dd, pkm_tail_row(H, F, Y, RHO, b, s_h, s_f, s_y, D, dd, m), mask=m)
 
 
 # ================================================================================================ launchers

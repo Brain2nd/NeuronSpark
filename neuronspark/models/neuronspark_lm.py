@@ -353,11 +353,16 @@ class NeuronSparkModel(nn.Module):
             copy = copy_stats_session(lex, ip.copy, ip.ring_ptr, ip.pos, W, tuple(cfg.lexical_order1_slice), ops=o)
             lex = lex.to(torch.bfloat16)                 # the operand of every layer's lexical projections, cast once
             carry: Optional[torch.Tensor] = None
-            for layer in self.layers:
+            hn: Optional[torch.Tensor] = None
+            n_layers = len(self.layers)
+            for i, layer in enumerate(self.layers):
                 if isinstance(layer, HippocampalLayer):
                     x, carry = layer(x, lex=lex, ind=ind, copy=copy, carry=carry, inference_params=ip)
-                else:
-                    x, _ = layer(x, ip)
+                    continue
+                # the decode step: the residual addition and the next dendritic neuron layer's pre-norm in one kernel
+                nxt = self.layers[i + 1] if i + 1 < n_layers else None
+                gain = nxt.mixer_a.pre_norm_gain if T == 1 and isinstance(nxt, DendriticNeuronLayer) else None
+                x, hn = layer(x, ip, hn=hn, next_norm_gain=gain)
             x = o.rmsnorm_rows(x.reshape(T * B, D), float(self.norm.eps), weight=self.norm.weight).view(T, B, D)
             # the counters advance on the device (a replayed graph advances them too)
             ip.pos.add_(T)

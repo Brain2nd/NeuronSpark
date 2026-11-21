@@ -27,7 +27,8 @@ Forms (one per regime; the module picks the form from its arguments):
   neuron; written in bf16, the operand dtype of the first eta linear, so the linear's input cast is the kernel's
   store rounding) -> the two eta linears -> ``ops.plif_gate_prefill`` (a, drive; it reads the bf16 projection and
   widens it on load, exactly as an fp32 cast would) -> ``ops.plif_scan_prefill``, which carries the membrane
-  ``state.v`` in place;
+  ``state.v`` in place; two independent populations of one width (the spiking FFN's gate and up neurons) through
+  :meth:`PLIFNeuron.prefill_pair`: ``ops.plif_prefill_pair`` (both gates, both scans in one launch);
 * step (``state`` given, T == 1, no autograd): ``ops.plif_step`` (the centring over the carried input sum for the
   centred neuron, the two eta projections, the gate chain, one leaky step, the release and the soft reset in one
   kernel; the membrane ``state.v`` and the input sum updated in place).
@@ -269,6 +270,32 @@ class PLIFNeuron(nn.Module):
         a, drive = self._ops.plif_gate_prefill(x, self.w_eta, self.b_eta, zp)
         S = self._ops.plif_scan_prefill(a, drive, self.v_th, state.v, out_dtype)
         return S.to(out_dtype)
+
+    def prefill_pair(self, other: "PLIFNeuron", x: torch.Tensor, y: torch.Tensor, state: PLIFState,
+                     other_state: PLIFState) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Prefill form (T >= 2, no autograd) of two independent populations without centring and of one width: this
+        neuron on ``x`` with ``state``, ``other`` on ``y`` with ``other_state`` (x, y (T, B, C) of one shape and
+        dtype).  ``ops.plif_prefill_pair``: both gate chains, both scans in one launch, the membranes carried in
+        place.  Returns the two spike tensors in x.dtype, the values of ``self(x, state)`` and ``other(y,
+        other_state)``."""
+        if self.centred or other.centred or other.dim != self.dim:
+            raise RuntimeError("PLIFNeuron.prefill_pair: two populations without centring and of one width")
+        if x.dim() != 3 or int(x.shape[0]) < 2 or tuple(y.shape) != tuple(x.shape) or y.dtype != x.dtype \
+                or int(x.shape[-1]) != self.dim or x.dtype not in (torch.float32, torch.bfloat16):
+            raise RuntimeError(f"PLIFNeuron.prefill_pair: x, y fp32 / bf16 (T >= 2, B, {self.dim}) of one shape and "
+                               f"dtype, got {tuple(x.shape)} {x.dtype} / {tuple(y.shape)} {y.dtype}")
+        if torch.is_grad_enabled():
+            raise RuntimeError("PLIFNeuron: the inference forms (a carried state) run without autograd "
+                               "(torch.no_grad())")
+        B = int(x.shape[1])
+        for st in (state, other_state):
+            if tuple(st.v.shape) != (B, self.dim) or st.v.dtype != torch.float32:
+                raise RuntimeError(f"PLIFNeuron: membrane state {tuple(st.v.shape)} {st.v.dtype} for x "
+                                   f"{tuple(x.shape)} (expected fp32 ({B}, {self.dim}))")
+        zx = self._eta_projection(x, contiguous=False)                     # bf16, widened in the gate kernels
+        zy = other._eta_projection(y, contiguous=False)
+        return self._ops.plif_prefill_pair(x, self.w_eta, self.b_eta, zx, self.v_th, state.v,
+                                           y, other.w_eta, other.b_eta, zy, other.v_th, other_state.v, x.dtype)
 
     def _forward_step(self, x: torch.Tensor, state: PLIFState, pos: Optional[torch.Tensor],
                       out_dtype: torch.dtype) -> torch.Tensor:

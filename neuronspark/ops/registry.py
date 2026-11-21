@@ -223,6 +223,9 @@ _SPECS: List[OpSpec] = [
     _op("plif_scan_prefill", _T + "plif", "a drive v_th v0 out_dtype",
         "spikes S (T, B, C) out_dtype", "prefill", mutates="v0",
         doc="a, drive (T, B, C) fp32, v_th (C,) fp32, v0 (B, C) fp32 carried membrane"),
+    _op("plif_prefill_pair", _T + "plif", "x0 w0 b0 zp0 th0 v0 x1 w1 b1 zp1 th1 v1 out_dtype",
+        "spikes (2, T, B, C) out_dtype", "prefill", mutates="v0 v1",
+        doc="two populations of one shape: x (T, B, C), w_eta, b_eta, v_th (C,) fp32, zp (T, B, C) bf16, v (B, C) fp32"),
     # ---------------------------------------------------------------------------------------------- PKM
     _op("pkm_unit_queries", _T + "pkm_query", "q heads half",
         "(T, B, 4, 2, 64) fp32 unit half-queries; backward: dq bf16", "train",

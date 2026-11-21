@@ -34,7 +34,10 @@ Operators (regime: public function -> what runs):
   or bf16 gradient.
 * prefill :func:`plif_gate_prefill` (custom op ``neuronspark::plif_gate_prefill``): (a, drive) fp32 from x, w_eta, b_eta
   and the projection, any T >= 1; :func:`plif_scan_prefill` (custom op ``neuronspark::plif_scan_prefill``, mutates
-  ``v0``): the scan from the carried membrane v0, which it overwrites with the last membrane.
+  ``v0``): the scan from the carried membrane v0, which the kernel overwrites with the last membrane;
+  :func:`plif_prefill_pair` (custom op ``neuronspark::plif_prefill_pair``, mutates both membranes): two independent
+  populations of one shape (the spiking FFN's gate and up neurons), their gate kernels and both scans in one launch
+  (the second population's programs follow the first's), so that the two latency-bound chains run side by side.
 * decode: :func:`neuronspark.ops.triton.plif_step.plif_step` (two kernels per token; its own module).
 
 Numerics.  The training forward S / pre are the operations of the eager gate chain and the sequential scan in the same
@@ -44,7 +47,7 @@ operations.  Tests: the per-operator tolerance rule of :mod:`neuronspark.utils.t
 
 Pure-torch references (same signatures): :func:`plif_scan_train_ref` (the eager forward; the phase-split backward's
 expressions through :func:`neuronspark.ops.gluon.plif_k1_bwd.plif_k1_bwd_ref`), :func:`plif_centred_input_ref`,
-:func:`plif_gate_prefill_ref`, :func:`plif_scan_prefill_ref`.
+:func:`plif_gate_prefill_ref`, :func:`plif_scan_prefill_ref`, :func:`plif_prefill_pair_ref`.
 """
 from __future__ import annotations
 
@@ -86,6 +89,8 @@ __all__ = [
     "plif_gate_prefill_ref",
     "plif_scan_prefill",
     "plif_scan_prefill_ref",
+    "plif_prefill_pair",
+    "plif_prefill_pair_ref",
 ]
 
 # ================================================================================================ fixed constants
@@ -101,7 +106,8 @@ K1L_WARPS = 1
 #: prefill gate kernel: 2048 elements per program, 4 warps
 GATE_BLOCK = 2048
 GATE_WARPS = 4
-#: prefill scan: TILE 32, DEPTH 1, 32 lanes per program, 1 warp
+#: prefill scan: TILE 32 (the kernel is written out per token of its tile), DEPTH 1, 32 lanes per program, 1 warp
+SCAN_TILE = 32
 SCAN_BLOCK_C = 32
 SCAN_WARPS = 1
 
@@ -457,27 +463,39 @@ def plif_centred_input(x: torch.Tensor, out_dtype: Optional[torch.dtype] = None)
 
 
 # ================================================================================================ prefill
-def _gate_prefill(x: torch.Tensor, w_eta: torch.Tensor, b_eta: torch.Tensor, zp: torch.Tensor):
-    require_cuda(x, "plif_gate_prefill")
+def _check_gate(x: torch.Tensor, w_eta: torch.Tensor, b_eta: torch.Tensor, zp: torch.Tensor, what: str) -> None:
+    require_cuda(x, what)
     _need(x.dim() == 3 and tuple(zp.shape) == tuple(x.shape) and zp.dtype in (torch.float32, torch.bfloat16),
           f"x (T, B, C) and the projection zp (fp32 / bf16) of the same shape expected, got {tuple(x.shape)} "
           f"{x.dtype} / {tuple(zp.shape)} {zp.dtype}")
     _need(x.dtype in (torch.float32, torch.bfloat16), f"x must be fp32 or bf16, got {x.dtype}")
+    _need(zp.device == x.device, "x and the projection zp must be on one device")
     C = int(x.shape[-1])
     for name, t in (("w_eta", w_eta), ("b_eta", b_eta)):
         _need(t.dtype == torch.float32 and tuple(t.shape) == (C,) and t.device == x.device,
               f"{name} must be fp32 ({C},), got {t.dtype} {tuple(t.shape)}")
+
+
+def _gate_prefill(x: torch.Tensor, w_eta: torch.Tensor, b_eta: torch.Tensor, zp: torch.Tensor):
+    _check_gate(x, w_eta, b_eta, zp, "plif_gate_prefill")
+    a = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+    d = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+    _gate_into(x, w_eta, b_eta, zp, a, d)
+    return a, d
+
+
+def _gate_into(x: torch.Tensor, w_eta: torch.Tensor, b_eta: torch.Tensor, zp: torch.Tensor, a: torch.Tensor,
+               d: torch.Tensor) -> None:
+    """The gate kernel on checked operands into the contiguous fp32 outputs ``a`` / ``d`` of x's shape."""
     xc = x if x.is_contiguous() else x.contiguous()
     zc = zp if zp.is_contiguous() else zp.contiguous()
     wc = w_eta if w_eta.is_contiguous() else w_eta.contiguous()
     bc = b_eta if b_eta.is_contiguous() else b_eta.contiguous()
-    a = torch.empty(x.shape, dtype=torch.float32, device=x.device)
-    d = torch.empty(x.shape, dtype=torch.float32, device=x.device)
     N = xc.numel()
     if N:
-        _gate_prefill_kernel[(triton.cdiv(N, GATE_BLOCK),)](xc, zc, wc, bc, a, d, N, C, BLOCK=GATE_BLOCK,
-                                                            num_warps=GATE_WARPS, enable_fp_fusion=False)
-    return a, d
+        _gate_prefill_kernel[(triton.cdiv(N, GATE_BLOCK),)](xc, zc, wc, bc, a, d, N, int(x.shape[-1]),
+                                                            BLOCK=GATE_BLOCK, num_warps=GATE_WARPS,
+                                                            enable_fp_fusion=False)
 
 
 @torch.library.custom_op("neuronspark::plif_gate_prefill", mutates_args=())
@@ -491,31 +509,70 @@ def _plif_gate_prefill_fake(x, w_eta, b_eta, zp):
     return x.new_empty(tuple(x.shape), dtype=torch.float32), x.new_empty(tuple(x.shape), dtype=torch.float32)
 
 
-def _scan_prefill(a: torch.Tensor, drive: torch.Tensor, v_th: torch.Tensor, v0: torch.Tensor,
-                  out_dtype: torch.dtype) -> torch.Tensor:
+def _check_scan_prefill(a: torch.Tensor, drive: torch.Tensor, v_th: torch.Tensor, v0: torch.Tensor,
+                        pairs: int = 1) -> Tuple[int, int, int]:
     require_cuda(drive, "plif_scan_prefill")
     _need(drive.dim() == 3, f"drive must be (T, B, C), got {tuple(drive.shape)}")
     T, B, C = (int(s) for s in drive.shape)
     _need(T >= 1, "at least one token")
     _need(a.dtype == torch.float32 and drive.dtype == torch.float32 and tuple(a.shape) == (T, B, C),
           f"a / drive must be fp32 ({T}, {B}, {C}), got {a.dtype} {tuple(a.shape)} / {drive.dtype}")
-    _need(v_th.dtype == torch.float32 and tuple(v_th.shape) == (C,), f"v_th must be fp32 ({C},)")
-    _need(v0.dtype == torch.float32 and tuple(v0.shape) == (B, C) and v0.is_contiguous(),
+    _need(v_th.dtype == torch.float32 and tuple(v_th.shape) == (C,) and v_th.device == drive.device,
+          f"v_th must be fp32 ({C},)")
+    _need(v0.dtype == torch.float32 and tuple(v0.shape) == (B, C) and v0.is_contiguous() and v0.device == drive.device,
           f"v0 must be a contiguous fp32 ({B}, {C}) membrane, got {v0.dtype} {tuple(v0.shape)}")
-    _need(T * B * C < 2 ** 31, "too many elements for int32 addressing")
-    a = a.contiguous()
-    drive = drive.contiguous()
+    # int32 offsets: the populations' elements and the one-tile lookahead past the last token
+    _need(pairs * (T + 2 * SCAN_TILE) * B * C < 2 ** 31, "too many elements for int32 addressing")
+    return T, B, C
+
+
+def _apart(t: torch.Tensor, *others: torch.Tensor) -> bool:
+    """The storage range of ``t`` overlaps none of the others' (a membrane written in place needs memory of its own)."""
+    lo, hi = t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()
+    return all(o.numel() == 0 or o.data_ptr() + o.numel() * o.element_size() <= lo or hi <= o.data_ptr()
+               for o in others)
+
+
+def _scan_launch(a: torch.Tensor, drive: torch.Tensor, th0: torch.Tensor, th1: torch.Tensor, v0: torch.Tensor,
+                 v1: torch.Tensor, S: torch.Tensor, T: int, B: int, C: int, pops: int) -> None:
+    """The scan kernel over ``pops`` (1 or 2) populations of one (T, B, C) shape, stacked in a / drive / S; the
+    membranes v0 (and v1) are overwritten in place."""
+    nprog = triton.cdiv(B * C, SCAN_BLOCK_C)
+    if nprog:
+        _plif_scan_prefill_kernel[(pops * nprog,)](a, drive, th0, th1, v0, v1, S, T, B, C, nprog,
+                                                   BLOCK_C=SCAN_BLOCK_C, num_warps=SCAN_WARPS)
+
+
+def _scan_prefill(a: torch.Tensor, drive: torch.Tensor, v_th: torch.Tensor, v0: torch.Tensor,
+                  out_dtype: torch.dtype) -> torch.Tensor:
+    T, B, C = _check_scan_prefill(a, drive, v_th, v0)
+    _need(_apart(v0, a, drive, v_th), "the membrane v0 must not overlap a, drive or v_th (it is written in place)")
     th = v_th.contiguous()
-    dev = drive.device
-    S = torch.empty((T, B, C), dtype=out_dtype, device=dev)
-    vlast = torch.empty((B, C), dtype=torch.float32, device=dev)
-    pre = drive.new_empty((0,), dtype=torch.float32)
-    no_reset = torch.empty((1,), dtype=torch.int32, device=dev)          # not read (no reset)
-    _plif2_fwd_t32_d1_kernel[(triton.cdiv(B * C, SCAN_BLOCK_C),)](
-        a, drive, th, no_reset, v0, S, vlast, pre, T, B, C,
-        A_PER_CHANNEL=0, TH_PER_CHANNEL=1, STORE_PRE=0, BLOCK_C=SCAN_BLOCK_C, BIPOLAR=1, HAS_RESET=0, HAS_V0=1,
-        num_warps=SCAN_WARPS)
-    v0.copy_(vlast)
+    S = torch.empty((T, B, C), dtype=out_dtype, device=drive.device)
+    _scan_launch(a.contiguous(), drive.contiguous(), th, th, v0, v0, S, T, B, C, 1)
+    return S
+
+
+def _prefill_pair(x0: torch.Tensor, w0: torch.Tensor, b0: torch.Tensor, zp0: torch.Tensor, th0: torch.Tensor,
+                  v0: torch.Tensor, x1: torch.Tensor, w1: torch.Tensor, b1: torch.Tensor, zp1: torch.Tensor,
+                  th1: torch.Tensor, v1: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    _need(tuple(x1.shape) == tuple(x0.shape) and x1.device == x0.device,
+          f"a pair of populations of one shape on one device, got {tuple(x0.shape)} {x0.device} / {tuple(x1.shape)} "
+          f"{x1.device}")
+    _check_gate(x0, w0, b0, zp0, "plif_prefill_pair")
+    _check_gate(x1, w1, b1, zp1, "plif_prefill_pair")
+    T, B, C = (int(s) for s in x0.shape)
+    dev = x0.device
+    a = torch.empty((2, T, B, C), dtype=torch.float32, device=dev)
+    d = torch.empty((2, T, B, C), dtype=torch.float32, device=dev)
+    _check_scan_prefill(a[0], d[0], th0, v0, 2)
+    _check_scan_prefill(a[1], d[1], th1, v1, 2)
+    _need(_apart(v0, v1, th0, th1) and _apart(v1, th0, th1),
+          "the two populations need membranes of their own, apart from the thresholds")
+    _gate_into(x0, w0, b0, zp0, a[0], d[0])
+    _gate_into(x1, w1, b1, zp1, a[1], d[1])
+    S = torch.empty((2, T, B, C), dtype=out_dtype, device=dev)
+    _scan_launch(a, d, th0.contiguous(), th1.contiguous(), v0, v1, S, T, B, C, 2)
     return S
 
 
@@ -544,6 +601,31 @@ def plif_scan_prefill(a: torch.Tensor, drive: torch.Tensor, v_th: torch.Tensor, 
     (T, B, C), ``v_th`` fp32 (C,); any T >= 1 (the model uses it for T >= 2)."""
     od = _dtype_name(torch.float32 if out_dtype is None else out_dtype)
     return torch.ops.neuronspark.plif_scan_prefill(a, drive, v_th, v0, od)
+
+
+@torch.library.custom_op("neuronspark::plif_prefill_pair", mutates_args=("v0", "v1"))
+def _plif_prefill_pair_op(x0: torch.Tensor, w0: torch.Tensor, b0: torch.Tensor, zp0: torch.Tensor, th0: torch.Tensor,
+                          v0: torch.Tensor, x1: torch.Tensor, w1: torch.Tensor, b1: torch.Tensor, zp1: torch.Tensor,
+                          th1: torch.Tensor, v1: torch.Tensor, out_dtype: str) -> torch.Tensor:
+    return _prefill_pair(x0, w0, b0, zp0, th0, v0, x1, w1, b1, zp1, th1, v1, _DTYPES[out_dtype])
+
+
+@_plif_prefill_pair_op.register_fake
+def _plif_prefill_pair_fake(x0, w0, b0, zp0, th0, v0, x1, w1, b1, zp1, th1, v1, out_dtype):
+    return x0.new_empty((2,) + tuple(x0.shape), dtype=_DTYPES[out_dtype])
+
+
+def plif_prefill_pair(x0: torch.Tensor, w0: torch.Tensor, b0: torch.Tensor, zp0: torch.Tensor, th0: torch.Tensor,
+                      v0: torch.Tensor, x1: torch.Tensor, w1: torch.Tensor, b1: torch.Tensor, zp1: torch.Tensor,
+                      th1: torch.Tensor, v1: torch.Tensor,
+                      out_dtype: Optional[torch.dtype] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The prefill of two independent populations of one (T, B, C) shape (the spiking FFN's gate and up neurons): for
+    each, :func:`plif_gate_prefill` (x, w_eta, b_eta, zp) and :func:`plif_scan_prefill` (v_th, the carried membrane,
+    overwritten in place); the two scans in one launch, their dependency chains side by side.  Returns the two spike
+    tensors (T, B, C) in ``out_dtype`` (default float32), views of one (2, T, B, C) result."""
+    od = _dtype_name(torch.float32 if out_dtype is None else out_dtype)
+    S = torch.ops.neuronspark.plif_prefill_pair(x0, w0, b0, zp0, th0, v0, x1, w1, b1, zp1, th1, v1, od)
+    return S[0], S[1]
 
 
 # ================================================================================================ pure-torch references
@@ -645,6 +727,19 @@ def plif_scan_prefill_ref(a: torch.Tensor, drive: torch.Tensor, v_th: torch.Tens
         spikes.append(s)
     v0.copy_(prev)
     return torch.stack(spikes, dim=0).to(torch.float32 if out_dtype is None else out_dtype)
+
+
+@torch.no_grad()
+def plif_prefill_pair_ref(x0: torch.Tensor, w0: torch.Tensor, b0: torch.Tensor, zp0: torch.Tensor, th0: torch.Tensor,
+                          v0: torch.Tensor, x1: torch.Tensor, w1: torch.Tensor, b1: torch.Tensor, zp1: torch.Tensor,
+                          th1: torch.Tensor, v1: torch.Tensor,
+                          out_dtype: Optional[torch.dtype] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pure-torch reference of :func:`plif_prefill_pair`: the gate and scan references per population."""
+    out = []
+    for x, w, b, zp, th, v in ((x0, w0, b0, zp0, th0, v0), (x1, w1, b1, zp1, th1, v1)):
+        a, drive = plif_gate_prefill_ref(x, w, b, zp)
+        out.append(plif_scan_prefill_ref(a, drive, th, v, out_dtype))
+    return out[0], out[1]
 
 
 # ================================================================================================ scan kernels
@@ -1635,1092 +1730,442 @@ def _k1l_fwd_t32_d1_a0_kernel(
     tl.store(VLAST_OUT + offs, v, mask=cmask)
 
 
-# _plif2_fwd_t32_d1_kernel: the software-pipelined scan forward, TILE 32, DEPTH 1 (launched with A_PER_CHANNEL 0,
-#   TH_PER_CHANNEL 1, HAS_RESET 0, STORE_PRE 0).
+# _plif_scan_prefill_kernel: the inference scan from the carried membrane, TILE 32, DEPTH 1 (the tile's a and drive
+#   loaded one tile ahead).  The programs from NPROG0 on run the second population of a pair (its a / drive / S at
+#   the offset T * B * DN, its threshold TH1, its membrane V1); the membrane is carried in place (read at the start,
+#   written after the last token, by the same program).
 @triton.jit
-def _plif2_fwd_t32_d1_kernel(
-    A, I, TH, R, V0, S_OUT, VLAST_OUT, PRE_OUT,
-    T, B, DN,
-    A_PER_CHANNEL: tl.constexpr, TH_PER_CHANNEL: tl.constexpr, STORE_PRE: tl.constexpr,
-    BLOCK_C: tl.constexpr, BIPOLAR: tl.constexpr, HAS_RESET: tl.constexpr, HAS_V0: tl.constexpr,
-):
-    """Forward scan, TILE=32 tokens per tile, loads issued DEPTH=1 tile ahead."""
-    pid = tl.program_id(0)
+def _plif_scan_prefill_kernel(A, I, TH, TH1, V0, V1, S_OUT, T, B, DN, NPROG0, BLOCK_C: tl.constexpr):
+    """Prefill scan, TILE=32 tokens per tile, loads issued DEPTH=1 tile ahead."""
+    pid0 = tl.program_id(0)
+    second = pid0 >= NPROG0
+    pid = tl.where(second, pid0 - NPROG0, pid0)
     offs = pid * BLOCK_C + tl.arange(0, BLOCK_C)
     cmask = offs < B * DN
-    b = offs // DN
     c = offs % DN
-    if HAS_V0:
-        v = tl.load(V0 + offs, mask=cmask, other=0.0)
-    else:
-        v = tl.zeros([BLOCK_C], dtype=tl.float32)
-    a_const = tl.load(A + c, mask=cmask & (A_PER_CHANNEL != 0), other=0.0)
-    th_const = tl.load(TH + c, mask=cmask & (TH_PER_CHANNEL != 0), other=0.0)
-    lm_0 = cmask & (0 + 0 < T)
-    lp_0 = (0 + 0) * (B * DN) + b * DN + c
-    lm_1 = cmask & (0 + 1 < T)
-    lp_1 = (0 + 1) * (B * DN) + b * DN + c
-    lm_2 = cmask & (0 + 2 < T)
-    lp_2 = (0 + 2) * (B * DN) + b * DN + c
-    lm_3 = cmask & (0 + 3 < T)
-    lp_3 = (0 + 3) * (B * DN) + b * DN + c
-    lm_4 = cmask & (0 + 4 < T)
-    lp_4 = (0 + 4) * (B * DN) + b * DN + c
-    lm_5 = cmask & (0 + 5 < T)
-    lp_5 = (0 + 5) * (B * DN) + b * DN + c
-    lm_6 = cmask & (0 + 6 < T)
-    lp_6 = (0 + 6) * (B * DN) + b * DN + c
-    lm_7 = cmask & (0 + 7 < T)
-    lp_7 = (0 + 7) * (B * DN) + b * DN + c
-    lm_8 = cmask & (0 + 8 < T)
-    lp_8 = (0 + 8) * (B * DN) + b * DN + c
-    lm_9 = cmask & (0 + 9 < T)
-    lp_9 = (0 + 9) * (B * DN) + b * DN + c
-    lm_10 = cmask & (0 + 10 < T)
-    lp_10 = (0 + 10) * (B * DN) + b * DN + c
-    lm_11 = cmask & (0 + 11 < T)
-    lp_11 = (0 + 11) * (B * DN) + b * DN + c
-    lm_12 = cmask & (0 + 12 < T)
-    lp_12 = (0 + 12) * (B * DN) + b * DN + c
-    lm_13 = cmask & (0 + 13 < T)
-    lp_13 = (0 + 13) * (B * DN) + b * DN + c
-    lm_14 = cmask & (0 + 14 < T)
-    lp_14 = (0 + 14) * (B * DN) + b * DN + c
-    lm_15 = cmask & (0 + 15 < T)
-    lp_15 = (0 + 15) * (B * DN) + b * DN + c
-    lm_16 = cmask & (0 + 16 < T)
-    lp_16 = (0 + 16) * (B * DN) + b * DN + c
-    lm_17 = cmask & (0 + 17 < T)
-    lp_17 = (0 + 17) * (B * DN) + b * DN + c
-    lm_18 = cmask & (0 + 18 < T)
-    lp_18 = (0 + 18) * (B * DN) + b * DN + c
-    lm_19 = cmask & (0 + 19 < T)
-    lp_19 = (0 + 19) * (B * DN) + b * DN + c
-    lm_20 = cmask & (0 + 20 < T)
-    lp_20 = (0 + 20) * (B * DN) + b * DN + c
-    lm_21 = cmask & (0 + 21 < T)
-    lp_21 = (0 + 21) * (B * DN) + b * DN + c
-    lm_22 = cmask & (0 + 22 < T)
-    lp_22 = (0 + 22) * (B * DN) + b * DN + c
-    lm_23 = cmask & (0 + 23 < T)
-    lp_23 = (0 + 23) * (B * DN) + b * DN + c
-    lm_24 = cmask & (0 + 24 < T)
-    lp_24 = (0 + 24) * (B * DN) + b * DN + c
-    lm_25 = cmask & (0 + 25 < T)
-    lp_25 = (0 + 25) * (B * DN) + b * DN + c
-    lm_26 = cmask & (0 + 26 < T)
-    lp_26 = (0 + 26) * (B * DN) + b * DN + c
-    lm_27 = cmask & (0 + 27 < T)
-    lp_27 = (0 + 27) * (B * DN) + b * DN + c
-    lm_28 = cmask & (0 + 28 < T)
-    lp_28 = (0 + 28) * (B * DN) + b * DN + c
-    lm_29 = cmask & (0 + 29 < T)
-    lp_29 = (0 + 29) * (B * DN) + b * DN + c
-    lm_30 = cmask & (0 + 30 < T)
-    lp_30 = (0 + 30) * (B * DN) + b * DN + c
-    lm_31 = cmask & (0 + 31 < T)
-    lp_31 = (0 + 31) * (B * DN) + b * DN + c
-    i_0_0 = tl.load(I + lp_0, mask=lm_0, other=0.0).to(tl.float32)
-    i_0_1 = tl.load(I + lp_1, mask=lm_1, other=0.0).to(tl.float32)
-    i_0_2 = tl.load(I + lp_2, mask=lm_2, other=0.0).to(tl.float32)
-    i_0_3 = tl.load(I + lp_3, mask=lm_3, other=0.0).to(tl.float32)
-    i_0_4 = tl.load(I + lp_4, mask=lm_4, other=0.0).to(tl.float32)
-    i_0_5 = tl.load(I + lp_5, mask=lm_5, other=0.0).to(tl.float32)
-    i_0_6 = tl.load(I + lp_6, mask=lm_6, other=0.0).to(tl.float32)
-    i_0_7 = tl.load(I + lp_7, mask=lm_7, other=0.0).to(tl.float32)
-    i_0_8 = tl.load(I + lp_8, mask=lm_8, other=0.0).to(tl.float32)
-    i_0_9 = tl.load(I + lp_9, mask=lm_9, other=0.0).to(tl.float32)
-    i_0_10 = tl.load(I + lp_10, mask=lm_10, other=0.0).to(tl.float32)
-    i_0_11 = tl.load(I + lp_11, mask=lm_11, other=0.0).to(tl.float32)
-    i_0_12 = tl.load(I + lp_12, mask=lm_12, other=0.0).to(tl.float32)
-    i_0_13 = tl.load(I + lp_13, mask=lm_13, other=0.0).to(tl.float32)
-    i_0_14 = tl.load(I + lp_14, mask=lm_14, other=0.0).to(tl.float32)
-    i_0_15 = tl.load(I + lp_15, mask=lm_15, other=0.0).to(tl.float32)
-    i_0_16 = tl.load(I + lp_16, mask=lm_16, other=0.0).to(tl.float32)
-    i_0_17 = tl.load(I + lp_17, mask=lm_17, other=0.0).to(tl.float32)
-    i_0_18 = tl.load(I + lp_18, mask=lm_18, other=0.0).to(tl.float32)
-    i_0_19 = tl.load(I + lp_19, mask=lm_19, other=0.0).to(tl.float32)
-    i_0_20 = tl.load(I + lp_20, mask=lm_20, other=0.0).to(tl.float32)
-    i_0_21 = tl.load(I + lp_21, mask=lm_21, other=0.0).to(tl.float32)
-    i_0_22 = tl.load(I + lp_22, mask=lm_22, other=0.0).to(tl.float32)
-    i_0_23 = tl.load(I + lp_23, mask=lm_23, other=0.0).to(tl.float32)
-    i_0_24 = tl.load(I + lp_24, mask=lm_24, other=0.0).to(tl.float32)
-    i_0_25 = tl.load(I + lp_25, mask=lm_25, other=0.0).to(tl.float32)
-    i_0_26 = tl.load(I + lp_26, mask=lm_26, other=0.0).to(tl.float32)
-    i_0_27 = tl.load(I + lp_27, mask=lm_27, other=0.0).to(tl.float32)
-    i_0_28 = tl.load(I + lp_28, mask=lm_28, other=0.0).to(tl.float32)
-    i_0_29 = tl.load(I + lp_29, mask=lm_29, other=0.0).to(tl.float32)
-    i_0_30 = tl.load(I + lp_30, mask=lm_30, other=0.0).to(tl.float32)
-    i_0_31 = tl.load(I + lp_31, mask=lm_31, other=0.0).to(tl.float32)
-    if not A_PER_CHANNEL:
-        a_0_0 = tl.load(A + lp_0, mask=lm_0, other=0.0)
-        a_0_1 = tl.load(A + lp_1, mask=lm_1, other=0.0)
-        a_0_2 = tl.load(A + lp_2, mask=lm_2, other=0.0)
-        a_0_3 = tl.load(A + lp_3, mask=lm_3, other=0.0)
-        a_0_4 = tl.load(A + lp_4, mask=lm_4, other=0.0)
-        a_0_5 = tl.load(A + lp_5, mask=lm_5, other=0.0)
-        a_0_6 = tl.load(A + lp_6, mask=lm_6, other=0.0)
-        a_0_7 = tl.load(A + lp_7, mask=lm_7, other=0.0)
-        a_0_8 = tl.load(A + lp_8, mask=lm_8, other=0.0)
-        a_0_9 = tl.load(A + lp_9, mask=lm_9, other=0.0)
-        a_0_10 = tl.load(A + lp_10, mask=lm_10, other=0.0)
-        a_0_11 = tl.load(A + lp_11, mask=lm_11, other=0.0)
-        a_0_12 = tl.load(A + lp_12, mask=lm_12, other=0.0)
-        a_0_13 = tl.load(A + lp_13, mask=lm_13, other=0.0)
-        a_0_14 = tl.load(A + lp_14, mask=lm_14, other=0.0)
-        a_0_15 = tl.load(A + lp_15, mask=lm_15, other=0.0)
-        a_0_16 = tl.load(A + lp_16, mask=lm_16, other=0.0)
-        a_0_17 = tl.load(A + lp_17, mask=lm_17, other=0.0)
-        a_0_18 = tl.load(A + lp_18, mask=lm_18, other=0.0)
-        a_0_19 = tl.load(A + lp_19, mask=lm_19, other=0.0)
-        a_0_20 = tl.load(A + lp_20, mask=lm_20, other=0.0)
-        a_0_21 = tl.load(A + lp_21, mask=lm_21, other=0.0)
-        a_0_22 = tl.load(A + lp_22, mask=lm_22, other=0.0)
-        a_0_23 = tl.load(A + lp_23, mask=lm_23, other=0.0)
-        a_0_24 = tl.load(A + lp_24, mask=lm_24, other=0.0)
-        a_0_25 = tl.load(A + lp_25, mask=lm_25, other=0.0)
-        a_0_26 = tl.load(A + lp_26, mask=lm_26, other=0.0)
-        a_0_27 = tl.load(A + lp_27, mask=lm_27, other=0.0)
-        a_0_28 = tl.load(A + lp_28, mask=lm_28, other=0.0)
-        a_0_29 = tl.load(A + lp_29, mask=lm_29, other=0.0)
-        a_0_30 = tl.load(A + lp_30, mask=lm_30, other=0.0)
-        a_0_31 = tl.load(A + lp_31, mask=lm_31, other=0.0)
-    if not TH_PER_CHANNEL:
-        t_0_0 = tl.load(TH + lp_0, mask=lm_0, other=0.0)
-        t_0_1 = tl.load(TH + lp_1, mask=lm_1, other=0.0)
-        t_0_2 = tl.load(TH + lp_2, mask=lm_2, other=0.0)
-        t_0_3 = tl.load(TH + lp_3, mask=lm_3, other=0.0)
-        t_0_4 = tl.load(TH + lp_4, mask=lm_4, other=0.0)
-        t_0_5 = tl.load(TH + lp_5, mask=lm_5, other=0.0)
-        t_0_6 = tl.load(TH + lp_6, mask=lm_6, other=0.0)
-        t_0_7 = tl.load(TH + lp_7, mask=lm_7, other=0.0)
-        t_0_8 = tl.load(TH + lp_8, mask=lm_8, other=0.0)
-        t_0_9 = tl.load(TH + lp_9, mask=lm_9, other=0.0)
-        t_0_10 = tl.load(TH + lp_10, mask=lm_10, other=0.0)
-        t_0_11 = tl.load(TH + lp_11, mask=lm_11, other=0.0)
-        t_0_12 = tl.load(TH + lp_12, mask=lm_12, other=0.0)
-        t_0_13 = tl.load(TH + lp_13, mask=lm_13, other=0.0)
-        t_0_14 = tl.load(TH + lp_14, mask=lm_14, other=0.0)
-        t_0_15 = tl.load(TH + lp_15, mask=lm_15, other=0.0)
-        t_0_16 = tl.load(TH + lp_16, mask=lm_16, other=0.0)
-        t_0_17 = tl.load(TH + lp_17, mask=lm_17, other=0.0)
-        t_0_18 = tl.load(TH + lp_18, mask=lm_18, other=0.0)
-        t_0_19 = tl.load(TH + lp_19, mask=lm_19, other=0.0)
-        t_0_20 = tl.load(TH + lp_20, mask=lm_20, other=0.0)
-        t_0_21 = tl.load(TH + lp_21, mask=lm_21, other=0.0)
-        t_0_22 = tl.load(TH + lp_22, mask=lm_22, other=0.0)
-        t_0_23 = tl.load(TH + lp_23, mask=lm_23, other=0.0)
-        t_0_24 = tl.load(TH + lp_24, mask=lm_24, other=0.0)
-        t_0_25 = tl.load(TH + lp_25, mask=lm_25, other=0.0)
-        t_0_26 = tl.load(TH + lp_26, mask=lm_26, other=0.0)
-        t_0_27 = tl.load(TH + lp_27, mask=lm_27, other=0.0)
-        t_0_28 = tl.load(TH + lp_28, mask=lm_28, other=0.0)
-        t_0_29 = tl.load(TH + lp_29, mask=lm_29, other=0.0)
-        t_0_30 = tl.load(TH + lp_30, mask=lm_30, other=0.0)
-        t_0_31 = tl.load(TH + lp_31, mask=lm_31, other=0.0)
-    if HAS_RESET:
-        r_0_0 = tl.load(R + (0 + 0) * B + b, mask=lm_0, other=0).to(tl.int32)
-        r_0_1 = tl.load(R + (0 + 1) * B + b, mask=lm_1, other=0).to(tl.int32)
-        r_0_2 = tl.load(R + (0 + 2) * B + b, mask=lm_2, other=0).to(tl.int32)
-        r_0_3 = tl.load(R + (0 + 3) * B + b, mask=lm_3, other=0).to(tl.int32)
-        r_0_4 = tl.load(R + (0 + 4) * B + b, mask=lm_4, other=0).to(tl.int32)
-        r_0_5 = tl.load(R + (0 + 5) * B + b, mask=lm_5, other=0).to(tl.int32)
-        r_0_6 = tl.load(R + (0 + 6) * B + b, mask=lm_6, other=0).to(tl.int32)
-        r_0_7 = tl.load(R + (0 + 7) * B + b, mask=lm_7, other=0).to(tl.int32)
-        r_0_8 = tl.load(R + (0 + 8) * B + b, mask=lm_8, other=0).to(tl.int32)
-        r_0_9 = tl.load(R + (0 + 9) * B + b, mask=lm_9, other=0).to(tl.int32)
-        r_0_10 = tl.load(R + (0 + 10) * B + b, mask=lm_10, other=0).to(tl.int32)
-        r_0_11 = tl.load(R + (0 + 11) * B + b, mask=lm_11, other=0).to(tl.int32)
-        r_0_12 = tl.load(R + (0 + 12) * B + b, mask=lm_12, other=0).to(tl.int32)
-        r_0_13 = tl.load(R + (0 + 13) * B + b, mask=lm_13, other=0).to(tl.int32)
-        r_0_14 = tl.load(R + (0 + 14) * B + b, mask=lm_14, other=0).to(tl.int32)
-        r_0_15 = tl.load(R + (0 + 15) * B + b, mask=lm_15, other=0).to(tl.int32)
-        r_0_16 = tl.load(R + (0 + 16) * B + b, mask=lm_16, other=0).to(tl.int32)
-        r_0_17 = tl.load(R + (0 + 17) * B + b, mask=lm_17, other=0).to(tl.int32)
-        r_0_18 = tl.load(R + (0 + 18) * B + b, mask=lm_18, other=0).to(tl.int32)
-        r_0_19 = tl.load(R + (0 + 19) * B + b, mask=lm_19, other=0).to(tl.int32)
-        r_0_20 = tl.load(R + (0 + 20) * B + b, mask=lm_20, other=0).to(tl.int32)
-        r_0_21 = tl.load(R + (0 + 21) * B + b, mask=lm_21, other=0).to(tl.int32)
-        r_0_22 = tl.load(R + (0 + 22) * B + b, mask=lm_22, other=0).to(tl.int32)
-        r_0_23 = tl.load(R + (0 + 23) * B + b, mask=lm_23, other=0).to(tl.int32)
-        r_0_24 = tl.load(R + (0 + 24) * B + b, mask=lm_24, other=0).to(tl.int32)
-        r_0_25 = tl.load(R + (0 + 25) * B + b, mask=lm_25, other=0).to(tl.int32)
-        r_0_26 = tl.load(R + (0 + 26) * B + b, mask=lm_26, other=0).to(tl.int32)
-        r_0_27 = tl.load(R + (0 + 27) * B + b, mask=lm_27, other=0).to(tl.int32)
-        r_0_28 = tl.load(R + (0 + 28) * B + b, mask=lm_28, other=0).to(tl.int32)
-        r_0_29 = tl.load(R + (0 + 29) * B + b, mask=lm_29, other=0).to(tl.int32)
-        r_0_30 = tl.load(R + (0 + 30) * B + b, mask=lm_30, other=0).to(tl.int32)
-        r_0_31 = tl.load(R + (0 + 31) * B + b, mask=lm_31, other=0).to(tl.int32)
+    row = B * DN
+    base = tl.where(second, T * row, 0) + offs
+    m0 = cmask & (second == 0)
+    m1 = cmask & (second != 0)
+    v = tl.where(second, tl.load(V1 + offs, mask=m1, other=0.0), tl.load(V0 + offs, mask=m0, other=0.0))
+    th = tl.where(second, tl.load(TH1 + c, mask=m1, other=0.0), tl.load(TH + c, mask=m0, other=0.0))
+    i_0_0 = tl.load(I + (0 * row + base), mask=cmask & (0 < T), other=0.0)
+    i_0_1 = tl.load(I + (1 * row + base), mask=cmask & (1 < T), other=0.0)
+    i_0_2 = tl.load(I + (2 * row + base), mask=cmask & (2 < T), other=0.0)
+    i_0_3 = tl.load(I + (3 * row + base), mask=cmask & (3 < T), other=0.0)
+    i_0_4 = tl.load(I + (4 * row + base), mask=cmask & (4 < T), other=0.0)
+    i_0_5 = tl.load(I + (5 * row + base), mask=cmask & (5 < T), other=0.0)
+    i_0_6 = tl.load(I + (6 * row + base), mask=cmask & (6 < T), other=0.0)
+    i_0_7 = tl.load(I + (7 * row + base), mask=cmask & (7 < T), other=0.0)
+    i_0_8 = tl.load(I + (8 * row + base), mask=cmask & (8 < T), other=0.0)
+    i_0_9 = tl.load(I + (9 * row + base), mask=cmask & (9 < T), other=0.0)
+    i_0_10 = tl.load(I + (10 * row + base), mask=cmask & (10 < T), other=0.0)
+    i_0_11 = tl.load(I + (11 * row + base), mask=cmask & (11 < T), other=0.0)
+    i_0_12 = tl.load(I + (12 * row + base), mask=cmask & (12 < T), other=0.0)
+    i_0_13 = tl.load(I + (13 * row + base), mask=cmask & (13 < T), other=0.0)
+    i_0_14 = tl.load(I + (14 * row + base), mask=cmask & (14 < T), other=0.0)
+    i_0_15 = tl.load(I + (15 * row + base), mask=cmask & (15 < T), other=0.0)
+    i_0_16 = tl.load(I + (16 * row + base), mask=cmask & (16 < T), other=0.0)
+    i_0_17 = tl.load(I + (17 * row + base), mask=cmask & (17 < T), other=0.0)
+    i_0_18 = tl.load(I + (18 * row + base), mask=cmask & (18 < T), other=0.0)
+    i_0_19 = tl.load(I + (19 * row + base), mask=cmask & (19 < T), other=0.0)
+    i_0_20 = tl.load(I + (20 * row + base), mask=cmask & (20 < T), other=0.0)
+    i_0_21 = tl.load(I + (21 * row + base), mask=cmask & (21 < T), other=0.0)
+    i_0_22 = tl.load(I + (22 * row + base), mask=cmask & (22 < T), other=0.0)
+    i_0_23 = tl.load(I + (23 * row + base), mask=cmask & (23 < T), other=0.0)
+    i_0_24 = tl.load(I + (24 * row + base), mask=cmask & (24 < T), other=0.0)
+    i_0_25 = tl.load(I + (25 * row + base), mask=cmask & (25 < T), other=0.0)
+    i_0_26 = tl.load(I + (26 * row + base), mask=cmask & (26 < T), other=0.0)
+    i_0_27 = tl.load(I + (27 * row + base), mask=cmask & (27 < T), other=0.0)
+    i_0_28 = tl.load(I + (28 * row + base), mask=cmask & (28 < T), other=0.0)
+    i_0_29 = tl.load(I + (29 * row + base), mask=cmask & (29 < T), other=0.0)
+    i_0_30 = tl.load(I + (30 * row + base), mask=cmask & (30 < T), other=0.0)
+    i_0_31 = tl.load(I + (31 * row + base), mask=cmask & (31 < T), other=0.0)
+    a_0_0 = tl.load(A + (0 * row + base), mask=cmask & (0 < T), other=0.0)
+    a_0_1 = tl.load(A + (1 * row + base), mask=cmask & (1 < T), other=0.0)
+    a_0_2 = tl.load(A + (2 * row + base), mask=cmask & (2 < T), other=0.0)
+    a_0_3 = tl.load(A + (3 * row + base), mask=cmask & (3 < T), other=0.0)
+    a_0_4 = tl.load(A + (4 * row + base), mask=cmask & (4 < T), other=0.0)
+    a_0_5 = tl.load(A + (5 * row + base), mask=cmask & (5 < T), other=0.0)
+    a_0_6 = tl.load(A + (6 * row + base), mask=cmask & (6 < T), other=0.0)
+    a_0_7 = tl.load(A + (7 * row + base), mask=cmask & (7 < T), other=0.0)
+    a_0_8 = tl.load(A + (8 * row + base), mask=cmask & (8 < T), other=0.0)
+    a_0_9 = tl.load(A + (9 * row + base), mask=cmask & (9 < T), other=0.0)
+    a_0_10 = tl.load(A + (10 * row + base), mask=cmask & (10 < T), other=0.0)
+    a_0_11 = tl.load(A + (11 * row + base), mask=cmask & (11 < T), other=0.0)
+    a_0_12 = tl.load(A + (12 * row + base), mask=cmask & (12 < T), other=0.0)
+    a_0_13 = tl.load(A + (13 * row + base), mask=cmask & (13 < T), other=0.0)
+    a_0_14 = tl.load(A + (14 * row + base), mask=cmask & (14 < T), other=0.0)
+    a_0_15 = tl.load(A + (15 * row + base), mask=cmask & (15 < T), other=0.0)
+    a_0_16 = tl.load(A + (16 * row + base), mask=cmask & (16 < T), other=0.0)
+    a_0_17 = tl.load(A + (17 * row + base), mask=cmask & (17 < T), other=0.0)
+    a_0_18 = tl.load(A + (18 * row + base), mask=cmask & (18 < T), other=0.0)
+    a_0_19 = tl.load(A + (19 * row + base), mask=cmask & (19 < T), other=0.0)
+    a_0_20 = tl.load(A + (20 * row + base), mask=cmask & (20 < T), other=0.0)
+    a_0_21 = tl.load(A + (21 * row + base), mask=cmask & (21 < T), other=0.0)
+    a_0_22 = tl.load(A + (22 * row + base), mask=cmask & (22 < T), other=0.0)
+    a_0_23 = tl.load(A + (23 * row + base), mask=cmask & (23 < T), other=0.0)
+    a_0_24 = tl.load(A + (24 * row + base), mask=cmask & (24 < T), other=0.0)
+    a_0_25 = tl.load(A + (25 * row + base), mask=cmask & (25 < T), other=0.0)
+    a_0_26 = tl.load(A + (26 * row + base), mask=cmask & (26 < T), other=0.0)
+    a_0_27 = tl.load(A + (27 * row + base), mask=cmask & (27 < T), other=0.0)
+    a_0_28 = tl.load(A + (28 * row + base), mask=cmask & (28 < T), other=0.0)
+    a_0_29 = tl.load(A + (29 * row + base), mask=cmask & (29 < T), other=0.0)
+    a_0_30 = tl.load(A + (30 * row + base), mask=cmask & (30 < T), other=0.0)
+    a_0_31 = tl.load(A + (31 * row + base), mask=cmask & (31 < T), other=0.0)
     for tile in range(0, T, 32):
-        lm_0 = cmask & (tile + 32 + 0 < T)
-        lp_0 = (tile + 32 + 0) * (B * DN) + b * DN + c
-        lm_1 = cmask & (tile + 32 + 1 < T)
-        lp_1 = (tile + 32 + 1) * (B * DN) + b * DN + c
-        lm_2 = cmask & (tile + 32 + 2 < T)
-        lp_2 = (tile + 32 + 2) * (B * DN) + b * DN + c
-        lm_3 = cmask & (tile + 32 + 3 < T)
-        lp_3 = (tile + 32 + 3) * (B * DN) + b * DN + c
-        lm_4 = cmask & (tile + 32 + 4 < T)
-        lp_4 = (tile + 32 + 4) * (B * DN) + b * DN + c
-        lm_5 = cmask & (tile + 32 + 5 < T)
-        lp_5 = (tile + 32 + 5) * (B * DN) + b * DN + c
-        lm_6 = cmask & (tile + 32 + 6 < T)
-        lp_6 = (tile + 32 + 6) * (B * DN) + b * DN + c
-        lm_7 = cmask & (tile + 32 + 7 < T)
-        lp_7 = (tile + 32 + 7) * (B * DN) + b * DN + c
-        lm_8 = cmask & (tile + 32 + 8 < T)
-        lp_8 = (tile + 32 + 8) * (B * DN) + b * DN + c
-        lm_9 = cmask & (tile + 32 + 9 < T)
-        lp_9 = (tile + 32 + 9) * (B * DN) + b * DN + c
-        lm_10 = cmask & (tile + 32 + 10 < T)
-        lp_10 = (tile + 32 + 10) * (B * DN) + b * DN + c
-        lm_11 = cmask & (tile + 32 + 11 < T)
-        lp_11 = (tile + 32 + 11) * (B * DN) + b * DN + c
-        lm_12 = cmask & (tile + 32 + 12 < T)
-        lp_12 = (tile + 32 + 12) * (B * DN) + b * DN + c
-        lm_13 = cmask & (tile + 32 + 13 < T)
-        lp_13 = (tile + 32 + 13) * (B * DN) + b * DN + c
-        lm_14 = cmask & (tile + 32 + 14 < T)
-        lp_14 = (tile + 32 + 14) * (B * DN) + b * DN + c
-        lm_15 = cmask & (tile + 32 + 15 < T)
-        lp_15 = (tile + 32 + 15) * (B * DN) + b * DN + c
-        lm_16 = cmask & (tile + 32 + 16 < T)
-        lp_16 = (tile + 32 + 16) * (B * DN) + b * DN + c
-        lm_17 = cmask & (tile + 32 + 17 < T)
-        lp_17 = (tile + 32 + 17) * (B * DN) + b * DN + c
-        lm_18 = cmask & (tile + 32 + 18 < T)
-        lp_18 = (tile + 32 + 18) * (B * DN) + b * DN + c
-        lm_19 = cmask & (tile + 32 + 19 < T)
-        lp_19 = (tile + 32 + 19) * (B * DN) + b * DN + c
-        lm_20 = cmask & (tile + 32 + 20 < T)
-        lp_20 = (tile + 32 + 20) * (B * DN) + b * DN + c
-        lm_21 = cmask & (tile + 32 + 21 < T)
-        lp_21 = (tile + 32 + 21) * (B * DN) + b * DN + c
-        lm_22 = cmask & (tile + 32 + 22 < T)
-        lp_22 = (tile + 32 + 22) * (B * DN) + b * DN + c
-        lm_23 = cmask & (tile + 32 + 23 < T)
-        lp_23 = (tile + 32 + 23) * (B * DN) + b * DN + c
-        lm_24 = cmask & (tile + 32 + 24 < T)
-        lp_24 = (tile + 32 + 24) * (B * DN) + b * DN + c
-        lm_25 = cmask & (tile + 32 + 25 < T)
-        lp_25 = (tile + 32 + 25) * (B * DN) + b * DN + c
-        lm_26 = cmask & (tile + 32 + 26 < T)
-        lp_26 = (tile + 32 + 26) * (B * DN) + b * DN + c
-        lm_27 = cmask & (tile + 32 + 27 < T)
-        lp_27 = (tile + 32 + 27) * (B * DN) + b * DN + c
-        lm_28 = cmask & (tile + 32 + 28 < T)
-        lp_28 = (tile + 32 + 28) * (B * DN) + b * DN + c
-        lm_29 = cmask & (tile + 32 + 29 < T)
-        lp_29 = (tile + 32 + 29) * (B * DN) + b * DN + c
-        lm_30 = cmask & (tile + 32 + 30 < T)
-        lp_30 = (tile + 32 + 30) * (B * DN) + b * DN + c
-        lm_31 = cmask & (tile + 32 + 31 < T)
-        lp_31 = (tile + 32 + 31) * (B * DN) + b * DN + c
-        i_1_0 = tl.load(I + lp_0, mask=lm_0, other=0.0).to(tl.float32)
-        i_1_1 = tl.load(I + lp_1, mask=lm_1, other=0.0).to(tl.float32)
-        i_1_2 = tl.load(I + lp_2, mask=lm_2, other=0.0).to(tl.float32)
-        i_1_3 = tl.load(I + lp_3, mask=lm_3, other=0.0).to(tl.float32)
-        i_1_4 = tl.load(I + lp_4, mask=lm_4, other=0.0).to(tl.float32)
-        i_1_5 = tl.load(I + lp_5, mask=lm_5, other=0.0).to(tl.float32)
-        i_1_6 = tl.load(I + lp_6, mask=lm_6, other=0.0).to(tl.float32)
-        i_1_7 = tl.load(I + lp_7, mask=lm_7, other=0.0).to(tl.float32)
-        i_1_8 = tl.load(I + lp_8, mask=lm_8, other=0.0).to(tl.float32)
-        i_1_9 = tl.load(I + lp_9, mask=lm_9, other=0.0).to(tl.float32)
-        i_1_10 = tl.load(I + lp_10, mask=lm_10, other=0.0).to(tl.float32)
-        i_1_11 = tl.load(I + lp_11, mask=lm_11, other=0.0).to(tl.float32)
-        i_1_12 = tl.load(I + lp_12, mask=lm_12, other=0.0).to(tl.float32)
-        i_1_13 = tl.load(I + lp_13, mask=lm_13, other=0.0).to(tl.float32)
-        i_1_14 = tl.load(I + lp_14, mask=lm_14, other=0.0).to(tl.float32)
-        i_1_15 = tl.load(I + lp_15, mask=lm_15, other=0.0).to(tl.float32)
-        i_1_16 = tl.load(I + lp_16, mask=lm_16, other=0.0).to(tl.float32)
-        i_1_17 = tl.load(I + lp_17, mask=lm_17, other=0.0).to(tl.float32)
-        i_1_18 = tl.load(I + lp_18, mask=lm_18, other=0.0).to(tl.float32)
-        i_1_19 = tl.load(I + lp_19, mask=lm_19, other=0.0).to(tl.float32)
-        i_1_20 = tl.load(I + lp_20, mask=lm_20, other=0.0).to(tl.float32)
-        i_1_21 = tl.load(I + lp_21, mask=lm_21, other=0.0).to(tl.float32)
-        i_1_22 = tl.load(I + lp_22, mask=lm_22, other=0.0).to(tl.float32)
-        i_1_23 = tl.load(I + lp_23, mask=lm_23, other=0.0).to(tl.float32)
-        i_1_24 = tl.load(I + lp_24, mask=lm_24, other=0.0).to(tl.float32)
-        i_1_25 = tl.load(I + lp_25, mask=lm_25, other=0.0).to(tl.float32)
-        i_1_26 = tl.load(I + lp_26, mask=lm_26, other=0.0).to(tl.float32)
-        i_1_27 = tl.load(I + lp_27, mask=lm_27, other=0.0).to(tl.float32)
-        i_1_28 = tl.load(I + lp_28, mask=lm_28, other=0.0).to(tl.float32)
-        i_1_29 = tl.load(I + lp_29, mask=lm_29, other=0.0).to(tl.float32)
-        i_1_30 = tl.load(I + lp_30, mask=lm_30, other=0.0).to(tl.float32)
-        i_1_31 = tl.load(I + lp_31, mask=lm_31, other=0.0).to(tl.float32)
-        if not A_PER_CHANNEL:
-            a_1_0 = tl.load(A + lp_0, mask=lm_0, other=0.0)
-            a_1_1 = tl.load(A + lp_1, mask=lm_1, other=0.0)
-            a_1_2 = tl.load(A + lp_2, mask=lm_2, other=0.0)
-            a_1_3 = tl.load(A + lp_3, mask=lm_3, other=0.0)
-            a_1_4 = tl.load(A + lp_4, mask=lm_4, other=0.0)
-            a_1_5 = tl.load(A + lp_5, mask=lm_5, other=0.0)
-            a_1_6 = tl.load(A + lp_6, mask=lm_6, other=0.0)
-            a_1_7 = tl.load(A + lp_7, mask=lm_7, other=0.0)
-            a_1_8 = tl.load(A + lp_8, mask=lm_8, other=0.0)
-            a_1_9 = tl.load(A + lp_9, mask=lm_9, other=0.0)
-            a_1_10 = tl.load(A + lp_10, mask=lm_10, other=0.0)
-            a_1_11 = tl.load(A + lp_11, mask=lm_11, other=0.0)
-            a_1_12 = tl.load(A + lp_12, mask=lm_12, other=0.0)
-            a_1_13 = tl.load(A + lp_13, mask=lm_13, other=0.0)
-            a_1_14 = tl.load(A + lp_14, mask=lm_14, other=0.0)
-            a_1_15 = tl.load(A + lp_15, mask=lm_15, other=0.0)
-            a_1_16 = tl.load(A + lp_16, mask=lm_16, other=0.0)
-            a_1_17 = tl.load(A + lp_17, mask=lm_17, other=0.0)
-            a_1_18 = tl.load(A + lp_18, mask=lm_18, other=0.0)
-            a_1_19 = tl.load(A + lp_19, mask=lm_19, other=0.0)
-            a_1_20 = tl.load(A + lp_20, mask=lm_20, other=0.0)
-            a_1_21 = tl.load(A + lp_21, mask=lm_21, other=0.0)
-            a_1_22 = tl.load(A + lp_22, mask=lm_22, other=0.0)
-            a_1_23 = tl.load(A + lp_23, mask=lm_23, other=0.0)
-            a_1_24 = tl.load(A + lp_24, mask=lm_24, other=0.0)
-            a_1_25 = tl.load(A + lp_25, mask=lm_25, other=0.0)
-            a_1_26 = tl.load(A + lp_26, mask=lm_26, other=0.0)
-            a_1_27 = tl.load(A + lp_27, mask=lm_27, other=0.0)
-            a_1_28 = tl.load(A + lp_28, mask=lm_28, other=0.0)
-            a_1_29 = tl.load(A + lp_29, mask=lm_29, other=0.0)
-            a_1_30 = tl.load(A + lp_30, mask=lm_30, other=0.0)
-            a_1_31 = tl.load(A + lp_31, mask=lm_31, other=0.0)
-        if not TH_PER_CHANNEL:
-            t_1_0 = tl.load(TH + lp_0, mask=lm_0, other=0.0)
-            t_1_1 = tl.load(TH + lp_1, mask=lm_1, other=0.0)
-            t_1_2 = tl.load(TH + lp_2, mask=lm_2, other=0.0)
-            t_1_3 = tl.load(TH + lp_3, mask=lm_3, other=0.0)
-            t_1_4 = tl.load(TH + lp_4, mask=lm_4, other=0.0)
-            t_1_5 = tl.load(TH + lp_5, mask=lm_5, other=0.0)
-            t_1_6 = tl.load(TH + lp_6, mask=lm_6, other=0.0)
-            t_1_7 = tl.load(TH + lp_7, mask=lm_7, other=0.0)
-            t_1_8 = tl.load(TH + lp_8, mask=lm_8, other=0.0)
-            t_1_9 = tl.load(TH + lp_9, mask=lm_9, other=0.0)
-            t_1_10 = tl.load(TH + lp_10, mask=lm_10, other=0.0)
-            t_1_11 = tl.load(TH + lp_11, mask=lm_11, other=0.0)
-            t_1_12 = tl.load(TH + lp_12, mask=lm_12, other=0.0)
-            t_1_13 = tl.load(TH + lp_13, mask=lm_13, other=0.0)
-            t_1_14 = tl.load(TH + lp_14, mask=lm_14, other=0.0)
-            t_1_15 = tl.load(TH + lp_15, mask=lm_15, other=0.0)
-            t_1_16 = tl.load(TH + lp_16, mask=lm_16, other=0.0)
-            t_1_17 = tl.load(TH + lp_17, mask=lm_17, other=0.0)
-            t_1_18 = tl.load(TH + lp_18, mask=lm_18, other=0.0)
-            t_1_19 = tl.load(TH + lp_19, mask=lm_19, other=0.0)
-            t_1_20 = tl.load(TH + lp_20, mask=lm_20, other=0.0)
-            t_1_21 = tl.load(TH + lp_21, mask=lm_21, other=0.0)
-            t_1_22 = tl.load(TH + lp_22, mask=lm_22, other=0.0)
-            t_1_23 = tl.load(TH + lp_23, mask=lm_23, other=0.0)
-            t_1_24 = tl.load(TH + lp_24, mask=lm_24, other=0.0)
-            t_1_25 = tl.load(TH + lp_25, mask=lm_25, other=0.0)
-            t_1_26 = tl.load(TH + lp_26, mask=lm_26, other=0.0)
-            t_1_27 = tl.load(TH + lp_27, mask=lm_27, other=0.0)
-            t_1_28 = tl.load(TH + lp_28, mask=lm_28, other=0.0)
-            t_1_29 = tl.load(TH + lp_29, mask=lm_29, other=0.0)
-            t_1_30 = tl.load(TH + lp_30, mask=lm_30, other=0.0)
-            t_1_31 = tl.load(TH + lp_31, mask=lm_31, other=0.0)
-        if HAS_RESET:
-            r_1_0 = tl.load(R + (tile + 32 + 0) * B + b, mask=lm_0, other=0).to(tl.int32)
-            r_1_1 = tl.load(R + (tile + 32 + 1) * B + b, mask=lm_1, other=0).to(tl.int32)
-            r_1_2 = tl.load(R + (tile + 32 + 2) * B + b, mask=lm_2, other=0).to(tl.int32)
-            r_1_3 = tl.load(R + (tile + 32 + 3) * B + b, mask=lm_3, other=0).to(tl.int32)
-            r_1_4 = tl.load(R + (tile + 32 + 4) * B + b, mask=lm_4, other=0).to(tl.int32)
-            r_1_5 = tl.load(R + (tile + 32 + 5) * B + b, mask=lm_5, other=0).to(tl.int32)
-            r_1_6 = tl.load(R + (tile + 32 + 6) * B + b, mask=lm_6, other=0).to(tl.int32)
-            r_1_7 = tl.load(R + (tile + 32 + 7) * B + b, mask=lm_7, other=0).to(tl.int32)
-            r_1_8 = tl.load(R + (tile + 32 + 8) * B + b, mask=lm_8, other=0).to(tl.int32)
-            r_1_9 = tl.load(R + (tile + 32 + 9) * B + b, mask=lm_9, other=0).to(tl.int32)
-            r_1_10 = tl.load(R + (tile + 32 + 10) * B + b, mask=lm_10, other=0).to(tl.int32)
-            r_1_11 = tl.load(R + (tile + 32 + 11) * B + b, mask=lm_11, other=0).to(tl.int32)
-            r_1_12 = tl.load(R + (tile + 32 + 12) * B + b, mask=lm_12, other=0).to(tl.int32)
-            r_1_13 = tl.load(R + (tile + 32 + 13) * B + b, mask=lm_13, other=0).to(tl.int32)
-            r_1_14 = tl.load(R + (tile + 32 + 14) * B + b, mask=lm_14, other=0).to(tl.int32)
-            r_1_15 = tl.load(R + (tile + 32 + 15) * B + b, mask=lm_15, other=0).to(tl.int32)
-            r_1_16 = tl.load(R + (tile + 32 + 16) * B + b, mask=lm_16, other=0).to(tl.int32)
-            r_1_17 = tl.load(R + (tile + 32 + 17) * B + b, mask=lm_17, other=0).to(tl.int32)
-            r_1_18 = tl.load(R + (tile + 32 + 18) * B + b, mask=lm_18, other=0).to(tl.int32)
-            r_1_19 = tl.load(R + (tile + 32 + 19) * B + b, mask=lm_19, other=0).to(tl.int32)
-            r_1_20 = tl.load(R + (tile + 32 + 20) * B + b, mask=lm_20, other=0).to(tl.int32)
-            r_1_21 = tl.load(R + (tile + 32 + 21) * B + b, mask=lm_21, other=0).to(tl.int32)
-            r_1_22 = tl.load(R + (tile + 32 + 22) * B + b, mask=lm_22, other=0).to(tl.int32)
-            r_1_23 = tl.load(R + (tile + 32 + 23) * B + b, mask=lm_23, other=0).to(tl.int32)
-            r_1_24 = tl.load(R + (tile + 32 + 24) * B + b, mask=lm_24, other=0).to(tl.int32)
-            r_1_25 = tl.load(R + (tile + 32 + 25) * B + b, mask=lm_25, other=0).to(tl.int32)
-            r_1_26 = tl.load(R + (tile + 32 + 26) * B + b, mask=lm_26, other=0).to(tl.int32)
-            r_1_27 = tl.load(R + (tile + 32 + 27) * B + b, mask=lm_27, other=0).to(tl.int32)
-            r_1_28 = tl.load(R + (tile + 32 + 28) * B + b, mask=lm_28, other=0).to(tl.int32)
-            r_1_29 = tl.load(R + (tile + 32 + 29) * B + b, mask=lm_29, other=0).to(tl.int32)
-            r_1_30 = tl.load(R + (tile + 32 + 30) * B + b, mask=lm_30, other=0).to(tl.int32)
-            r_1_31 = tl.load(R + (tile + 32 + 31) * B + b, mask=lm_31, other=0).to(tl.int32)
-        # ---- token 0 of the tile (sequential, registers only)
-        m_0_0 = cmask & (tile + 0 < T)
-        p_0_0 = (tile + 0) * (B * DN) + b * DN + c
-        i = i_0_0
-        a = a_const if A_PER_CHANNEL else a_0_0
-        th = th_const if TH_PER_CHANNEL else t_0_0
-        if HAS_RESET:
-            pre = tl.where(r_0_0 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        nxt = tile + 32
+        i_1_0 = tl.load(I + ((nxt + 0) * row + base), mask=cmask & (nxt + 0 < T), other=0.0)
+        i_1_1 = tl.load(I + ((nxt + 1) * row + base), mask=cmask & (nxt + 1 < T), other=0.0)
+        i_1_2 = tl.load(I + ((nxt + 2) * row + base), mask=cmask & (nxt + 2 < T), other=0.0)
+        i_1_3 = tl.load(I + ((nxt + 3) * row + base), mask=cmask & (nxt + 3 < T), other=0.0)
+        i_1_4 = tl.load(I + ((nxt + 4) * row + base), mask=cmask & (nxt + 4 < T), other=0.0)
+        i_1_5 = tl.load(I + ((nxt + 5) * row + base), mask=cmask & (nxt + 5 < T), other=0.0)
+        i_1_6 = tl.load(I + ((nxt + 6) * row + base), mask=cmask & (nxt + 6 < T), other=0.0)
+        i_1_7 = tl.load(I + ((nxt + 7) * row + base), mask=cmask & (nxt + 7 < T), other=0.0)
+        i_1_8 = tl.load(I + ((nxt + 8) * row + base), mask=cmask & (nxt + 8 < T), other=0.0)
+        i_1_9 = tl.load(I + ((nxt + 9) * row + base), mask=cmask & (nxt + 9 < T), other=0.0)
+        i_1_10 = tl.load(I + ((nxt + 10) * row + base), mask=cmask & (nxt + 10 < T), other=0.0)
+        i_1_11 = tl.load(I + ((nxt + 11) * row + base), mask=cmask & (nxt + 11 < T), other=0.0)
+        i_1_12 = tl.load(I + ((nxt + 12) * row + base), mask=cmask & (nxt + 12 < T), other=0.0)
+        i_1_13 = tl.load(I + ((nxt + 13) * row + base), mask=cmask & (nxt + 13 < T), other=0.0)
+        i_1_14 = tl.load(I + ((nxt + 14) * row + base), mask=cmask & (nxt + 14 < T), other=0.0)
+        i_1_15 = tl.load(I + ((nxt + 15) * row + base), mask=cmask & (nxt + 15 < T), other=0.0)
+        i_1_16 = tl.load(I + ((nxt + 16) * row + base), mask=cmask & (nxt + 16 < T), other=0.0)
+        i_1_17 = tl.load(I + ((nxt + 17) * row + base), mask=cmask & (nxt + 17 < T), other=0.0)
+        i_1_18 = tl.load(I + ((nxt + 18) * row + base), mask=cmask & (nxt + 18 < T), other=0.0)
+        i_1_19 = tl.load(I + ((nxt + 19) * row + base), mask=cmask & (nxt + 19 < T), other=0.0)
+        i_1_20 = tl.load(I + ((nxt + 20) * row + base), mask=cmask & (nxt + 20 < T), other=0.0)
+        i_1_21 = tl.load(I + ((nxt + 21) * row + base), mask=cmask & (nxt + 21 < T), other=0.0)
+        i_1_22 = tl.load(I + ((nxt + 22) * row + base), mask=cmask & (nxt + 22 < T), other=0.0)
+        i_1_23 = tl.load(I + ((nxt + 23) * row + base), mask=cmask & (nxt + 23 < T), other=0.0)
+        i_1_24 = tl.load(I + ((nxt + 24) * row + base), mask=cmask & (nxt + 24 < T), other=0.0)
+        i_1_25 = tl.load(I + ((nxt + 25) * row + base), mask=cmask & (nxt + 25 < T), other=0.0)
+        i_1_26 = tl.load(I + ((nxt + 26) * row + base), mask=cmask & (nxt + 26 < T), other=0.0)
+        i_1_27 = tl.load(I + ((nxt + 27) * row + base), mask=cmask & (nxt + 27 < T), other=0.0)
+        i_1_28 = tl.load(I + ((nxt + 28) * row + base), mask=cmask & (nxt + 28 < T), other=0.0)
+        i_1_29 = tl.load(I + ((nxt + 29) * row + base), mask=cmask & (nxt + 29 < T), other=0.0)
+        i_1_30 = tl.load(I + ((nxt + 30) * row + base), mask=cmask & (nxt + 30 < T), other=0.0)
+        i_1_31 = tl.load(I + ((nxt + 31) * row + base), mask=cmask & (nxt + 31 < T), other=0.0)
+        a_1_0 = tl.load(A + ((nxt + 0) * row + base), mask=cmask & (nxt + 0 < T), other=0.0)
+        a_1_1 = tl.load(A + ((nxt + 1) * row + base), mask=cmask & (nxt + 1 < T), other=0.0)
+        a_1_2 = tl.load(A + ((nxt + 2) * row + base), mask=cmask & (nxt + 2 < T), other=0.0)
+        a_1_3 = tl.load(A + ((nxt + 3) * row + base), mask=cmask & (nxt + 3 < T), other=0.0)
+        a_1_4 = tl.load(A + ((nxt + 4) * row + base), mask=cmask & (nxt + 4 < T), other=0.0)
+        a_1_5 = tl.load(A + ((nxt + 5) * row + base), mask=cmask & (nxt + 5 < T), other=0.0)
+        a_1_6 = tl.load(A + ((nxt + 6) * row + base), mask=cmask & (nxt + 6 < T), other=0.0)
+        a_1_7 = tl.load(A + ((nxt + 7) * row + base), mask=cmask & (nxt + 7 < T), other=0.0)
+        a_1_8 = tl.load(A + ((nxt + 8) * row + base), mask=cmask & (nxt + 8 < T), other=0.0)
+        a_1_9 = tl.load(A + ((nxt + 9) * row + base), mask=cmask & (nxt + 9 < T), other=0.0)
+        a_1_10 = tl.load(A + ((nxt + 10) * row + base), mask=cmask & (nxt + 10 < T), other=0.0)
+        a_1_11 = tl.load(A + ((nxt + 11) * row + base), mask=cmask & (nxt + 11 < T), other=0.0)
+        a_1_12 = tl.load(A + ((nxt + 12) * row + base), mask=cmask & (nxt + 12 < T), other=0.0)
+        a_1_13 = tl.load(A + ((nxt + 13) * row + base), mask=cmask & (nxt + 13 < T), other=0.0)
+        a_1_14 = tl.load(A + ((nxt + 14) * row + base), mask=cmask & (nxt + 14 < T), other=0.0)
+        a_1_15 = tl.load(A + ((nxt + 15) * row + base), mask=cmask & (nxt + 15 < T), other=0.0)
+        a_1_16 = tl.load(A + ((nxt + 16) * row + base), mask=cmask & (nxt + 16 < T), other=0.0)
+        a_1_17 = tl.load(A + ((nxt + 17) * row + base), mask=cmask & (nxt + 17 < T), other=0.0)
+        a_1_18 = tl.load(A + ((nxt + 18) * row + base), mask=cmask & (nxt + 18 < T), other=0.0)
+        a_1_19 = tl.load(A + ((nxt + 19) * row + base), mask=cmask & (nxt + 19 < T), other=0.0)
+        a_1_20 = tl.load(A + ((nxt + 20) * row + base), mask=cmask & (nxt + 20 < T), other=0.0)
+        a_1_21 = tl.load(A + ((nxt + 21) * row + base), mask=cmask & (nxt + 21 < T), other=0.0)
+        a_1_22 = tl.load(A + ((nxt + 22) * row + base), mask=cmask & (nxt + 22 < T), other=0.0)
+        a_1_23 = tl.load(A + ((nxt + 23) * row + base), mask=cmask & (nxt + 23 < T), other=0.0)
+        a_1_24 = tl.load(A + ((nxt + 24) * row + base), mask=cmask & (nxt + 24 < T), other=0.0)
+        a_1_25 = tl.load(A + ((nxt + 25) * row + base), mask=cmask & (nxt + 25 < T), other=0.0)
+        a_1_26 = tl.load(A + ((nxt + 26) * row + base), mask=cmask & (nxt + 26 < T), other=0.0)
+        a_1_27 = tl.load(A + ((nxt + 27) * row + base), mask=cmask & (nxt + 27 < T), other=0.0)
+        a_1_28 = tl.load(A + ((nxt + 28) * row + base), mask=cmask & (nxt + 28 < T), other=0.0)
+        a_1_29 = tl.load(A + ((nxt + 29) * row + base), mask=cmask & (nxt + 29 < T), other=0.0)
+        a_1_30 = tl.load(A + ((nxt + 30) * row + base), mask=cmask & (nxt + 30 < T), other=0.0)
+        a_1_31 = tl.load(A + ((nxt + 31) * row + base), mask=cmask & (nxt + 31 < T), other=0.0)
+        # ---- token 0 of the tile
+        m = cmask & (tile + 0 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_0, v), i_0_0)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_0, pre - s, v)
-        tl.store(S_OUT + p_0_0, s, mask=m_0_0)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_0, pre, mask=m_0_0)
-        # ---- token 1 of the tile (sequential, registers only)
-        m_0_1 = cmask & (tile + 1 < T)
-        p_0_1 = (tile + 1) * (B * DN) + b * DN + c
-        i = i_0_1
-        a = a_const if A_PER_CHANNEL else a_0_1
-        th = th_const if TH_PER_CHANNEL else t_0_1
-        if HAS_RESET:
-            pre = tl.where(r_0_1 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 0) * row + base), s, mask=m)
+        # ---- token 1 of the tile
+        m = cmask & (tile + 1 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_1, v), i_0_1)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_1, pre - s, v)
-        tl.store(S_OUT + p_0_1, s, mask=m_0_1)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_1, pre, mask=m_0_1)
-        # ---- token 2 of the tile (sequential, registers only)
-        m_0_2 = cmask & (tile + 2 < T)
-        p_0_2 = (tile + 2) * (B * DN) + b * DN + c
-        i = i_0_2
-        a = a_const if A_PER_CHANNEL else a_0_2
-        th = th_const if TH_PER_CHANNEL else t_0_2
-        if HAS_RESET:
-            pre = tl.where(r_0_2 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 1) * row + base), s, mask=m)
+        # ---- token 2 of the tile
+        m = cmask & (tile + 2 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_2, v), i_0_2)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_2, pre - s, v)
-        tl.store(S_OUT + p_0_2, s, mask=m_0_2)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_2, pre, mask=m_0_2)
-        # ---- token 3 of the tile (sequential, registers only)
-        m_0_3 = cmask & (tile + 3 < T)
-        p_0_3 = (tile + 3) * (B * DN) + b * DN + c
-        i = i_0_3
-        a = a_const if A_PER_CHANNEL else a_0_3
-        th = th_const if TH_PER_CHANNEL else t_0_3
-        if HAS_RESET:
-            pre = tl.where(r_0_3 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 2) * row + base), s, mask=m)
+        # ---- token 3 of the tile
+        m = cmask & (tile + 3 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_3, v), i_0_3)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_3, pre - s, v)
-        tl.store(S_OUT + p_0_3, s, mask=m_0_3)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_3, pre, mask=m_0_3)
-        # ---- token 4 of the tile (sequential, registers only)
-        m_0_4 = cmask & (tile + 4 < T)
-        p_0_4 = (tile + 4) * (B * DN) + b * DN + c
-        i = i_0_4
-        a = a_const if A_PER_CHANNEL else a_0_4
-        th = th_const if TH_PER_CHANNEL else t_0_4
-        if HAS_RESET:
-            pre = tl.where(r_0_4 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 3) * row + base), s, mask=m)
+        # ---- token 4 of the tile
+        m = cmask & (tile + 4 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_4, v), i_0_4)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_4, pre - s, v)
-        tl.store(S_OUT + p_0_4, s, mask=m_0_4)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_4, pre, mask=m_0_4)
-        # ---- token 5 of the tile (sequential, registers only)
-        m_0_5 = cmask & (tile + 5 < T)
-        p_0_5 = (tile + 5) * (B * DN) + b * DN + c
-        i = i_0_5
-        a = a_const if A_PER_CHANNEL else a_0_5
-        th = th_const if TH_PER_CHANNEL else t_0_5
-        if HAS_RESET:
-            pre = tl.where(r_0_5 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 4) * row + base), s, mask=m)
+        # ---- token 5 of the tile
+        m = cmask & (tile + 5 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_5, v), i_0_5)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_5, pre - s, v)
-        tl.store(S_OUT + p_0_5, s, mask=m_0_5)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_5, pre, mask=m_0_5)
-        # ---- token 6 of the tile (sequential, registers only)
-        m_0_6 = cmask & (tile + 6 < T)
-        p_0_6 = (tile + 6) * (B * DN) + b * DN + c
-        i = i_0_6
-        a = a_const if A_PER_CHANNEL else a_0_6
-        th = th_const if TH_PER_CHANNEL else t_0_6
-        if HAS_RESET:
-            pre = tl.where(r_0_6 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 5) * row + base), s, mask=m)
+        # ---- token 6 of the tile
+        m = cmask & (tile + 6 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_6, v), i_0_6)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_6, pre - s, v)
-        tl.store(S_OUT + p_0_6, s, mask=m_0_6)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_6, pre, mask=m_0_6)
-        # ---- token 7 of the tile (sequential, registers only)
-        m_0_7 = cmask & (tile + 7 < T)
-        p_0_7 = (tile + 7) * (B * DN) + b * DN + c
-        i = i_0_7
-        a = a_const if A_PER_CHANNEL else a_0_7
-        th = th_const if TH_PER_CHANNEL else t_0_7
-        if HAS_RESET:
-            pre = tl.where(r_0_7 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 6) * row + base), s, mask=m)
+        # ---- token 7 of the tile
+        m = cmask & (tile + 7 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_7, v), i_0_7)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_7, pre - s, v)
-        tl.store(S_OUT + p_0_7, s, mask=m_0_7)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_7, pre, mask=m_0_7)
-        # ---- token 8 of the tile (sequential, registers only)
-        m_0_8 = cmask & (tile + 8 < T)
-        p_0_8 = (tile + 8) * (B * DN) + b * DN + c
-        i = i_0_8
-        a = a_const if A_PER_CHANNEL else a_0_8
-        th = th_const if TH_PER_CHANNEL else t_0_8
-        if HAS_RESET:
-            pre = tl.where(r_0_8 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 7) * row + base), s, mask=m)
+        # ---- token 8 of the tile
+        m = cmask & (tile + 8 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_8, v), i_0_8)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_8, pre - s, v)
-        tl.store(S_OUT + p_0_8, s, mask=m_0_8)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_8, pre, mask=m_0_8)
-        # ---- token 9 of the tile (sequential, registers only)
-        m_0_9 = cmask & (tile + 9 < T)
-        p_0_9 = (tile + 9) * (B * DN) + b * DN + c
-        i = i_0_9
-        a = a_const if A_PER_CHANNEL else a_0_9
-        th = th_const if TH_PER_CHANNEL else t_0_9
-        if HAS_RESET:
-            pre = tl.where(r_0_9 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 8) * row + base), s, mask=m)
+        # ---- token 9 of the tile
+        m = cmask & (tile + 9 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_9, v), i_0_9)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_9, pre - s, v)
-        tl.store(S_OUT + p_0_9, s, mask=m_0_9)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_9, pre, mask=m_0_9)
-        # ---- token 10 of the tile (sequential, registers only)
-        m_0_10 = cmask & (tile + 10 < T)
-        p_0_10 = (tile + 10) * (B * DN) + b * DN + c
-        i = i_0_10
-        a = a_const if A_PER_CHANNEL else a_0_10
-        th = th_const if TH_PER_CHANNEL else t_0_10
-        if HAS_RESET:
-            pre = tl.where(r_0_10 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 9) * row + base), s, mask=m)
+        # ---- token 10 of the tile
+        m = cmask & (tile + 10 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_10, v), i_0_10)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_10, pre - s, v)
-        tl.store(S_OUT + p_0_10, s, mask=m_0_10)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_10, pre, mask=m_0_10)
-        # ---- token 11 of the tile (sequential, registers only)
-        m_0_11 = cmask & (tile + 11 < T)
-        p_0_11 = (tile + 11) * (B * DN) + b * DN + c
-        i = i_0_11
-        a = a_const if A_PER_CHANNEL else a_0_11
-        th = th_const if TH_PER_CHANNEL else t_0_11
-        if HAS_RESET:
-            pre = tl.where(r_0_11 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 10) * row + base), s, mask=m)
+        # ---- token 11 of the tile
+        m = cmask & (tile + 11 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_11, v), i_0_11)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_11, pre - s, v)
-        tl.store(S_OUT + p_0_11, s, mask=m_0_11)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_11, pre, mask=m_0_11)
-        # ---- token 12 of the tile (sequential, registers only)
-        m_0_12 = cmask & (tile + 12 < T)
-        p_0_12 = (tile + 12) * (B * DN) + b * DN + c
-        i = i_0_12
-        a = a_const if A_PER_CHANNEL else a_0_12
-        th = th_const if TH_PER_CHANNEL else t_0_12
-        if HAS_RESET:
-            pre = tl.where(r_0_12 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 11) * row + base), s, mask=m)
+        # ---- token 12 of the tile
+        m = cmask & (tile + 12 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_12, v), i_0_12)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_12, pre - s, v)
-        tl.store(S_OUT + p_0_12, s, mask=m_0_12)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_12, pre, mask=m_0_12)
-        # ---- token 13 of the tile (sequential, registers only)
-        m_0_13 = cmask & (tile + 13 < T)
-        p_0_13 = (tile + 13) * (B * DN) + b * DN + c
-        i = i_0_13
-        a = a_const if A_PER_CHANNEL else a_0_13
-        th = th_const if TH_PER_CHANNEL else t_0_13
-        if HAS_RESET:
-            pre = tl.where(r_0_13 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 12) * row + base), s, mask=m)
+        # ---- token 13 of the tile
+        m = cmask & (tile + 13 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_13, v), i_0_13)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_13, pre - s, v)
-        tl.store(S_OUT + p_0_13, s, mask=m_0_13)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_13, pre, mask=m_0_13)
-        # ---- token 14 of the tile (sequential, registers only)
-        m_0_14 = cmask & (tile + 14 < T)
-        p_0_14 = (tile + 14) * (B * DN) + b * DN + c
-        i = i_0_14
-        a = a_const if A_PER_CHANNEL else a_0_14
-        th = th_const if TH_PER_CHANNEL else t_0_14
-        if HAS_RESET:
-            pre = tl.where(r_0_14 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 13) * row + base), s, mask=m)
+        # ---- token 14 of the tile
+        m = cmask & (tile + 14 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_14, v), i_0_14)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_14, pre - s, v)
-        tl.store(S_OUT + p_0_14, s, mask=m_0_14)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_14, pre, mask=m_0_14)
-        # ---- token 15 of the tile (sequential, registers only)
-        m_0_15 = cmask & (tile + 15 < T)
-        p_0_15 = (tile + 15) * (B * DN) + b * DN + c
-        i = i_0_15
-        a = a_const if A_PER_CHANNEL else a_0_15
-        th = th_const if TH_PER_CHANNEL else t_0_15
-        if HAS_RESET:
-            pre = tl.where(r_0_15 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 14) * row + base), s, mask=m)
+        # ---- token 15 of the tile
+        m = cmask & (tile + 15 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_15, v), i_0_15)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_15, pre - s, v)
-        tl.store(S_OUT + p_0_15, s, mask=m_0_15)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_15, pre, mask=m_0_15)
-        # ---- token 16 of the tile (sequential, registers only)
-        m_0_16 = cmask & (tile + 16 < T)
-        p_0_16 = (tile + 16) * (B * DN) + b * DN + c
-        i = i_0_16
-        a = a_const if A_PER_CHANNEL else a_0_16
-        th = th_const if TH_PER_CHANNEL else t_0_16
-        if HAS_RESET:
-            pre = tl.where(r_0_16 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 15) * row + base), s, mask=m)
+        # ---- token 16 of the tile
+        m = cmask & (tile + 16 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_16, v), i_0_16)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_16, pre - s, v)
-        tl.store(S_OUT + p_0_16, s, mask=m_0_16)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_16, pre, mask=m_0_16)
-        # ---- token 17 of the tile (sequential, registers only)
-        m_0_17 = cmask & (tile + 17 < T)
-        p_0_17 = (tile + 17) * (B * DN) + b * DN + c
-        i = i_0_17
-        a = a_const if A_PER_CHANNEL else a_0_17
-        th = th_const if TH_PER_CHANNEL else t_0_17
-        if HAS_RESET:
-            pre = tl.where(r_0_17 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 16) * row + base), s, mask=m)
+        # ---- token 17 of the tile
+        m = cmask & (tile + 17 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_17, v), i_0_17)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_17, pre - s, v)
-        tl.store(S_OUT + p_0_17, s, mask=m_0_17)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_17, pre, mask=m_0_17)
-        # ---- token 18 of the tile (sequential, registers only)
-        m_0_18 = cmask & (tile + 18 < T)
-        p_0_18 = (tile + 18) * (B * DN) + b * DN + c
-        i = i_0_18
-        a = a_const if A_PER_CHANNEL else a_0_18
-        th = th_const if TH_PER_CHANNEL else t_0_18
-        if HAS_RESET:
-            pre = tl.where(r_0_18 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 17) * row + base), s, mask=m)
+        # ---- token 18 of the tile
+        m = cmask & (tile + 18 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_18, v), i_0_18)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_18, pre - s, v)
-        tl.store(S_OUT + p_0_18, s, mask=m_0_18)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_18, pre, mask=m_0_18)
-        # ---- token 19 of the tile (sequential, registers only)
-        m_0_19 = cmask & (tile + 19 < T)
-        p_0_19 = (tile + 19) * (B * DN) + b * DN + c
-        i = i_0_19
-        a = a_const if A_PER_CHANNEL else a_0_19
-        th = th_const if TH_PER_CHANNEL else t_0_19
-        if HAS_RESET:
-            pre = tl.where(r_0_19 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 18) * row + base), s, mask=m)
+        # ---- token 19 of the tile
+        m = cmask & (tile + 19 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_19, v), i_0_19)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_19, pre - s, v)
-        tl.store(S_OUT + p_0_19, s, mask=m_0_19)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_19, pre, mask=m_0_19)
-        # ---- token 20 of the tile (sequential, registers only)
-        m_0_20 = cmask & (tile + 20 < T)
-        p_0_20 = (tile + 20) * (B * DN) + b * DN + c
-        i = i_0_20
-        a = a_const if A_PER_CHANNEL else a_0_20
-        th = th_const if TH_PER_CHANNEL else t_0_20
-        if HAS_RESET:
-            pre = tl.where(r_0_20 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 19) * row + base), s, mask=m)
+        # ---- token 20 of the tile
+        m = cmask & (tile + 20 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_20, v), i_0_20)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_20, pre - s, v)
-        tl.store(S_OUT + p_0_20, s, mask=m_0_20)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_20, pre, mask=m_0_20)
-        # ---- token 21 of the tile (sequential, registers only)
-        m_0_21 = cmask & (tile + 21 < T)
-        p_0_21 = (tile + 21) * (B * DN) + b * DN + c
-        i = i_0_21
-        a = a_const if A_PER_CHANNEL else a_0_21
-        th = th_const if TH_PER_CHANNEL else t_0_21
-        if HAS_RESET:
-            pre = tl.where(r_0_21 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 20) * row + base), s, mask=m)
+        # ---- token 21 of the tile
+        m = cmask & (tile + 21 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_21, v), i_0_21)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_21, pre - s, v)
-        tl.store(S_OUT + p_0_21, s, mask=m_0_21)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_21, pre, mask=m_0_21)
-        # ---- token 22 of the tile (sequential, registers only)
-        m_0_22 = cmask & (tile + 22 < T)
-        p_0_22 = (tile + 22) * (B * DN) + b * DN + c
-        i = i_0_22
-        a = a_const if A_PER_CHANNEL else a_0_22
-        th = th_const if TH_PER_CHANNEL else t_0_22
-        if HAS_RESET:
-            pre = tl.where(r_0_22 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 21) * row + base), s, mask=m)
+        # ---- token 22 of the tile
+        m = cmask & (tile + 22 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_22, v), i_0_22)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_22, pre - s, v)
-        tl.store(S_OUT + p_0_22, s, mask=m_0_22)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_22, pre, mask=m_0_22)
-        # ---- token 23 of the tile (sequential, registers only)
-        m_0_23 = cmask & (tile + 23 < T)
-        p_0_23 = (tile + 23) * (B * DN) + b * DN + c
-        i = i_0_23
-        a = a_const if A_PER_CHANNEL else a_0_23
-        th = th_const if TH_PER_CHANNEL else t_0_23
-        if HAS_RESET:
-            pre = tl.where(r_0_23 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 22) * row + base), s, mask=m)
+        # ---- token 23 of the tile
+        m = cmask & (tile + 23 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_23, v), i_0_23)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_23, pre - s, v)
-        tl.store(S_OUT + p_0_23, s, mask=m_0_23)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_23, pre, mask=m_0_23)
-        # ---- token 24 of the tile (sequential, registers only)
-        m_0_24 = cmask & (tile + 24 < T)
-        p_0_24 = (tile + 24) * (B * DN) + b * DN + c
-        i = i_0_24
-        a = a_const if A_PER_CHANNEL else a_0_24
-        th = th_const if TH_PER_CHANNEL else t_0_24
-        if HAS_RESET:
-            pre = tl.where(r_0_24 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 23) * row + base), s, mask=m)
+        # ---- token 24 of the tile
+        m = cmask & (tile + 24 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_24, v), i_0_24)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_24, pre - s, v)
-        tl.store(S_OUT + p_0_24, s, mask=m_0_24)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_24, pre, mask=m_0_24)
-        # ---- token 25 of the tile (sequential, registers only)
-        m_0_25 = cmask & (tile + 25 < T)
-        p_0_25 = (tile + 25) * (B * DN) + b * DN + c
-        i = i_0_25
-        a = a_const if A_PER_CHANNEL else a_0_25
-        th = th_const if TH_PER_CHANNEL else t_0_25
-        if HAS_RESET:
-            pre = tl.where(r_0_25 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 24) * row + base), s, mask=m)
+        # ---- token 25 of the tile
+        m = cmask & (tile + 25 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_25, v), i_0_25)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_25, pre - s, v)
-        tl.store(S_OUT + p_0_25, s, mask=m_0_25)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_25, pre, mask=m_0_25)
-        # ---- token 26 of the tile (sequential, registers only)
-        m_0_26 = cmask & (tile + 26 < T)
-        p_0_26 = (tile + 26) * (B * DN) + b * DN + c
-        i = i_0_26
-        a = a_const if A_PER_CHANNEL else a_0_26
-        th = th_const if TH_PER_CHANNEL else t_0_26
-        if HAS_RESET:
-            pre = tl.where(r_0_26 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 25) * row + base), s, mask=m)
+        # ---- token 26 of the tile
+        m = cmask & (tile + 26 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_26, v), i_0_26)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_26, pre - s, v)
-        tl.store(S_OUT + p_0_26, s, mask=m_0_26)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_26, pre, mask=m_0_26)
-        # ---- token 27 of the tile (sequential, registers only)
-        m_0_27 = cmask & (tile + 27 < T)
-        p_0_27 = (tile + 27) * (B * DN) + b * DN + c
-        i = i_0_27
-        a = a_const if A_PER_CHANNEL else a_0_27
-        th = th_const if TH_PER_CHANNEL else t_0_27
-        if HAS_RESET:
-            pre = tl.where(r_0_27 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 26) * row + base), s, mask=m)
+        # ---- token 27 of the tile
+        m = cmask & (tile + 27 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_27, v), i_0_27)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_27, pre - s, v)
-        tl.store(S_OUT + p_0_27, s, mask=m_0_27)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_27, pre, mask=m_0_27)
-        # ---- token 28 of the tile (sequential, registers only)
-        m_0_28 = cmask & (tile + 28 < T)
-        p_0_28 = (tile + 28) * (B * DN) + b * DN + c
-        i = i_0_28
-        a = a_const if A_PER_CHANNEL else a_0_28
-        th = th_const if TH_PER_CHANNEL else t_0_28
-        if HAS_RESET:
-            pre = tl.where(r_0_28 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 27) * row + base), s, mask=m)
+        # ---- token 28 of the tile
+        m = cmask & (tile + 28 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_28, v), i_0_28)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_28, pre - s, v)
-        tl.store(S_OUT + p_0_28, s, mask=m_0_28)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_28, pre, mask=m_0_28)
-        # ---- token 29 of the tile (sequential, registers only)
-        m_0_29 = cmask & (tile + 29 < T)
-        p_0_29 = (tile + 29) * (B * DN) + b * DN + c
-        i = i_0_29
-        a = a_const if A_PER_CHANNEL else a_0_29
-        th = th_const if TH_PER_CHANNEL else t_0_29
-        if HAS_RESET:
-            pre = tl.where(r_0_29 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 28) * row + base), s, mask=m)
+        # ---- token 29 of the tile
+        m = cmask & (tile + 29 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_29, v), i_0_29)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_29, pre - s, v)
-        tl.store(S_OUT + p_0_29, s, mask=m_0_29)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_29, pre, mask=m_0_29)
-        # ---- token 30 of the tile (sequential, registers only)
-        m_0_30 = cmask & (tile + 30 < T)
-        p_0_30 = (tile + 30) * (B * DN) + b * DN + c
-        i = i_0_30
-        a = a_const if A_PER_CHANNEL else a_0_30
-        th = th_const if TH_PER_CHANNEL else t_0_30
-        if HAS_RESET:
-            pre = tl.where(r_0_30 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 29) * row + base), s, mask=m)
+        # ---- token 30 of the tile
+        m = cmask & (tile + 30 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_30, v), i_0_30)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_30, pre - s, v)
-        tl.store(S_OUT + p_0_30, s, mask=m_0_30)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_30, pre, mask=m_0_30)
-        # ---- token 31 of the tile (sequential, registers only)
-        m_0_31 = cmask & (tile + 31 < T)
-        p_0_31 = (tile + 31) * (B * DN) + b * DN + c
-        i = i_0_31
-        a = a_const if A_PER_CHANNEL else a_0_31
-        th = th_const if TH_PER_CHANNEL else t_0_31
-        if HAS_RESET:
-            pre = tl.where(r_0_31 != 0, i, _rn_add_f32(_rn_mul_f32(a, v), i))
-        else:
-            pre = _rn_add_f32(_rn_mul_f32(a, v), i)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 30) * row + base), s, mask=m)
+        # ---- token 31 of the tile
+        m = cmask & (tile + 31 < T)
+        pre = _rn_add_f32(_rn_mul_f32(a_0_31, v), i_0_31)
         s = tl.maximum(pre - th, 0.0)
-        if BIPOLAR:
-            s = s - tl.maximum(-pre - th, 0.0)
-        v = tl.where(m_0_31, pre - s, v)
-        tl.store(S_OUT + p_0_31, s, mask=m_0_31)
-        if STORE_PRE:
-            tl.store(PRE_OUT + p_0_31, pre, mask=m_0_31)
-        # rotate the register buffers (slot s <- slot s+1)
+        s = s - tl.maximum(-pre - th, 0.0)
+        v = tl.where(m, pre - s, v)
+        tl.store(S_OUT + ((tile + 31) * row + base), s, mask=m)
         i_0_0 = i_1_0
+        a_0_0 = a_1_0
         i_0_1 = i_1_1
+        a_0_1 = a_1_1
         i_0_2 = i_1_2
+        a_0_2 = a_1_2
         i_0_3 = i_1_3
+        a_0_3 = a_1_3
         i_0_4 = i_1_4
+        a_0_4 = a_1_4
         i_0_5 = i_1_5
+        a_0_5 = a_1_5
         i_0_6 = i_1_6
+        a_0_6 = a_1_6
         i_0_7 = i_1_7
+        a_0_7 = a_1_7
         i_0_8 = i_1_8
+        a_0_8 = a_1_8
         i_0_9 = i_1_9
+        a_0_9 = a_1_9
         i_0_10 = i_1_10
+        a_0_10 = a_1_10
         i_0_11 = i_1_11
+        a_0_11 = a_1_11
         i_0_12 = i_1_12
+        a_0_12 = a_1_12
         i_0_13 = i_1_13
+        a_0_13 = a_1_13
         i_0_14 = i_1_14
+        a_0_14 = a_1_14
         i_0_15 = i_1_15
+        a_0_15 = a_1_15
         i_0_16 = i_1_16
+        a_0_16 = a_1_16
         i_0_17 = i_1_17
+        a_0_17 = a_1_17
         i_0_18 = i_1_18
+        a_0_18 = a_1_18
         i_0_19 = i_1_19
+        a_0_19 = a_1_19
         i_0_20 = i_1_20
+        a_0_20 = a_1_20
         i_0_21 = i_1_21
+        a_0_21 = a_1_21
         i_0_22 = i_1_22
+        a_0_22 = a_1_22
         i_0_23 = i_1_23
+        a_0_23 = a_1_23
         i_0_24 = i_1_24
+        a_0_24 = a_1_24
         i_0_25 = i_1_25
+        a_0_25 = a_1_25
         i_0_26 = i_1_26
+        a_0_26 = a_1_26
         i_0_27 = i_1_27
+        a_0_27 = a_1_27
         i_0_28 = i_1_28
+        a_0_28 = a_1_28
         i_0_29 = i_1_29
+        a_0_29 = a_1_29
         i_0_30 = i_1_30
+        a_0_30 = a_1_30
         i_0_31 = i_1_31
-        if not A_PER_CHANNEL:
-            a_0_0 = a_1_0
-            a_0_1 = a_1_1
-            a_0_2 = a_1_2
-            a_0_3 = a_1_3
-            a_0_4 = a_1_4
-            a_0_5 = a_1_5
-            a_0_6 = a_1_6
-            a_0_7 = a_1_7
-            a_0_8 = a_1_8
-            a_0_9 = a_1_9
-            a_0_10 = a_1_10
-            a_0_11 = a_1_11
-            a_0_12 = a_1_12
-            a_0_13 = a_1_13
-            a_0_14 = a_1_14
-            a_0_15 = a_1_15
-            a_0_16 = a_1_16
-            a_0_17 = a_1_17
-            a_0_18 = a_1_18
-            a_0_19 = a_1_19
-            a_0_20 = a_1_20
-            a_0_21 = a_1_21
-            a_0_22 = a_1_22
-            a_0_23 = a_1_23
-            a_0_24 = a_1_24
-            a_0_25 = a_1_25
-            a_0_26 = a_1_26
-            a_0_27 = a_1_27
-            a_0_28 = a_1_28
-            a_0_29 = a_1_29
-            a_0_30 = a_1_30
-            a_0_31 = a_1_31
-        if not TH_PER_CHANNEL:
-            t_0_0 = t_1_0
-            t_0_1 = t_1_1
-            t_0_2 = t_1_2
-            t_0_3 = t_1_3
-            t_0_4 = t_1_4
-            t_0_5 = t_1_5
-            t_0_6 = t_1_6
-            t_0_7 = t_1_7
-            t_0_8 = t_1_8
-            t_0_9 = t_1_9
-            t_0_10 = t_1_10
-            t_0_11 = t_1_11
-            t_0_12 = t_1_12
-            t_0_13 = t_1_13
-            t_0_14 = t_1_14
-            t_0_15 = t_1_15
-            t_0_16 = t_1_16
-            t_0_17 = t_1_17
-            t_0_18 = t_1_18
-            t_0_19 = t_1_19
-            t_0_20 = t_1_20
-            t_0_21 = t_1_21
-            t_0_22 = t_1_22
-            t_0_23 = t_1_23
-            t_0_24 = t_1_24
-            t_0_25 = t_1_25
-            t_0_26 = t_1_26
-            t_0_27 = t_1_27
-            t_0_28 = t_1_28
-            t_0_29 = t_1_29
-            t_0_30 = t_1_30
-            t_0_31 = t_1_31
-        if HAS_RESET:
-            r_0_0 = r_1_0
-            r_0_1 = r_1_1
-            r_0_2 = r_1_2
-            r_0_3 = r_1_3
-            r_0_4 = r_1_4
-            r_0_5 = r_1_5
-            r_0_6 = r_1_6
-            r_0_7 = r_1_7
-            r_0_8 = r_1_8
-            r_0_9 = r_1_9
-            r_0_10 = r_1_10
-            r_0_11 = r_1_11
-            r_0_12 = r_1_12
-            r_0_13 = r_1_13
-            r_0_14 = r_1_14
-            r_0_15 = r_1_15
-            r_0_16 = r_1_16
-            r_0_17 = r_1_17
-            r_0_18 = r_1_18
-            r_0_19 = r_1_19
-            r_0_20 = r_1_20
-            r_0_21 = r_1_21
-            r_0_22 = r_1_22
-            r_0_23 = r_1_23
-            r_0_24 = r_1_24
-            r_0_25 = r_1_25
-            r_0_26 = r_1_26
-            r_0_27 = r_1_27
-            r_0_28 = r_1_28
-            r_0_29 = r_1_29
-            r_0_30 = r_1_30
-            r_0_31 = r_1_31
-    tl.store(VLAST_OUT + offs, v, mask=cmask)
+        a_0_31 = a_1_31
+    tl.store(V0 + offs, v, mask=m0)
+    tl.store(V1 + offs, v, mask=m1)

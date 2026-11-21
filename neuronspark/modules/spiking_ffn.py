@@ -8,7 +8,8 @@
 op (bf16 operands, fp32 accumulation, bf16 output).  The two neurons carry their own membranes in an inference call
 (``gate_state`` / ``up_state``, the ``ffn_gate`` / ``ffn_up`` entries of the layer's ``HippocampalState``).  A
 single-token inference call (the decode step) multiplies z once, by the stacked bf16 weights of gate_proj, up_proj and
-skip_proj (:func:`neuronspark.ops.linear.stacked_inference_weight`).
+skip_proj (:func:`neuronspark.ops.linear.stacked_inference_weight`).  A prefill runs the two neurons through
+:meth:`neuronspark.modules.plif.PLIFNeuron.prefill_pair` (their scans side by side in one launch).
 
 Launch (``init="launch"``, global RNG stream, in this order): the four projections' PyTorch default draws, the gate
 neuron's and the up neuron's draws, then gate_proj / up_proj Xavier-uniform, down_proj N(0, out_std), skip_proj 0.
@@ -75,6 +76,11 @@ class SpikingFFN(nn.Module):
             u = self.up_neuron(zu, up_state, pos)
             # lin(g * u, down) + zk; one sequence: the product of the spikes and the skip term in the product's kernel
             return self._ops.linear_add(g, self.down_proj.weight, zk, u)
+        if gate_state is not None and probe is None:
+            # prefill: the two neurons' scans side by side in one launch
+            g, u = self.gate_neuron.prefill_pair(self.up_neuron, lin(z, self.gate_proj.weight),
+                                                 lin(z, self.up_proj.weight), gate_state, up_state)
+            return lin(g * u, self.down_proj.weight) + lin(z, self.skip_proj.weight)
         g = self.gate_neuron(lin(z, self.gate_proj.weight), gate_state, pos)
         u = self.up_neuron(lin(z, self.up_proj.weight), up_state, pos)
         if probe is not None:

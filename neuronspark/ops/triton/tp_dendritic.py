@@ -17,7 +17,8 @@ Ops (inference, no autograd; ``send`` / ``recv`` the peer's and this GPU's mailb
 * ``tp_gated_norm_soma(y, z, theta, gamma, eps, n_all, send, recv) -> x``: the prefill's gated norm and soma on (M, N)
   bf16 rows (one program per row, the whole local row in registers, one word per row).
 
-References: :func:`tp_step_core_ref`, :func:`tp_gated_norm_soma_ref` take the peer's per-row sums of squares.
+References: :func:`tp_step_core_ref`, :func:`tp_gated_norm_soma_ref` take the kernels' arguments and make the
+exchange in torch (:func:`neuronspark.ops.triton.tp_exchange.publish_ref` and ``take_ref``).
 """
 from __future__ import annotations
 
@@ -34,7 +35,7 @@ from neuronspark.ops.triton.dendritic_gated_norm import _rep_gate, _rep_load, _s
 from neuronspark.ops.triton.dendritic_soma import dendritic_soma_readout_ref
 from neuronspark.ops.triton.dendritic_step import (_launch_k1_gated, _launch_k1_plain, _launch_k1_split, _widths,
                                                   dendritic_step_k1_ref, k1_route, k1_tile, k2_programs)
-from neuronspark.ops.triton.tp_exchange import mailbox_swap1
+from neuronspark.ops.triton.tp_exchange import mailbox_swap1, publish_ref, take_ref
 
 __all__ = ["tp_step_core", "tp_step_core_ref", "tp_gated_norm_soma", "tp_gated_norm_soma_ref",
            "k2_words"]
@@ -232,30 +233,43 @@ def tp_gated_norm_soma(y: torch.Tensor, z: torch.Tensor, theta: torch.Tensor, ga
 
 
 # ================================================================================================ references
-def _norm_soma_ref(g: torch.Tensor, ss_peer: torch.Tensor, theta: torch.Tensor, gamma: torch.Tensor, eps: float,
-                   n_all: int, rstd: Optional[torch.Tensor] = None) -> torch.Tensor:
-    if rstd is None:
-        rstd = torch.rsqrt((g.pow(2).sum(dim=-1) + ss_peer) / n_all + eps)
+def tp_gated_norm_soma_ref(y: torch.Tensor, z: torch.Tensor, theta: torch.Tensor, gamma: torch.Tensor, eps: float,
+                           n_all: int, send: torch.Tensor, recv: torch.Tensor,
+                           rstd_out: Optional[torch.Tensor] = None,
+                           n_out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Pure torch, the exchange included: g = y z sigmoid(z) (fp32), this GPU's sum of squares of row m published at
+    word m of ``send``, the peer's taken from ``recv``; rstd over n_all channels, n = bf16(g rstd), the soma read-out;
+    ``rstd_out`` and ``n_out`` written as the kernel writes them."""
+    zf = z.float()
+    g = y.float() * (zf * torch.sigmoid(zf))
+    ss = g.pow(2).sum(dim=-1)
+    publish_ref(send, 0, ss)
+    peer = take_ref(recv, 0, int(g.shape[0]), "tp_gated_norm_soma_ref").view(torch.float32)
+    rstd = torch.rsqrt((ss + peer) / n_all + eps)
+    if rstd_out is not None:
+        rstd_out.copy_(rstd)
     n = (g * rstd.unsqueeze(-1)).to(torch.bfloat16)
+    if n_out is not None:
+        n_out.copy_(n)
     return dendritic_soma_readout_ref(n, theta, gamma)
 
 
-def tp_gated_norm_soma_ref(y: torch.Tensor, z: torch.Tensor, theta: torch.Tensor, gamma: torch.Tensor, eps: float,
-                           n_all: int, ss_peer: torch.Tensor, rstd: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """Pure torch: g = y z sigmoid(z) (fp32), rstd from this GPU's and the peer's (M,) sums of squares over n_all
-    channels (or the given (M,) ``rstd``: the read-out stage alone), n = bf16(g rstd), the soma read-out."""
-    zf = z.float()
-    g = y.float() * (zf * torch.sigmoid(zf))
-    return _norm_soma_ref(g, ss_peer, theta, gamma, eps, n_all, rstd)
-
-
-def tp_step_core_ref(proj, conv_state, ssm_state, conv_w, conv_b, A, dt_bias, D, theta, gamma, eps, n_all,
-                     ss_peer: torch.Tensor) -> torch.Tensor:
-    """Pure torch: the one-GPU step's K1 reference on the local heads (states advanced in place, every conv tail
-    rolled), the gate ``bf16(y) * silu(z)``, then the gated norm with the peer's (b,) sums of squares and the soma
-    read-out."""
-    di = int(theta.shape[0])
+def tp_step_core_ref(proj: torch.Tensor, conv_state: torch.Tensor, ssm_state: torch.Tensor, conv_w: torch.Tensor,
+                     conv_b: torch.Tensor, A: torch.Tensor, dt_bias: torch.Tensor, D: torch.Tensor, theta: torch.Tensor,
+                     gamma: torch.Tensor, eps: float, n_all: int, send: torch.Tensor,
+                     recv: torch.Tensor) -> torch.Tensor:
+    """Pure torch, the exchange included: the one-GPU step's K1 reference on the local heads (states advanced in place,
+    every conv tail rolled), the gate ``bf16(y) * silu(z)``; the row's sum of squares published at the words of its K2
+    programs in ``send`` (word row * programs + program), the peer's taken from ``recv``, each program's rstd from its
+    own word over n_all channels for the program's slice of columns; n = bf16(g rstd), the soma read-out."""
+    b, di = int(proj.shape[0]), int(theta.shape[0])
     y = dendritic_step_k1_ref(proj, conv_state, ssm_state, conv_w, conv_b, A, dt_bias, D, theta)
     z = proj[:, :di].float()
     g = y.to(torch.bfloat16).float() * (z * torch.sigmoid(z))
-    return _norm_soma_ref(g, ss_peer, theta, gamma, eps, n_all)
+    ss = g.pow(2).sum(dim=-1)
+    slice_ = triton.next_power_of_2(triton.cdiv(di, k2_programs(b)))
+    parts = triton.cdiv(di, slice_)
+    publish_ref(send, 0, ss.repeat_interleave(parts))
+    peer = take_ref(recv, 0, b * parts, "tp_step_core_ref").view(torch.float32).view(b, parts)
+    rstd = torch.rsqrt((ss.unsqueeze(-1) + peer) / n_all + eps).repeat_interleave(slice_, dim=1)[:, :di]
+    return dendritic_soma_readout_ref((g * rstd).to(torch.bfloat16), theta, gamma)

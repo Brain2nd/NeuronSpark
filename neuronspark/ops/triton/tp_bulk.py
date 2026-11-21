@@ -49,8 +49,9 @@ Ops (inference, no autograd):
 
 Launch constants: ``JOIN_ROWS`` x ``JOIN_BLOCK`` values per program, ``JOIN_WARPS`` warps.
 
-A one-GPU test passes its own buffer as ``part_peer`` and its own word as the flag.  References:
-:func:`tp_prefill_join_ref`, :func:`tp_prefill_gather_ref`.
+A one-GPU call passes its own buffer as ``part_peer`` and its own word as the flag.  References (the kernels'
+arguments; a flag word a kernel would wait for must hold the epoch already): :func:`tp_fence_ref`,
+:func:`tp_release_ref`, :func:`tp_prefill_join_ref`, :func:`tp_prefill_gather_ref`.
 """
 from __future__ import annotations
 
@@ -60,8 +61,8 @@ import triton.language as tl
 
 from neuronspark.ops.triton import require_cuda, require_no_grad
 
-__all__ = ["JOIN_ROWS", "JOIN_BLOCK", "JOIN_WARPS", "tp_fence", "tp_release", "tp_prefill_join",
-           "tp_prefill_join_ref", "tp_prefill_gather", "tp_prefill_gather_ref"]
+__all__ = ["JOIN_ROWS", "JOIN_BLOCK", "JOIN_WARPS", "tp_fence", "tp_fence_ref", "tp_release", "tp_release_ref",
+           "tp_prefill_join", "tp_prefill_join_ref", "tp_prefill_gather", "tp_prefill_gather_ref"]
 
 JOIN_ROWS = 8
 JOIN_BLOCK = 512
@@ -233,16 +234,39 @@ def tp_prefill_gather(x: torch.Tensor, part_peer: torch.Tensor, flag: torch.Tens
 
 
 # ================================================================================================ reference
-def tp_prefill_join_ref(part: torch.Tensor, part_peer: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-    """Pure torch: ``h + f32(bf16(part + part_peer))`` with the partials' (b, t) rows viewed as (T, B, D)."""
+def _passed_ref(flag: torch.Tensor, epoch: torch.Tensor, what: str) -> None:
+    """The word ``flag`` must hold at least the epoch: the kernel waits until it does, a reference cannot."""
+    if bool((flag < epoch).any()):
+        raise RuntimeError(f"neuronspark.{what}: the flag word is below the epoch (the kernel would wait for the peer)")
+
+
+def tp_fence_ref(flag_peer: torch.Tensor, flag: torch.Tensor, epoch: torch.Tensor) -> None:
+    """Pure torch: the epoch stored into the peer's call word ``flag_peer``; then ``flag`` must hold at least it."""
+    flag_peer.copy_(epoch)
+    _passed_ref(flag, epoch, "tp_fence_ref")
+
+
+def tp_release_ref(flag_peer: torch.Tensor, epoch: torch.Tensor) -> None:
+    """Pure torch: the epoch stored into the peer's flag word ``flag_peer``."""
+    flag_peer.copy_(epoch)
+
+
+def tp_prefill_join_ref(part: torch.Tensor, part_peer: torch.Tensor, h: torch.Tensor, flag: torch.Tensor,
+                        epoch: torch.Tensor) -> torch.Tensor:
+    """Pure torch: ``h + f32(bf16(part + part_peer))`` with the partials' (b, t) rows viewed as (T, B, D); ``flag``
+    must hold at least the epoch."""
+    _passed_ref(flag, epoch, "tp_prefill_join_ref")
     T, B, D = (int(s) for s in h.shape)
     upd = (part + part_peer).to(torch.bfloat16).float().view(B, T, D).transpose(0, 1)
     return (h + upd).contiguous()
 
 
-def tp_prefill_gather_ref(x: torch.Tensor, part_peer: torch.Tensor, lo: int, batch: int) -> torch.Tensor:
+def tp_prefill_gather_ref(x: torch.Tensor, part_peer: torch.Tensor, flag: torch.Tensor, epoch: torch.Tensor, lo: int,
+                          batch: int) -> torch.Tensor:
     """Pure torch: this GPU's rows (T, n, D) and the peer's (the first T (batch - n) rows of ``part_peer`` viewed (T,
-    batch - n, D)) side by side along the batch, this GPU's first when ``lo`` is 0."""
+    batch - n, D)) side by side along the batch, this GPU's first when ``lo`` is 0; ``flag`` must hold at least the
+    epoch."""
+    _passed_ref(flag, epoch, "tp_prefill_gather_ref")
     T, n, D = (int(s) for s in x.shape)
     peer = part_peer[:T * (int(batch) - n)].view(T, int(batch) - n, D)
     return torch.cat([x, peer] if int(lo) == 0 else [peer, x], dim=1).contiguous()

@@ -52,10 +52,11 @@ columns; ``tp_tail_gather`` the warps of the one-GPU tail (``HIPPO_STEP_WARPS``)
 columns (at the model's widths, D >= 512, the tail kernel's own block: the same row sum, the same rows); the greedy
 pick's one warp holds a block of at least 32 rows (one word per thread).
 
-References: :func:`tp_join_ref`, :func:`tp_tail_gather_ref` and :func:`tp_greedy_pick_ref` take the peer's values as
-arguments.  A one-GPU test passes the same buffer as ``send`` and ``recv`` (the program then reads its own words: the
-peer's values are its own), or fills ``recv`` with the peer's flagged words before the call (``tp_tail_gather``: its
-received rows are words that this GPU does not publish).
+References: :func:`tp_join_ref`, :func:`tp_tail_gather_ref` and :func:`tp_greedy_pick_ref` take the kernels'
+arguments and make the exchange in torch (:func:`publish_ref` the words this GPU sends, :func:`take_ref` the words it
+receives, which must be flagged already, then cleared).  A one-GPU call passes the same buffer as ``send`` and ``recv``
+(the program then reads its own words: the peer's values are its own), or fills ``recv`` with the peer's flagged words
+before the call (``tp_tail_gather``: its received rows are words that this GPU does not publish).
 """
 from __future__ import annotations
 
@@ -68,8 +69,8 @@ import triton.language as tl
 from neuronspark.ops.triton import require_cuda, require_no_grad
 from neuronspark.ops.triton.hippo_step import HIPPO_STEP_WARPS, pkm_tail_row, pkm_tail_step_ref
 
-__all__ = ["JOIN_WARPS", "mailbox_send", "mailbox_recv", "mailbox_swap", "mailbox_swap1", "tp_join", "tp_join_ref",
-           "tp_tail_gather", "tp_tail_gather_ref", "tp_greedy_pick", "tp_greedy_pick_ref"]
+__all__ = ["JOIN_WARPS", "mailbox_send", "mailbox_recv", "mailbox_swap", "mailbox_swap1", "publish_ref", "take_ref",
+           "tp_join", "tp_join_ref", "tp_tail_gather", "tp_tail_gather_ref", "tp_greedy_pick", "tp_greedy_pick_ref"]
 
 JOIN_WARPS = 4
 
@@ -276,39 +277,71 @@ def tp_greedy_pick(value: torch.Tensor, index: torch.Tensor, offset: int, send: 
 
 
 # ================================================================================================ references
-def tp_greedy_pick_ref(values, indices, offsets) -> torch.Tensor:
-    """Pure torch: the global id of the larger per-row maximum over the shards (the lower id on a tie; a nan larger
-    than every number)."""
-    v = torch.stack([x.float() for x in values], 1)
-    ids = torch.stack([i + int(o) for i, o in zip(indices, offsets)], 1)
-    nan = v.isnan()
-    best = torch.where(nan.any(dim=1, keepdim=True), nan, v == v.max(dim=1, keepdim=True).values)
+def publish_ref(region: torch.Tensor, start: int, values: torch.Tensor) -> None:
+    """Pure torch: the flagged words of ``values`` (fp32, or int32 bit patterns) stored at ``region[start:]`` in their
+    row-major order, as the programs publish them."""
+    bits = values.contiguous().view(torch.int32).reshape(-1).to(torch.int64) & 0xFFFFFFFF
+    region[start:start + bits.numel()] = bits | (1 << 32)
+
+
+def take_ref(region: torch.Tensor, start: int, n: int, what: str) -> torch.Tensor:
+    """Pure torch: the int32 bit patterns of the ``n`` words at ``region[start:]``, then those words cleared, as the
+    programs receive them; every word must be flagged (the kernel waits until it is: a reference cannot)."""
+    w = region[start:start + n]
+    if not bool(((w >> 32) != 0).all()):
+        raise RuntimeError(f"neuronspark.{what}: a word of this GPU's region is not flagged (the kernel would wait for "
+                           f"the peer to publish it)")
+    bits = (w & 0xFFFFFFFF).to(torch.int32)
+    region[start:start + n] = 0
+    return bits
+
+
+def tp_greedy_pick_ref(value: torch.Tensor, index: torch.Tensor, offset: int, send: torch.Tensor,
+                       recv: torch.Tensor) -> torch.Tensor:
+    """Pure torch, the exchange included: this GPU's maximum and global id of row b published at words 2 b and 2 b + 1
+    of ``send``, the peer's taken from ``recv``; the global id of the larger maximum, the lower id on a tie, a nan
+    larger than every number (two nan: the lower id)."""
+    B = int(value.shape[0])
+    v = value.float().contiguous()
+    i = (index + int(offset)).to(torch.int32)
+    publish_ref(send, 0, torch.stack([v.view(torch.int32), i], 1))
+    peer = take_ref(recv, 0, 2 * B, "tp_greedy_pick_ref").view(B, 2)
+    vals = torch.stack([v, peer[:, 0].contiguous().view(torch.float32)], 1)
+    ids = torch.stack([i, peer[:, 1]], 1).to(torch.int64)
+    nan = vals.isnan()
+    best = torch.where(nan.any(dim=1, keepdim=True), nan, vals == vals.max(dim=1, keepdim=True).values)
     ids = torch.where(best, ids, torch.full_like(ids, torch.iinfo(torch.int64).max))
     return ids.min(dim=1).values
 
 
-def tp_join_ref(partial: torch.Tensor, partial_peer: torch.Tensor, h: torch.Tensor,
+def tp_join_ref(partial: torch.Tensor, h: torch.Tensor, send: torch.Tensor, recv: torch.Tensor,
                 gain: Optional[torch.Tensor] = None, eps: float = 1e-5) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Pure torch: ``upd = bf16(partial + partial_peer)``, ``h_new = h + f32(upd)``, the pre-norm in fp32 rounded to
-    bf16 once."""
-    h_new = h + (partial + partial_peer).to(torch.bfloat16).float()
+    """Pure torch, the exchange included: this GPU's partial published into ``send`` (word row * D + column), the
+    peer's taken from ``recv``; ``upd = bf16(partial + partial_peer)``, ``h_new = h + f32(upd)``, the pre-norm in fp32
+    rounded to bf16 once."""
+    B, D = (int(s) for s in partial.shape)
+    publish_ref(send, 0, partial)
+    peer = take_ref(recv, 0, B * D, "tp_join_ref").view(torch.float32).view(B, D)
+    h_new = h + (partial + peer).to(torch.bfloat16).float()
     return h_new, _prenorm_ref(h_new, gain, eps)
 
 
-def tp_tail_gather_ref(h: torch.Tensor, ffn: torch.Tensor, y: torch.Tensor, rho: torch.Tensor, x_peer: torch.Tensor,
-                       lo: int, gain: Optional[torch.Tensor] = None,
+def tp_tail_gather_ref(h: torch.Tensor, ffn: torch.Tensor, y: torch.Tensor, rho: torch.Tensor, lo: int, batch: int,
+                       send: torch.Tensor, recv: torch.Tensor, gain: Optional[torch.Tensor] = None,
                        eps: float = 1e-5) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Pure torch: rows [lo, lo + n) the tail of this GPU's rows (:func:`neuronspark.ops.triton.hippo_step
-    .pkm_tail_step_ref`), the others the peer's rows ``x_peer`` (its tails) in their order; the pre-norm in fp32
-    rounded to bf16 once."""
-    x = pkm_tail_step_ref(h, ffn, y, rho)
-    n, B = int(x.shape[0]), int(x.shape[0]) + int(x_peer.shape[0])
-    own = torch.zeros(B, dtype=torch.bool, device=x.device)
-    own[int(lo):int(lo) + n] = True
-    h = torch.empty((B, int(x.shape[1])), dtype=torch.float32, device=x.device)
-    h[own] = x.float()
-    h[~own] = x_peer.float()
-    return h, _prenorm_ref(h, gain, eps)
+    """Pure torch, the exchange included: rows [lo, lo + n) the tail of this GPU's rows
+    (:func:`neuronspark.ops.triton.hippo_step.pkm_tail_step_ref`), published into ``send`` (word row * D + column);
+    the other rows taken from ``recv``; the pre-norm in fp32 rounded to bf16 once."""
+    x = pkm_tail_step_ref(h, ffn, y, rho).float()
+    n, D = (int(s) for s in x.shape)
+    B, lo = int(batch), int(lo)
+    out = torch.empty((B, D), dtype=torch.float32, device=x.device)
+    out[lo:lo + n] = x
+    publish_ref(send, lo * D, x)
+    for a, b in ((0, lo), (lo + n, B)):
+        if b > a:
+            out[a:b] = take_ref(recv, a * D, (b - a) * D, "tp_tail_gather_ref").view(torch.float32).view(b - a, D)
+    return out, _prenorm_ref(out, gain, eps)
 
 
 def _prenorm_ref(h: torch.Tensor, gain: Optional[torch.Tensor], eps: float) -> Optional[torch.Tensor]:

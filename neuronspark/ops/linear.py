@@ -24,7 +24,12 @@ Numerics contract (training, whole-row regime):
   operator's contribution, and every backward that runs through the operator writes the buffer, also one asked for
   other tensors only (``torch.autograd.grad`` with respect to an activation): bind only weights whose gradient is read
   from ``.grad`` in a step made of ``backward()`` calls.  The bound buffer must stay the weight's ``.grad``: a
-  training call or a backward that finds another tensor there, or none, raises.
+  training call or a backward that finds another tensor there, or none, raises.  A bound weight armed with
+  :func:`arm_grad_overwrite_` has its next weight-gradient GEMM write the buffer instead (``grad = dy2^T x2``,
+  ``torch.mm`` with ``out=`` the buffer: beta 0, the buffer not read); that GEMM disarms the weight, so its later
+  GEMMs accumulate as before: an owner whose step begins with this operator's GEMM as the first writer of the weight's
+  gradient (the projections; the tied embedding, whose readout runs its GEMMs before the lookup adds its rows) arms
+  the weight before that backward instead of zeroing the buffer.
 * input gradient: ``dx = dy2 @ weight_bf16``, one GEMM with bf16 operands that writes the result in ``x.dtype``: bf16
   for a bf16 input, fp32 for an fp32 input (``torch.mm(dy2, weight_bf16, out_dtype=torch.float32)``: the fp32
   accumulation stored as it is, no bf16 output widened by a second kernel; a GEMM with an fp32 result exists on CUDA
@@ -85,6 +90,8 @@ __all__ = [
     "stacked_bands",
     "bind_grad_",
     "unbind_grad_",
+    "arm_grad_overwrite_",
+    "armed_grad_overwrites",
     "bind_train_bf16_",
     "unbind_train_bf16_",
     "padded_extent",
@@ -94,6 +101,7 @@ __all__ = [
 _CACHE_ATTR = "_ns_bf16"
 _VERSION_ATTR = "_ns_bf16_version"
 _GRAD_ATTR = "_ns_grad_buffer"
+_OVERWRITE_ATTR = "_ns_grad_overwrite"
 _TRAIN_ATTR = "_ns_train_bf16"
 _TRAIN_VERSION_ATTR = "_ns_train_bf16_version"
 # training GEMMs of an output-feature count that is not a multiple of ALIGN run on the extent rounded up to PAD_MULTIPLE
@@ -248,8 +256,28 @@ def bind_grad_(param: torch.Tensor) -> None:
 
 def unbind_grad_(param: torch.Tensor) -> None:
     """Undo :func:`bind_grad_`: the weight gradient is returned to autograd again (no-op when not bound)."""
-    if hasattr(param, _GRAD_ATTR):
-        delattr(param, _GRAD_ATTR)
+    for name in (_GRAD_ATTR, _OVERWRITE_ATTR):
+        if hasattr(param, name):
+            delattr(param, name)
+
+
+def arm_grad_overwrite_(params: Sequence[torch.Tensor], armed: bool = True) -> None:
+    """Arm (``armed`` True) or disarm the bound weights ``params`` (:func:`bind_grad_`): the next weight-gradient GEMM
+    of an armed weight writes its bound buffer (beta 0) instead of adding into it, and disarms the weight (see the
+    module docstring).  The flag is read when the backward runs (in a CUDA-graph capture: baked into the graph)."""
+    for p in params:
+        if getattr(p, _GRAD_ATTR, None) is None:
+            raise RuntimeError(f"arm_grad_overwrite_: a weight {tuple(p.shape)} is not bound with bind_grad_")
+        if armed:
+            setattr(p, _OVERWRITE_ATTR, True)
+        elif hasattr(p, _OVERWRITE_ATTR):
+            delattr(p, _OVERWRITE_ATTR)
+
+
+def armed_grad_overwrites(params: Sequence[torch.Tensor]) -> list:
+    """The weights of ``params`` still armed (:func:`arm_grad_overwrite_`): none after a backward that ran a
+    weight-gradient GEMM of each."""
+    return [p for p in params if getattr(p, _OVERWRITE_ATTR, False)]
 
 
 def _bound_grad(weight: torch.Tensor) -> Optional[torch.Tensor]:
@@ -367,6 +395,9 @@ class Fp32WgradLinearFn(torch.autograd.Function):
                 g = None if ctx.bound_weight is None else _bound_grad(ctx.bound_weight)
                 if g is None:
                     dw = torch.mm(dy2[:, :n].t(), x2, out_dtype=torch.float32)
+                elif getattr(ctx.bound_weight, _OVERWRITE_ATTR, False):
+                    delattr(ctx.bound_weight, _OVERWRITE_ATTR)
+                    torch.mm(dy2[:, :n].t(), x2, out_dtype=torch.float32, out=g)
                 else:
                     torch.addmm(g, dy2[:, :n].t(), x2, out_dtype=torch.float32, out=g)
             if ctx.needs_input_grad[0]:

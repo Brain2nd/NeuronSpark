@@ -16,7 +16,8 @@ The split (rank r of 2):
   is exchanged inside the norm kernel (:mod:`neuronspark.ops.triton.tp_dendritic`); the out-projection's partial
   product is taken in fp32 and summed across the GPUs, rounded to bf16 once and added to the fp32 residual stream (the
   decode step: one kernel with the next dendritic neuron layer's pre-norm, :func:`neuronspark.ops.triton.tp_exchange
-  .tp_join`; the prefill: an NCCL all-reduce, then the one-GPU residual addition);
+  .tp_join`; the prefill: the partial written into symmetric memory and read by the other GPU once released,
+  :func:`neuronspark.ops.triton.tp_bulk.tp_prefill_join`);
 * the readout: vocabulary rows [0, S) on rank 0 and [S, V) on rank 1, S = the largest multiple of every readout
   balance width that is at most V / 2 (the balance adds ``c[:, v % w]``: a shard starting at a multiple of w is the
   same function); the logits are gathered (NCCL) into the full (B, R, V) rows on both GPUs, or, for greedy decoding
@@ -27,8 +28,13 @@ The split (rank r of 2):
 
 Exchanges inside a captured step go through a mailbox in symmetric memory (:class:`TensorParallelComm`): one region
 per call site of the step (decode sites and prefill sites in separate ranges), the site counter reset at the start of
-every forward.  Both GPUs must run the same sequence of forwards (the same calls in the same order); the generation
-path does, as both ranks call it with the same arguments, and a sampled token is rank 0's on both GPUs
+every forward.  The prefill's out-projection partials go through two symmetric buffers (by site parity) with a flag
+word per site, and every prefill call advances an epoch counter and starts with a fence on a call word
+(:mod:`neuronspark.ops.triton.tp_bulk`); the buffers grow in an eager call, at least doubling, and are kept until
+:meth:`TensorParallelComm.close` (a captured call addresses them).  Both GPUs must run the same sequence of forwards
+(the same calls in the same order), and each GPU its forwards one after another (on one stream, or on streams ordered
+by events: eager calls and graph replays share the mailbox, the epoch and the buffers); the generation path does, as
+both ranks call it with the same arguments, and a sampled token is rank 0's on both GPUs
 (:meth:`TensorParallelLM.agree_tokens`).  The decay rates and soma thresholds of a GPU's heads are weight constants
 (:class:`neuronspark.utils.cache.WeightConstants`), formed on first use and held by every captured step that reads
 them.
@@ -56,6 +62,7 @@ from neuronspark.modules.hippocampal_layer import HippocampalLayer
 from neuronspark.modules.induction import allocate_induction_state, induction_session_match
 from neuronspark.ops.linear import _cached_bf16, cache_bf16_, drop_bf16_
 from neuronspark.ops.triton.dendritic_step import MAX_DECODE_BATCH
+from neuronspark.ops.triton.tp_bulk import tp_fence, tp_prefill_join, tp_release
 from neuronspark.ops.triton.tp_dendritic import k2_words, tp_gated_norm_soma, tp_step_core
 from neuronspark.ops.triton.tp_exchange import tp_greedy_pick, tp_join
 from neuronspark.utils.cache import (DendriticState, InferenceParams, RING_MULTIPLE, WeightConstants,
@@ -102,20 +109,69 @@ class TensorParallelComm:
         name = self.group.group_name
         self._decode_base = 0
         self._prefill_base = DECODE_SITES * DECODE_SITE_WORDS
-        total = self._prefill_base + PREFILL_SITES * PREFILL_SITE_WORDS
+        self._flag_base = self._prefill_base + PREFILL_SITES * PREFILL_SITE_WORDS
+        self._call_word = self._flag_base + PREFILL_SITES
+        total = self._call_word + 1
         self.local = symm_mem.empty(total, dtype=torch.int64, device=self.device)
         self.local.zero_()
         self.handle = symm_mem.rendezvous(self.local, name)
         self.remote = self.handle.get_buffer(self.peer, (total,), torch.int64)
+        self.epoch = torch.zeros(1, dtype=torch.int64, device=self.device)   # prefill calls so far (on the device)
+        self._bulk = None                                # (local, handle, remote, capacity) of the partial buffers
+        self._bulk_kept: List[tuple] = []                # smaller buffers a captured call may still address
         torch.cuda.synchronize(self.device)
         dist.barrier(self.group)
         self._prefill = False
         self._site = 0
+        self._bulk_site = 0
 
     def begin(self, prefill: bool) -> None:
-        """Start a forward: the next region is the first of the call's range."""
+        """Start a forward: the next region is the first of the call's range; a prefill call advances the epoch and
+        passes the fence on the call word (both GPUs have finished their previous calls)."""
         self._prefill = bool(prefill)
         self._site = 0
+        self._bulk_site = 0
+        if self._prefill:
+            self.epoch.add_(1)
+            c = self._call_word
+            tp_fence(self.remote[c:c + 1], self.local[c:c + 1], self.epoch)
+
+    def bulk(self, rows: int, cols: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """(this GPU's partial buffer (rows, cols) fp32, the peer's, this GPU's flag word, the peer's) of the next
+        prefill join site (:mod:`neuronspark.ops.triton.tp_bulk`).  The buffers grow in an eager call (both GPUs make
+        the same calls, so both grow together); a captured call needs an eager call of its size first."""
+        n = int(rows) * int(cols)
+        site = self._bulk_site
+        if site >= PREFILL_SITES:
+            raise RuntimeError(f"TensorParallelComm: a prefill call has {PREFILL_SITES} join sites")
+        if self._bulk is None or n > self._bulk[3]:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("TensorParallelComm: a captured prefill needs an eager call of its size first (its "
+                                   "partial buffers are allocated there)")
+            self._grow(n, int(cols))
+        self._bulk_site += 1
+        local, _, remote, cap = self._bulk
+        lo = (site % 2) * cap
+        f = self._flag_base + site
+        return (local[lo:lo + n].view(int(rows), int(cols)), remote[lo:lo + n].view(int(rows), int(cols)),
+                self.local[f:f + 1], self.remote[f:f + 1])
+
+    def _grow(self, n: int, cols: int) -> None:
+        """New partial buffers of at least ``n`` values per parity: at least twice the old capacity, up to the largest
+        call's (PREFILL_SITE_WORDS rows of ``cols``), so that the kept buffers total less than three times the
+        largest."""
+        import torch.distributed._symmetric_memory as symm_mem
+        old = 0 if self._bulk is None else self._bulk[3]
+        cap = max(int(n), min(2 * old, PREFILL_SITE_WORDS * int(cols)))
+        cap = -(-cap // 1024) * 1024                     # the second parity's view starts 4 KiB aligned
+        local = symm_mem.empty(2 * cap, dtype=torch.float32, device=self.device)
+        handle = symm_mem.rendezvous(local, self.group.group_name)
+        remote = handle.get_buffer(self.peer, (2 * cap,), torch.float32)
+        if self._bulk is not None:
+            self._bulk_kept.append(self._bulk)
+        self._bulk = (local, handle, remote, cap)
+        torch.cuda.synchronize(self.device)
+        dist.barrier(self.group)
 
     def region(self, words: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """(the peer's words, this GPU's words) of the next call site, ``words`` long."""
@@ -136,6 +192,7 @@ class TensorParallelComm:
         torch.cuda.synchronize(self.device)
         dist.barrier(self.group)
         self.remote = self.handle = self.local = None
+        self._bulk, self._bulk_kept = None, []
         gc.collect()
         torch.cuda.synchronize(self.device)
         dist.barrier(self.group)
@@ -232,10 +289,10 @@ class _DendriticShard(nn.Module):
         send, recv = comm.region(B * T)
         xo = tp_gated_norm_soma(y.reshape(B * T, di), z.reshape(B * T, di), theta, self.gamma, self.norm_eps,
                                 self.di_all, send, recv)
-        part = torch.mm(xo, self._w_out().t(), out_dtype=torch.float32)            # (B * T, D) fp32 partial
-        dist.all_reduce(part, group=comm.group)
-        upd = part.to(torch.bfloat16).view(B, T, Dm).transpose(0, 1)                 # (T, B, D) bf16
-        return o.dendritic_res_add(h, upd)
+        part, part_peer, flag, flag_peer = comm.bulk(B * T, Dm)
+        torch.mm(xo, self._w_out().t(), out_dtype=torch.float32, out=part)          # (B * T, D) fp32 partial
+        tp_release(flag_peer, comm.epoch)
+        return tp_prefill_join(part, part_peer, h, flag, comm.epoch)
 
 
 # ================================================================================================ the model

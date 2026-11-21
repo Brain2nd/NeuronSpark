@@ -15,8 +15,9 @@ Reuse of a word.  A mailbox region belongs to one call site of the step (``Tenso
 site's next call is the next use.  The peer can publish the next use only after it has passed an exchange that this
 GPU enters after it has finished (and cleared) the present use, because every call site of a step exchanges in the
 same order on both GPUs.  So the clear never erases a published word and a published word is never overwritten
-before it is read.  A step with a single call site has no such exchange between two uses of it: every step has at
-least two (a split dendritic neuron layer has two), or an NCCL collective between its uses (the prefill).
+before it is read.  A step with a single call site has no such exchange between two uses of it: every decode step has
+at least two (a split dendritic neuron layer has two), and a prefill call's mailbox sites have the joins and the
+call's starting fence of :mod:`neuronspark.ops.triton.tp_bulk` between their uses.
 
 Two properties are assumed, not proved here.  (i) An aligned 64-bit system-scope store reaches the peer's memory as
 one access (data and flag together), as NCCL's LL protocol assumes of its 8-byte flag-and-data lines.  (ii) The

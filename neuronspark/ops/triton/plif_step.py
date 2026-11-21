@@ -1,8 +1,10 @@
 """Decode-step operators of the PLIF populations of the hippocampal layers (T = 1, carried state updated in place).
 
-``plif_step``  one token of a PLIF population in one kernel, one program per row: the token term of the gate (the
-    rank-r eta projection of the input, or of its strictly-past centring for the centred neuron), the projected gate,
-    one leaky step from the carried membrane, the bipolar release and the soft reset.  Per row b and channel c, with
+``plif_step``  one token of a PLIF population in two kernels: the token term's first projection (the rank-r eta
+    projection of the input, or of its strictly-past centring for the centred neuron; programs over (row, ranks)),
+    then per (row, channel block) the projected gate, one leaky step from the carried membrane, the bipolar release
+    and the soft reset.  The rows of a step are few and the eta weights are not in the cache when the step reaches
+    them: spreading a row over many programs puts its weight reads on many SMs.  Per row b and channel c, with
     ``xw = fp32(x)``, f(.) the exact widening to fp32 and every fp32 operation of the gate chain rounded once (round to
     nearest even, no FMA contraction)::
 
@@ -47,17 +49,24 @@ from neuronspark.ops.triton._ptx import (  # noqa: F401  (resolved by the kernel
     _sub_rn,
 )
 
-__all__ = ["STEP_BLOCK", "STEP_WARPS", "PLIF_STEP_WARPS", "plif_step", "plif_step_ref",
+__all__ = ["STEP_BLOCK", "STEP_WARPS", "PLIF_PROJ_TILE", "PLIF_PROJ_RANKS", "PLIF_PROJ_WARPS", "PLIF_GATE_BLOCK",
+           "PLIF_GATE_WARPS", "plif_step", "plif_step_ref",
            "plif_gate_step_ref", "centred_step", "centred_step_ref"]
 
 # ================================================================================================ fixed constants
 #: centring: elements per program and warps
 STEP_BLOCK = 1024
 STEP_WARPS = 4
-#: PLIF step: one program per row over the whole population (a power-of-two block with a mask), warps.  The eta
-#: weights are not in the cache when the step reaches them: the kernel's time is the number of loads a thread issues
-#: one after the other, so the two weight tiles are spread over as many threads as a block has
-PLIF_STEP_WARPS = 32
+#: PLIF step, token term: one program per (row, PLIF_PROJ_RANKS ranks) of eta_V, the channels in tiles of
+#: PLIF_PROJ_TILE spread over the block's threads; gate: one program per (row, PLIF_GATE_BLOCK channels) with the
+#: block's rows of eta_U.  The eta weights are not in the cache when the step reaches them: a thread issues one or two
+#: loads per tile, and the programs of a row run on as many SMs.  Screened in the captured decode step of the 1.3B
+#: model at batch 1, 8 and 32 (ranks per program 1 / 2 / 4, warps 2 - 16, channels per gate program 16 - 256)
+PLIF_PROJ_TILE = 2048
+PLIF_PROJ_RANKS = 1
+PLIF_PROJ_WARPS = 8
+PLIF_GATE_BLOCK = 64
+PLIF_GATE_WARPS = 8
 
 _DTYPES: Dict[str, torch.dtype] = {"float32": torch.float32, "bfloat16": torch.bfloat16}
 
@@ -87,40 +96,61 @@ def _bf16(x):
 
 
 @triton.jit
-def _plif_step_kernel(X, EV, EU, W, BE, TH, V, S, SUM, CNT, s_x, s_ev, s_eu, C, R,
-                      RB: tl.constexpr, BC: tl.constexpr, CENTRED: tl.constexpr):
+def _plif_proj_kernel(X, EV, SUM, CNT, T, s_x, s_ev, R, C: tl.constexpr, BR: tl.constexpr, BK: tl.constexpr,
+                      CENTRED: tl.constexpr):
+    """program (row, rank block): the token term's first projection t = bf16(eta_V @ bf16(xc)) of BR ranks, stored
+    in fp32 (the bf16 value widened); the carried sum is read, not written."""
     b = tl.program_id(0).to(tl.int64)
+    r = tl.program_id(1) * BR + tl.arange(0, BR)
+    rm = r < R
+    kk = tl.arange(0, BK)
+    one = tl.full([BK], 1.0, tl.float32)
+    zero = tl.zeros([BK], tl.float32)
+    acc = tl.zeros([BR, BK], tl.float32)
+    for k0 in tl.static_range(0, C, BK):
+        c = k0 + kk
+        m = c < C
+        xf = tl.load(X + b * s_x + c, mask=m, other=0.0).to(tl.float32)
+        if CENTRED:
+            n = zero + tl.load(CNT + b).to(tl.float32)
+            past = tl.load(SUM + b * C + c, mask=m, other=0.0)
+            xc = tl.where(n > zero, _sub_rn(xf, _div_rn(past, tl.maximum(n, one))), zero)
+        else:
+            xc = xf
+        ev = tl.load(EV + r[:, None].to(tl.int64) * s_ev + c[None, :], mask=rm[:, None] & m[None, :], other=0.0)
+        acc += _bf16(ev.to(tl.float32)) * _bf16(xc)[None, :]
+    tl.store(T + b * R + r, _bf16(tl.sum(acc, axis=1)), mask=rm)
+
+
+@triton.jit
+def _plif_gate_kernel(X, T, EU, W, BE, TH, V, S, SUM, s_x, s_eu, C, R,
+                      RB: tl.constexpr, BC: tl.constexpr, CENTRED: tl.constexpr):
+    """program (row, channel block): zp = bf16(eta_U @ t) of the block's channels, the gate chain, the leaky step,
+    the release and the reset; the block's membrane (and carried sum) written in place."""
+    b = tl.program_id(0).to(tl.int64)
+    c = tl.program_id(1) * BC + tl.arange(0, BC)
+    m = c < C
     rr = tl.arange(0, RB)
     rm = rr < R
-    c = tl.arange(0, BC)
-    m = c < C
     one = tl.full([BC], 1.0, tl.float32)
     zero = tl.zeros([BC], tl.float32)
-    # ---- every read of the row, of its state and of the weights (the program holds the whole row: BC >= C)
     xf = tl.load(X + b * s_x + c, mask=m, other=0.0).to(tl.float32)
     v = tl.load(V + b * C + c, mask=m, other=0.0)
     w = tl.load(W + c, mask=m, other=0.0)
     be = tl.load(BE + c, mask=m, other=0.0)
     th = tl.load(TH + c, mask=m, other=0.0)
     if CENTRED:
-        n = zero + tl.load(CNT + b).to(tl.float32)
         past = tl.load(SUM + b * C + c, mask=m, other=0.0)
-        xc = tl.where(n > zero, _sub_rn(xf, _div_rn(past, tl.maximum(n, one))), zero)
-    else:
-        xc = xf
-    # ---- the token term: t = bf16(eta_V @ bf16(xc)) (RB,), zp = bf16(eta_U @ t) (BC,)
-    ev = tl.load(EV + rr[:, None].to(tl.int64) * s_ev + c[None, :], mask=rm[:, None] & m[None, :], other=0.0)
-    t = _bf16(tl.sum(_bf16(ev.to(tl.float32)) * _bf16(xc)[None, :], axis=1))
+    t = tl.load(T + b * R + rr, mask=rm, other=0.0)
     eu = tl.load(EU + c[:, None].to(tl.int64) * s_eu + rr[None, :], mask=m[:, None] & rm[None, :], other=0.0)
     zp = _bf16(tl.sum(_bf16(eu.to(tl.float32)) * t[None, :], axis=1))
-    # ---- the gate chain, the leaky step, the release and the reset
     z2 = _add_rn(_add_rn(_mul_rn(w, xf), be), zp)
     eta = _div_rn(one, _add_rn(one, libdevice.exp(-z2)))
     a = _sub_rn(one, eta)
     d = _mul_rn(eta, xf)
     pre = _add_rn(_mul_rn(a, v), d)
     sp = _sub_rn(tl.maximum(_sub_rn(pre, th), zero), tl.maximum(_sub_rn(-pre, th), zero))
-    tl.debug_barrier()                 # every thread has read the carried state before a thread writes it
+    tl.debug_barrier()                 # every thread has read the block's carried state before a thread writes it
     tl.store(V + b * C + c, _sub_rn(pre, sp), mask=m)
     tl.store(S + b * C + c, sp.to(S.dtype.element_ty), mask=m)
     if CENTRED:
@@ -186,10 +216,18 @@ def _plif_step_fwd(x: torch.Tensor, eta_V: torch.Tensor, eta_U: torch.Tensor, w_
         _need(count is None, "a count without a carried sum")
     _need(0 < B * C < 2 ** 31, "the element count must be positive and int32-addressable")
     S = torch.empty((B, C), dtype=out_dtype, device=dev)
-    _plif_step_kernel[(B,)](x, eta_V, eta_U, w_eta, b_eta, v_th, v, S, run_sum if centred else v,
-                            count if centred else v, int(x.stride(0)), int(eta_V.stride(0)), int(eta_U.stride(0)),
-                            C, R, RB=triton.next_power_of_2(R), BC=triton.next_power_of_2(C), CENTRED=int(centred),
-                            num_warps=PLIF_STEP_WARPS, enable_fp_fusion=False)
+    t = torch.empty((B, R), dtype=torch.float32, device=dev)
+    br = PLIF_PROJ_RANKS
+    _plif_proj_kernel[(B, triton.cdiv(R, br))](x, eta_V, run_sum if centred else v, count if centred else v, t,
+                                               int(x.stride(0)), int(eta_V.stride(0)), R, C=C, BR=br,
+                                               BK=min(triton.next_power_of_2(C), PLIF_PROJ_TILE),
+                                               CENTRED=int(centred), num_warps=PLIF_PROJ_WARPS,
+                                               enable_fp_fusion=False)
+    bc = PLIF_GATE_BLOCK
+    _plif_gate_kernel[(B, triton.cdiv(C, bc))](x, t, eta_U, w_eta, b_eta, v_th, v, S, run_sum if centred else v,
+                                               int(x.stride(0)), int(eta_U.stride(0)), C, R,
+                                               RB=triton.next_power_of_2(R), BC=bc, CENTRED=int(centred),
+                                               num_warps=PLIF_GATE_WARPS, enable_fp_fusion=False)
     return S
 
 

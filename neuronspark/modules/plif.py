@@ -273,7 +273,7 @@ class PLIFNeuron(nn.Module):
     def _forward_step(self, x: torch.Tensor, state: PLIFState, pos: Optional[torch.Tensor],
                       out_dtype: torch.dtype) -> torch.Tensor:
         """Single-token form: ``ops.plif_step`` (the centring of the centred neuron, the two eta projections, the gate
-        chain, the leaky step, the release and the reset in one kernel); the membrane (and the input sum) updated in
+        chain, the leaky step, the release and the reset in two kernels); the membrane (and the input sum) updated in
         place."""
         x2 = x[0]                                                           # (B, C)
         if self.centred:

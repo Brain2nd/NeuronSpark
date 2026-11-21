@@ -35,7 +35,7 @@ Operators (regime: public function -> what runs):
 * prefill :func:`plif_gate_prefill` (custom op ``neuronspark::plif_gate_prefill``): (a, drive) fp32 from x, w_eta, b_eta
   and the projection, any T >= 1; :func:`plif_scan_prefill` (custom op ``neuronspark::plif_scan_prefill``, mutates
   ``v0``): the scan from the carried membrane v0, which it overwrites with the last membrane.
-* decode: :func:`neuronspark.ops.triton.plif_step.plif_step` (one kernel per token; its own module).
+* decode: :func:`neuronspark.ops.triton.plif_step.plif_step` (two kernels per token; its own module).
 
 Numerics.  The training forward S / pre are the operations of the eager gate chain and the sequential scan in the same
 order; gzp / gx follow the phase-split backward above; the per-channel sums for b_eta, w_eta and v_th are

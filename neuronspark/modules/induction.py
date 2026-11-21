@@ -1,4 +1,4 @@
-"""Induction matches of the hippocampal layers' pool attention (model level, pure torch).
+"""Induction matches of the hippocampal layers' pool attention (model level).
 
 The order-n match of query position t and key position j::
 
@@ -115,7 +115,10 @@ def induction_session_match(ids: torch.Tensor, state: InductionState, ring_ptr: 
     every slot of the keys ring after this call's keys were written at ``(ring_ptr + t) % W``; ``state.keys`` /
     ``state.win`` are updated in place.  ``ring_ptr`` (1,) int64: the ring pointer at the start of the call.  ``ops``:
     the operator namespace of the model (:func:`neuronspark.ops.namespace`; None = the kernels), whose
-    ``induction_step`` matches one token (T == 1: the same integer comparisons, one kernel)."""
+    ``induction_step`` matches one token (T == 1) and ``induction_match_prefill`` the queries of a longer call against
+    the ring once its keys are written (T >= 2): the same integer comparisons, one kernel each.  The torch chain below
+    serves a call the prefill kernel does not take (a keys ring off the device or not contiguous, CPU ids without an
+    operator namespace), decided before the cache is written."""
     keys, win = state.keys, state.win
     B, Wr, n = (int(s) for s in keys.shape)
     if Wr != int(W):
@@ -137,12 +140,19 @@ def induction_session_match(ids: torch.Tensor, state: InductionState, ring_ptr: 
         o = namespace("kernel") if ops is None else ops
         m = o.induction_step(x[:, 0].contiguous(), win, keys, ring_ptr, pad)             # (n, B, W) uint8
         return tuple(m[k - 1].view(torch.bool).unsqueeze(1) for k in orders)
+    # the prefill kernel takes the call: decided before the cache is written
+    one_kernel = ((ops is not None or x.is_cuda) and keys.is_cuda and keys.is_contiguous()
+                  and ring_ptr.device == keys.device)
     ext = torch.cat([win, x], dim=1)                                      # (B, n + T): ext[:, n + tau] = x_{p0 + tau}
     keys_new = torch.stack([ext[:, n - 1 - i:n - 1 - i + T] for i in range(n)], dim=-1)   # (B, T, n): x_{t-1-i}
     qwin = torch.stack([ext[:, n - i:n - i + T] for i in range(n)], dim=-1)              # (B, T, n): x_{t-i}
     slots = (ring_ptr + torch.arange(T, device=x.device, dtype=torch.int64)) % Wr
     keys.index_copy_(1, slots, keys_new)
     win.copy_(ext[:, T:])
+    if one_kernel:
+        o = namespace("kernel") if ops is None else ops
+        m = o.induction_match_prefill(keys, qwin, ring_ptr, pad)                         # (n, B, T, W) uint8
+        return tuple(m[k - 1].view(torch.bool) for k in orders)
     past = ring_strict_past(ring_ptr, T, Wr, 1)                            # (T, W): the slot's event at p <= t - 1
     eq = (keys.unsqueeze(1) == qwin.unsqueeze(2)) & (qwin != pad).unsqueeze(2)          # (B, T, W, n)
     acc = past.unsqueeze(0).expand(B, T, Wr)

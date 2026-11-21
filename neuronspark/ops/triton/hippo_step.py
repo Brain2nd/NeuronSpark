@@ -40,7 +40,7 @@ __all__ = ["HIPPO_STEP_WARPS", "read_gain_step", "read_gain_step_ref", "pkm_tail
 
 # ================================================================================================ fixed constants
 #: one program per row over the whole width (a power-of-two block with a mask), warps
-HIPPO_STEP_WARPS = 8
+HIPPO_STEP_WARPS = 16
 
 
 # ================================================================================================ kernels

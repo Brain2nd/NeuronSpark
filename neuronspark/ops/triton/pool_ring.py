@@ -86,7 +86,7 @@ __all__ = [
 RING2_QUERY_ROWS = 16
 # (largest decode batch, live slots per program, slots per tile, warps, stages); the first row with b <= its bound
 RING2_CONFIGS = (
-    (1, 64, 64, 8, 2),
+    (1, 32, 32, 4, 2),
     (8, 128, 64, 4, 2),
     (None, 512, 64, 4, 3),
 )

@@ -101,14 +101,14 @@ __all__ = [
 ]
 
 # ------------------------------------------------------------------------------------------------ launch constants
-PRENORM_WARPS = 2                      # fla layer_norm_fwd_kernel1's cached configuration at D = 1536
+PRENORM_WARPS = 4                      # screened in the captured decode step (B200, batch 1 / 8 / 32)
 K1_ROUTE = {1: "gated", 8: "split", 32: "split"}   # every other decode batch: "plain"
 K1_TILE_B1 = (16, 4)                   # K1 (rows per program, warps) at b == 1 (the gated route requires it)
 K1_TILE = (32, 4)                      # K1 (rows per program, warps) at b >= 2
 K1_SPLIT_CONV_WARPS = 2                # split route: conv kernel warps per program
 K1_SPLIT_STATE_TILE = (16, 2)          # split route: state kernel (rows per program, warps)
 K1_SPLIT_MAXNREG = 0                   # split route: state kernel register cap (0 = none)
-K2_PROGRAMS_SMALL = 8                  # K2 programs per row for b <= K2_SMALL_MAX_BATCH
+K2_PROGRAMS_SMALL = 16                 # K2 programs per row for b <= K2_SMALL_MAX_BATCH
 K2_PROGRAMS_LARGE = 4                  # K2 programs per row above
 K2_SMALL_MAX_BATCH = 16
 MAX_DECODE_BATCH = 32                  # the decode batches the routes cover: 1 .. 32

@@ -240,7 +240,7 @@ _SPECS: List[OpSpec] = [
         "(T, B, 768) fp32; backward: dw, dV", "train prefill",
         doc="w (T, B, 64) fp32 slot weights, u (T, B, 64) int64 slot ids, V (16384, 768) fp32"),
     _op("pkm_norm_gate", _T + "pkm_gate", "val gain glog eps",
-        "(T, B, 768) bf16 = bf16(zero-centred RMSNorm(val) * sigmoid(glog)); backward: dval, dgain, dglog", "train",
+        "(T, B, 768) bf16 = bf16(zero-centred RMSNorm(val) * sigmoid(glog)); backward: dval, dgain, dglog", "train prefill",
         doc="val (T, B, 768) fp32 value read, gain (768,) fp32 (zero-centred), glog (T, B, 768) bf16 gate logits"),
     _op("pkm_topk_softmax_t1", _T + "pkm_topk", "s_raw beta k",
         "(sc, w, u, ii, jj)", "decode",

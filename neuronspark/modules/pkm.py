@@ -26,7 +26,7 @@ Ops per regime:
   deterministic backward); ``ops.pkm_norm_gate`` (the ZCN, the gate and the rounding to bf16: one forward and one
   backward kernel); torch softmax;
 * prefill (T >= 2): the training forward's kernels without autograd, ``ops.pkm_topk_train`` (exact top-k) + torch
-  softmax and ``ops.pkm_value_read``; ``ops.rmsnorm_rows`` for the ZCN;
+  softmax, ``ops.pkm_value_read`` and ``ops.pkm_norm_gate`` (the ZCN, the gate and the rounding to bf16);
 * decode (T == 1): ``ops.pkm_scores_step`` (the unit half-queries and their cosines), ``ops.pkm_topk_softmax_t1``
   (the gain multiply, the exact top-k and the softmax in one kernel), ``ops.pkm_value_step`` (the weighted value sum,
   the ZCN and the gate).
@@ -66,7 +66,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from neuronspark.modules.linear import Linear
-from neuronspark.modules.plif import forked_rng, linear_init, rows_rmsnorm
+from neuronspark.modules.plif import forked_rng, linear_init
 from neuronspark.ops.linear import stacked_bands, stacked_inference_weight
 from neuronspark.utils.cache import WeightConstants
 from neuronspark.utils.precision import regime_product
@@ -169,9 +169,6 @@ class PKMMixin:
             kh = F.normalize(self.pkm_subkeys.to(torch.float32), dim=-1)
         return regime_product(_half_query_scores, qh, kh)
 
-    def _pkm_out(self, r: torch.Tensor, x_hat: torch.Tensor) -> torch.Tensor:
-        return self._ops.linear(r.to(x_hat.dtype), self.pkm_o.weight)
-
     # ------------------------------------------------------------------------------------------------ whole row
     def _pkm_read_train(self, x_q: torch.Tensor, x_g: torch.Tensor, res_attn: torch.Tensor, calib=None,
                         mode: Optional[str] = None) -> Optional[torch.Tensor]:
@@ -240,10 +237,8 @@ class PKMMixin:
             sc, u, ii, jj = o.pkm_topk_train(s, k)           # no autograd here: the forward kernel alone
             w = torch.softmax(sc, dim=-1)
             val = o.pkm_value_read(w.reshape(T, B, H * k), u.reshape(T, B, H * k), self.pkm_values)
-            r = rows_rmsnorm(o, val, PKM_EPS, weight=self.pkm_norm_gain, zero_centered=True,
-                             out_dtype=torch.float32)
-            r = r * torch.sigmoid(glog.to(torch.float32))
-        return self._pkm_out(r, x_hat)
+            r = o.pkm_norm_gate(val, self.pkm_norm_gain, glog, PKM_EPS)       # bf16: the output projection's operand
+        return o.linear(r, self.pkm_o.weight)
 
     # ------------------------------------------------------------------------------------------------ decode
     def _pkm_read_step(self, xb: torch.Tensor) -> torch.Tensor:

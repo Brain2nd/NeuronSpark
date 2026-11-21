@@ -1,4 +1,5 @@
-"""Norm and gate of the PKM read (training): one forward kernel and one backward kernel.
+"""Norm and gate of the PKM read (training; the prefill calls it without autograd): one forward kernel and one
+backward kernel.
 
 The value read ``val`` (T, B, dv) fp32 of the product-key memory (:mod:`neuronspark.modules.pkm`) is normalised with a
 zero-centred gain and gated per channel before the output projection::
@@ -173,8 +174,8 @@ def pkm_norm_gate(val: torch.Tensor, gain: torch.Tensor, glog: torch.Tensor, eps
     """``bf16(val * rsqrt(mean(val^2, -1) + eps) * (1 + gain) * sigmoid(glog.float()))`` (T, B, dv) contiguous.
 
     ``val`` (T, B, dv) fp32 and ``glog`` (T, B, dv) bf16 with unit inner strides (any (t, b) strides); ``gain`` (dv,)
-    fp32 contiguous, the zero-centred norm gain; ``eps`` the norm's eps.  Differentiable in val, gain and glog.
-    Training regime."""
+    fp32 contiguous, the zero-centred norm gain; ``eps`` the norm's eps.  Differentiable in val, gain and glog.  The
+    training forward and, without autograd, the prefill."""
     for name, t in (("val", val), ("gain", gain), ("glog", glog)):
         require_cuda(t, f"pkm_norm_gate ({name})")
     if val.dim() != 3 or val.dtype != torch.float32 or val.stride(-1) != 1 or val.numel() >= 2 ** 31:

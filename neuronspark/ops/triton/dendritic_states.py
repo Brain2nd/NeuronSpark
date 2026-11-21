@@ -270,19 +270,29 @@ def _forward_states(states_pre: torch.Tensor, dA_last: torch.Tensor) -> torch.Te
     return torch.stack(out, dim=1)
 
 
+def _hi_lo(v: torch.Tensor, seqlen: int) -> torch.Tensor:
+    """The fp32 scaled x ``v`` (b, c, l, h, p) as the chunk-state kernel feeds it to the tensor cores: zero at the rows
+    past ``seqlen`` (whatever dt holds there), hi = bf16(v), lo = bf16(v - hi), returned as hi + lo in float64."""
+    nchunks, chunk = v.shape[1], v.shape[2]
+    live = (torch.arange(nchunks * chunk, device=v.device) < seqlen).reshape(1, nchunks, chunk, 1, 1)
+    v = torch.where(live, v, 0.0)
+    hi = v.to(torch.bfloat16)
+    return hi.double() + (v - hi.float()).to(torch.bfloat16).double()
+
+
 def csp_fused_ref(B, x, dt, dA_cumsum, out_dtype):
-    """The chunk states and their passing with the chunk-state kernel's operand rounding (``chunk_states_train``:
-    ``scale = exp(min(dA_last - dA_l, 0)) dt_l`` in fp32, ``bf16(B_l scale)`` as the dot operand): states_pre[c] =
-    sum_{l in c} x_l bf16(B_l scale_l)^T (float64 sums), then the passing recurrence; returns (states_pre fp32, states in
-    out_dtype)."""
+    """The chunk states and their passing with the chunk-state kernel's operands (``chunk_states_train``:
+    ``scale = exp(min(dA_last - dA_l, 0)) dt_l`` in fp32, the fp32 ``x_l scale_l`` as its two bf16 parts, see
+    :func:`_hi_lo`): states_pre[c] = sum_{l in c} (x_l scale_l) B_l^T (float64 sums), then the passing recurrence;
+    returns (states_pre fp32, states in out_dtype)."""
     batch, seqlen, nheads, headdim = x.shape
     _, _, nchunks, chunk = dt.shape
     xc = _chunked(x, nchunks, chunk)                                   # (b, c, l, h, p)
     Bc = _chunked(B[:, :, 0], nchunks, chunk).float()                  # (b, c, l, n) bf16-exact fp32
     dA = dA_cumsum.float()                                             # (b, h, c, l)
     scale = _exp_f32(torch.clamp_max(dA[..., -1:] - dA, 0.0)) * dt.float()        # (b, h, c, l) fp32
-    bs = (Bc[:, :, :, None, :] * scale.permute(0, 2, 3, 1)[..., None]).to(B.dtype).double()   # (b, c, l, h, n)
-    states_pre = torch.einsum("bclhp,bclhn->bchpn", xc, bs)
+    xs = _hi_lo(xc.float() * scale.permute(0, 2, 3, 1)[..., None], x.shape[1])       # (b, c, l, h, p)
+    states_pre = torch.einsum("bclhp,bcln->bchpn", xs, Bc.double())
     states = _forward_states(states_pre.float(), dA[..., -1])
     return states_pre.float(), states.to(out_dtype)
 
@@ -292,12 +302,13 @@ def csp_prefill_ref(B, x, dt, dA_cumsum, initial_state, out_dtype):
     kernel's expressions and rounding points::
 
         chunk state:    scale_l = exp(min(dA_last - dA_l, 0)) dt_l                                   fp32
-                        chunk_state[c] = sum_{l in c} x_l bf16(B_l scale_l)^T                          stored fp32
+                        chunk_state[c] = sum_{l in c} hilo(x_l scale_l) B_l^T                          fp32
         state passing:  s_0 = initial_state,  states[c] = out_dtype(s_c),
                         s_{c+1} = exp(dA_last[c]) s_c + chunk_state[c]                                 fp32
         final_state = s_nchunks (fp32)
 
-    ``dA_last[c] = dA_cumsum[:, :, c, -1]``; ``exp`` in the kernels' fp32 form (:func:`_exp_f32`); the sums of the dot
+    ``dA_last[c] = dA_cumsum[:, :, c, -1]``; ``exp`` in the kernels' fp32 form (:func:`_exp_f32`); ``hilo`` the two bf16
+    parts of the fp32 product (:func:`_hi_lo`); the sums of the dot
     and of each passing step are accumulated in float64 and rounded once to fp32 (the kernels' fp32 dot / fma order is
     the rule class).  Returns (states (b, nc, h, P, N) in out_dtype, final_state (b, h, P, N) fp32).  No kernel; any
     device."""
@@ -307,8 +318,8 @@ def csp_prefill_ref(B, x, dt, dA_cumsum, initial_state, out_dtype):
     Bc = _chunked(B[:, :, 0], nchunks, chunk).float()                  # (b, c, l, n) bf16-exact fp32
     dA = dA_cumsum.float()                                             # (b, h, c, l)
     scale = _exp_f32(torch.clamp_max(dA[..., -1:] - dA, 0.0)) * dt.float()        # (b, h, c, l) fp32
-    bs = (Bc[:, :, :, None, :] * scale.permute(0, 2, 3, 1)[..., None]).to(B.dtype).double()   # (b, c, l, h, n)
-    chunk_states = torch.einsum("bclhp,bclhn->bchpn", xc, bs).float()                 # the stored fp32 chunk states
+    xs = _hi_lo(xc.float() * scale.permute(0, 2, 3, 1)[..., None], x.shape[1])       # (b, c, l, h, p)
+    chunk_states = torch.einsum("bclhp,bcln->bchpn", xs, Bc.double()).float()         # the fp32 chunk states
     decay = _exp_f32(dA[..., -1])                                      # (b, h, c) fp32
     s = initial_state.float()
     entering = []

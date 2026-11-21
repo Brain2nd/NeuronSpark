@@ -40,8 +40,8 @@ ring 2, accumulator buffers 2, 4 warps per compute partition, work-split cost 3.
 no K-step prefetch, P ring 3, states ring 1, 4 columns per thread group; grid = #SM) or TMA (BM 64, BK 32, 4 warps, 3
 stages); none is tuned at run time.
 
-Numerics.  The rounding points: the chunk states summed in fp32 over K steps of 32 tokens and passed in fp32, the
-states entering each chunk rounded to bf16
+Numerics.  The rounding points: the chunk states summed in fp32 over K steps of 64 tokens (the fp32 scaled x as two bf16
+parts, 16 significant bits) and passed in fp32, the states entering each chunk rounded to bf16
 before the inter-chunk product, ``CB * decay * dt`` rounded to bf16 before the intra-chunk product, fp32
 accumulation, y rounded once.  The Gluon kernel accumulates the inter-chunk term separately and adds it in its
 epilogue, and takes the decay as ``ex2.approx.ftz`` (results below 2^-126 flush to zero): fp32 order / underflow
@@ -315,7 +315,10 @@ def dendritic_prefill_states_ref(x: torch.Tensor, Bm: torch.Tensor, initial_stat
     fp32)``::
 
         chunk state:
-            b_k = bf16(B_k * (exp(min(dA_last - dA_k, 0)) * dt_k)),  chunk_state = sum_k x_k b_k^T   (fp32)
+            xs_k = x_k * (exp(min(dA_last - dA_k, 0)) * dt_k)   (fp32, 0 past the sequence, as its bf16 parts
+                                                               hi = bf16(xs_k) and lo = bf16(xs_k - hi): the kernel's
+                                                               operands)
+            chunk_state = sum_k xs_k B_k^T   (fp32)
         state passing:
             s_0 = initial_state,  s_{c+1} = exp(dA_last_c) s_c + chunk_state_c (fp32),
             states[:, c] = out_dtype(s_c),  final_state = s_nchunks
@@ -335,8 +338,12 @@ def dendritic_prefill_states_ref(x: torch.Tensor, Bm: torch.Tensor, initial_stat
     for c in range(nchunks):
         dt_c, da_c = dtq[:, :, c], daq[:, :, c]                                            # (b, h, l)
         scale = _exp_k(torch.clamp_max(da_c[..., -1:] - da_c, 0.0)) * dt_c                 # (b, h, l)
-        b_k = (Bc[:, c][:, None] * scale[..., None]).to(x.dtype)                           # (b, h, l, n)
-        chunk_state = torch.einsum("blhp,bhln->bhpn", xc[:, c].double(), b_k.double()).float()   # (b, h, p, n)
+        xs = xc[:, c].float() * scale.transpose(1, 2)[..., None]                           # (b, l, h, p) fp32
+        live = torch.arange(c * chunk, (c + 1) * chunk, device=x.device) < x.shape[1]      # rows past the sequence: 0
+        xs = torch.where(live[None, :, None, None], xs, 0.0)
+        hi = xs.to(torch.bfloat16)
+        xs = hi.double() + (xs - hi.float()).to(torch.bfloat16).double()                  # the kernel's two parts
+        chunk_state = torch.einsum("blhp,bln->bhpn", xs, Bc[:, c].double()).float()       # (b, h, p, n)
         entering.append(s.to(out_dtype))
         s = (_exp_k(da_c[..., -1]).double()[..., None, None] * s.double() + chunk_state.double()).float()
     return torch.stack(entering, dim=1), s

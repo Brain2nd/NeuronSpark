@@ -29,6 +29,10 @@ and position t (positions before the row start read the pad id V)::
   overlap (checked).  A bound table armed to overwrite (:func:`neuronspark.ops.linear.arm_grad_overwrite_`) is refused:
   the backward writes only the rows read.
 
+Contract: the ids lie in [0, V), which is not checked on the device (an id outside reads a row outside its table and
+its backward writes one; the model's token embedding looks up the same ids and reports one out of range); first-order
+gradients only (the backward has no derivative of its own).
+
 Numerics: the forward is exact (the reference's integers, gathers and products); the backward's sums are fp32 in
 another order than the reference's (torch's embedding backward per table).  Tests: the forward against
 :func:`lexical_train_ref` (the torch chain of the module) exactly, the gradients with the per-operator tolerance rule of

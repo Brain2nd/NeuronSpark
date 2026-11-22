@@ -23,8 +23,11 @@ and position t (positions before the row start read the pad id V)::
   (a dense view per table) returned to autograd as the tables' gradients; a table whose gradient buffer is bound
   (:func:`neuronspark.ops.linear.bind_grad_`: an optimizer that owns the table's ``.grad``) has the rows added into that
   buffer instead (``grad[row] = grad[row] + sum``: what adding the dense gradient adds, the other rows' zeros adding
-  nothing), and autograd receives no gradient for it.  A bound table armed to overwrite
-  (:func:`neuronspark.ops.linear.arm_grad_overwrite_`) is refused: the backward writes only the rows read.
+  nothing to a buffer that holds no -0, as one zeroed and then only added into), and autograd receives no gradient for
+  it.  As for the linear operator's bound weights, every bound table that requires a gradient gets its rows, whichever
+  gradients the backward was asked for (``torch.autograd.grad``, ``backward(inputs=...)``).  Bound buffers must not
+  overlap (checked).  A bound table armed to overwrite (:func:`neuronspark.ops.linear.arm_grad_overwrite_`) is refused:
+  the backward writes only the rows read.
 
 Numerics: the forward is exact (the reference's integers, gathers and products); the backward's sums are fp32 in
 another order than the reference's (torch's embedding backward per table).  Tests: the forward against
@@ -155,9 +158,9 @@ def _lex_train_table_bwd(G, SK, PERM, DST, j, s0, R, B, g_s0, g_s1, g_s2, scale,
             pos2 = tl.load(PERM + s0 + ii, mask=inr, other=s0) - s0
             t2 = pos2 // B
             b2 = pos2 - t2 * B
-            g2 = tl.load(G + (t2 * g_s0 + b2 * g_s1)[:, None] + ch[None, :], mask=inr[:, None] & dm[None, :],
-                         other=0.0) * scale
-            acc += tl.sum(g2, axis=0)
+            m3 = inr[:, None] & dm[None, :]
+            g2 = tl.load(G + (t2 * g_s0 + b2 * g_s1)[:, None] + ch[None, :], mask=m3, other=0.0) * scale
+            acc += tl.sum(tl.where(m3, g2, 0.0), axis=0)                 # (0 x an infinite scale: not a NaN)
             q += BS
             go = (tl.sum(inr.to(tl.int32), axis=0) == BS) & (q < R)
         dl = DST + (kl - R0).to(tl.int64) * D + dd
@@ -202,7 +205,8 @@ def _check(ids, tables, orders, hash_mult, hash_add, hash_wrap) -> None:
         _need(t.dim() == 2 and t.dtype == torch.float32 and t.is_contiguous() and t.device == ids.device,
               f"a table must be a contiguous fp32 (rows, d) tensor on the ids' device, got {t.dtype} {tuple(t.shape)}")
     _need(sum(int(t.shape[0]) for t in tables) < 2 ** 31, "the tables' rows must sum to less than 2^31")
-    _need(len(tables) * ids.numel() < 2 ** 31, "tables x positions must be less than 2^31")
+    _need(len(tables) * ids.numel() + BWD_SLOTS < 2 ** 31, "tables x positions must be less than 2^31 - BWD_SLOTS "
+          "(the backward's int32 slot indices)")
 
 
 def _layout(tables, orders):
@@ -223,10 +227,11 @@ def _lexical_train_fwd(ids: torch.Tensor, tables: List[torch.Tensor], orders: Li
     out = torch.empty((T, B, M), dtype=torch.float32, device=ids.device)
     keys = torch.empty((len(tables) * R,), dtype=torch.int32, device=ids.device)
     if R:
-        _lex_train_fwd_kernel[(triton.cdiv(R, FWD_POSITIONS),)](
-            ids, tuple(tables), hash_mult, hash_add, hash_wrap, out, keys, R, B, int(ids.stride(0)),
-            int(ids.stride(1)), int(vocab_size), float(scale), ORDERS=ords, ROWS=rows, DIMS=dims, DBS=dbs,
-            NT=len(tables), M=M, BP=FWD_POSITIONS, num_warps=FWD_WARPS)
+        with torch.cuda.device(ids.device):                                # the launch goes to the current device
+            _lex_train_fwd_kernel[(triton.cdiv(R, FWD_POSITIONS),)](
+                ids, tuple(tables), hash_mult, hash_add, hash_wrap, out, keys, R, B, int(ids.stride(0)),
+                int(ids.stride(1)), int(vocab_size), float(scale), ORDERS=ords, ROWS=rows, DIMS=dims, DBS=dbs,
+                NT=len(tables), M=M, BP=FWD_POSITIONS, num_warps=FWD_WARPS)
     return out, keys
 
 
@@ -258,10 +263,11 @@ def _lexical_train_bwd(g: torch.Tensor, keys: torch.Tensor, tables: Sequence[tor
     if R:
         sk, perm = torch.sort(keys, stable=True)
         dsts = tuple(bound[k] if bound[k] is not None else grads[k] for k in range(len(tables)))
-        _lex_train_bwd_kernel[(triton.cdiv(R, BWD_SLOTS), len(tables))](
-            g, sk, perm, dsts, R, B, int(g.stride(0)), int(g.stride(1)), int(g.stride(2)), float(scale),
-            ROWS=rows, DIMS=dims, DBS=dbs, ACCS=tuple(int(x is not None) for x in bound), NT=len(tables),
-            BS=BWD_SLOTS, num_warps=BWD_WARPS)
+        with torch.cuda.device(g.device):
+            _lex_train_bwd_kernel[(triton.cdiv(R, BWD_SLOTS), len(tables))](
+                g, sk, perm, dsts, R, B, int(g.stride(0)), int(g.stride(1)), int(g.stride(2)), float(scale),
+                ROWS=rows, DIMS=dims, DBS=dbs, ACCS=tuple(int(x is not None) for x in bound), NT=len(tables),
+                BS=BWD_SLOTS, num_warps=BWD_WARPS)
     return grads
 
 
@@ -298,6 +304,11 @@ class LexicalTrainFn(torch.autograd.Function):
             raise RuntimeError("neuronspark.lexical_train backward: a lexical table armed to overwrite its bound "
                                "gradient buffer (arm_grad_overwrite_); the backward adds the rows it reads, so its "
                                "owner zeroes the buffer instead")
+        spans = sorted((b.data_ptr(), b.data_ptr() + b.numel() * b.element_size()) for b in bound if b is not None)
+        if any(spans[i][1] > spans[i + 1][0] for i in range(len(spans) - 1)):
+            raise RuntimeError("neuronspark.lexical_train backward: the bound gradient buffers of two tables overlap "
+                               "(their rows would be added concurrently)")
+        g = g.resolve_neg()                                                # the kernel reads the stored values
         grads = _lexical_train_bwd(g, keys, ctx.tables, ctx.orders, B, T, ctx.scale, bound)
         return (None,) * 7 + tuple(gr if need[k] else None for k, gr in enumerate(grads))
 

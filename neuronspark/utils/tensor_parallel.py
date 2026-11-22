@@ -1,5 +1,5 @@
-"""Tensor-parallel inference on two GPUs: both GPUs work on the same requests, each holding half of every dendritic
-neuron layer and half of the readout's vocabulary.
+"""Tensor-parallel inference on N GPUs (2 to 8): every GPU works on the same requests, each holding 1 / N of every
+dendritic neuron layer and of the readout's vocabulary.
 
     import torch.distributed as dist
     dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
@@ -7,61 +7,63 @@ neuron layer and half of the readout's vocabulary.
     tp = tensor_parallel(model)                    # world size 1: the model itself
     out = tp.generate(prompts, max_length)         # captured prefill and decode steps, as for one GPU
 
-The split (rank r of 2):
+The split (rank r of N):
 
-* dendritic neuron layer (``mixer_a``): heads [r H/2, (r + 1) H/2) with their channels -- the in-projection's z, x and
+* dendritic neuron layer (``mixer_a``): heads [r H/N, (r + 1) H/N) with their channels -- the in-projection's z, x and
   dt rows, the conv taps and bias of the x channels, A, D, dt bias, theta, gamma, the out-projection's columns -- and
-  their recurrent state (conv tail (B, d_inner / 2 + 2 N, 3), SSM state (B, H / 2, P, N); the cache holds every
+  their recurrent state (conv tail (B, d_inner / N + 2 N_s, 3), SSM state (B, H / N, P, N_s); the cache holds every
   layer's in one tensor per field); the B and C rows (shared by every head) and their conv channels are held and
-  computed by both GPUs.  The gated RMSNorm's per-row sum of squares is exchanged inside the norm kernel
+  computed by every GPU.  The gated RMSNorm's per-row sum of squares is summed across the GPUs inside the norm kernel
   (:mod:`neuronspark.ops.triton.tp_dendritic`); the out-projection's partial product is taken in fp32 and summed across
-  the GPUs, rounded to bf16 once and added to the fp32 residual stream (the decode step: one kernel with the next
-  dendritic neuron layer's pre-norm, :func:`neuronspark.ops.triton.tp_exchange.tp_join`; the prefill of one row: the
-  partial written into symmetric memory and read by the other GPU once released,
+  the GPUs in rank order, rounded to bf16 once and added to the fp32 residual stream (the decode step: one kernel with
+  the next dendritic neuron layer's pre-norm, :func:`neuronspark.ops.triton.tp_exchange.tp_join`; the prefill of one
+  row: the partial written into symmetric memory and read by the other GPUs once released,
   :func:`neuronspark.ops.triton.tp_bulk.tp_prefill_join`);
-* the hippocampal layers, for a batch of B >= 2 rows: rows [0, ceil(B / 2)) on rank 0 and the rest on rank 1, with
-  their states (rings, clocks, conv history, neuron potentials); each GPU runs the one-GPU layer on its rows (its rows
-  of the position counter, the shared ring pointer) and in a decode step the rows are joined on both GPUs after the
-  layer (the layer's last addition, the exchange and the next dendritic neuron layer's pre-norm in one kernel,
-  :func:`neuronspark.ops.triton.tp_exchange.tp_tail_gather`, through the layer's ``tail``).  A batch of one row runs
-  them whole on both GPUs;
-* a prefill of B >= 2 rows splits the batch instead, by the same rows: each GPU runs every layer on its rows, the
+* the hippocampal layers, for a batch of B >= N rows: rows [lo_r, lo_(r+1)) on rank r, lo_r = ceil(r B / N)
+  (:func:`neuronspark.ops.triton.tp_bulk.row_bounds`), with their states (rings, clocks, conv history, neuron
+  potentials); each GPU runs the one-GPU layer on its rows (its rows of the position counter, the shared ring pointer)
+  and in a decode step the rows are joined on every GPU after the layer (the layer's last addition, the exchange and
+  the next dendritic neuron layer's pre-norm in one kernel, :func:`neuronspark.ops.triton.tp_exchange.tp_tail_gather`,
+  through the layer's ``tail``).  A batch of fewer rows runs them whole on every GPU;
+* a prefill of B >= N rows splits the batch instead, by the same rows: each GPU runs every layer on its rows, the
   dendritic neuron layers whole (the model's own layer, every head, from its rows' states), and the rows are joined on
-  both GPUs after the last layer, only the positions the readout takes (written into symmetric memory and read by the
-  other GPU once released, :func:`neuronspark.ops.triton.tp_bulk.tp_prefill_gather`).  The dendritic states move from
+  every GPU after the last layer, only the positions the readout takes (written into symmetric memory and read by the
+  other GPUs once released, :func:`neuronspark.ops.triton.tp_bulk.tp_prefill_gather`).  The dendritic states move from
   the head split to the row split before the layers and back after them, one exchange each way for every layer: a GPU
-  stages its heads' states of the peer's rows (before) or holds its rows' states of every head (after) in symmetric
-  memory and releases them, and the peer pulls its part (:func:`neuronspark.ops.triton.tp_bulk.tp_state_pull`); the B
-  and C conv channels, held for every row on both GPUs, come from the rows' GPU.  Both GPUs hold the bf16 copies of
-  the dendritic neuron layers' whole projection weights for it;
-* the readout: vocabulary rows [0, S) on rank 0 and [S, V) on rank 1, S = the largest multiple of every readout
-  balance width that is at most V / 2 (the balance adds ``c[:, v % w]``: a shard starting at a multiple of w is the
-  same function); the logits are gathered (NCCL) into the full (B, R, V) rows on both GPUs, or, for greedy decoding
-  (:class:`GreedyTokens`), each GPU's per-row maximum and its index are exchanged and the token picked
+  stages its heads' states of the other GPUs' rows (before) or holds its rows' states of every head (after) in
+  symmetric memory and releases them, and each other GPU pulls its part
+  (:func:`neuronspark.ops.triton.tp_bulk.tp_state_pull`); the B and C conv channels, held for every row on every GPU,
+  come from the rows' GPU.  Every GPU holds the bf16 copies of the dendritic neuron layers' whole projection weights
+  for it;
+* the readout: vocabulary rows [S_r, S_(r+1)) on rank r, S_r (0 < r < N) = the largest multiple of every readout balance
+  width that is at most r V / N (:func:`vocab_bounds`; the balance adds ``c[:, v % w]``: a shard starting at a multiple
+  of w is the same function); the logits are gathered (NCCL) into the full (B, R, V) rows on every GPU, or, for greedy
+  decoding (:class:`GreedyTokens`), the GPUs' per-row maxima and their indices are exchanged and the token picked
   (:func:`neuronspark.ops.triton.tp_exchange.tp_greedy_pick`): the full logits are never formed;
 * everything else -- embedding, lexical memory, induction match, copy statistics, the final norm -- runs whole on
-  both GPUs on the same values.
+  every GPU on the same values.
 
 Exchanges inside a captured step go through a mailbox in symmetric memory (:class:`TensorParallelComm`): one region
-per call site of the step (decode sites and prefill sites in separate ranges), the site counter reset at the start of
-every forward; every greedy pick, a prefill's too, takes the last decode site (a site's words are written again only
-after an exchange in between: the next decode step reaches that site after its other exchanges, and a prefill starts
-with a fence).  A one-row prefill's out-projection partials and a split prefill's joined rows go through two symmetric
-buffers (by site parity) with a flag word per site, the states a split prefill moves through a third with two flag
-words of its own, and every prefill call advances an epoch counter and starts with a fence on a call word
+per call site of the step on every GPU (decode sites and prefill sites in separate ranges; a site that sums the GPUs'
+values holds N - 1 slots, :mod:`neuronspark.ops.triton.tp_exchange`), the site counter reset at the start of every
+forward; every greedy pick, a prefill's too, takes the last decode site (a site's words are written again only after
+an exchange in between: the next decode step reaches that site after its other exchanges, and a prefill starts with a
+fence).  A one-row prefill's out-projection partials and a split prefill's joined rows go through two symmetric
+buffers (by site parity) with a row of N flag words per site, the states a split prefill moves through a third with two
+rows of its own, and every prefill call advances an epoch counter and starts with a fence on the call words
 (:mod:`neuronspark.ops.triton.tp_bulk`); the buffers grow in an eager call, at least doubling, and are kept until
-:meth:`TensorParallelComm.close` (a captured call addresses them).  Both GPUs must run the same sequence of forwards
+:meth:`TensorParallelComm.close` (a captured call addresses them).  Every GPU must run the same sequence of forwards
 (the same calls in the same order), and each GPU its forwards one after another (on one stream, or on streams ordered
 by events: eager calls and graph replays share the mailbox, the epoch and the buffers); the generation path does, as
-both ranks call it with the same arguments, and a sampled token is rank 0's on both GPUs
+every rank calls it with the same arguments, and a sampled token is rank 0's on every GPU
 (:meth:`TensorParallelLM.agree_tokens`).  The decay rates and soma thresholds of a GPU's heads are weight constants
 (:class:`neuronspark.utils.cache.WeightConstants`), formed on first use and held by every captured step that reads
 them.
 
-The model's mathematics is the one-GPU path's; the sums run in another order (two partial dot products and two
-partial sums of squares added in fp32), and a split batch runs the one-GPU kernels on half the batch (the hippocampal
-layers, and every layer of a prefill: a kernel whose choices depend on the batch, e.g. a product's algorithm, can round
-a row otherwise).  The cache's
+The model's mathematics is the one-GPU path's; the sums run in another order (N partial dot products and N partial
+sums of squares added in fp32 in rank order), and a split batch runs the one-GPU kernels on part of the batch (the
+hippocampal layers, and every layer of a prefill: a kernel whose choices depend on the batch, e.g. a product's
+algorithm, can round a row otherwise).  The cache's
 contract is kept: the dendritic state dtype of the cache; :meth:`TensorParallelLM.gather_cache` joins the split states
 into the one-GPU cache's names and shapes.  ``DecodeGraph`` / ``PrefillGraph`` of :mod:`neuronspark.utils.generation`
 capture the tensor-parallel model unchanged.
@@ -84,22 +86,23 @@ from neuronspark.modules.hippocampal_layer import HippocampalLayer
 from neuronspark.modules.induction import allocate_induction_state, induction_session_match
 from neuronspark.ops.linear import _cached_bf16, cache_bf16_, drop_bf16_
 from neuronspark.ops.triton.dendritic_step import MAX_DECODE_BATCH
-from neuronspark.ops.triton.tp_bulk import tp_fence, tp_prefill_gather, tp_prefill_join, tp_release, tp_state_pull
+from neuronspark.ops.triton.tp_bulk import (row_bounds, tp_fence, tp_prefill_gather, tp_prefill_join, tp_release,
+                                            tp_state_pull)
 from neuronspark.ops.triton.tp_dendritic import k2_words, tp_gated_norm_soma, tp_step_core
-from neuronspark.ops.triton.tp_exchange import tp_greedy_pick, tp_join, tp_tail_gather
+from neuronspark.ops.triton.tp_exchange import MAX_GPUS, tp_greedy_pick, tp_join, tp_tail_gather
 from neuronspark.utils.cache import (DendriticState, HippocampalState, InferenceParams, RING_MULTIPLE,
                                      WeightConstants, drop_weight_constants, resolve_dendritic_state_dtype)
 from neuronspark.utils.generation import GenerationMixin
 from neuronspark.utils.precision import regime
 
-__all__ = ["TensorParallelComm", "TensorParallelLM", "GreedyTokens", "tensor_parallel", "vocab_split", "mailbox_sites",
+__all__ = ["TensorParallelComm", "TensorParallelLM", "GreedyTokens", "tensor_parallel", "vocab_bounds", "mailbox_sites",
            "DECODE_SITE_WORDS", "DECODE_SITES", "PREFILL_SITE_WORDS", "PREFILL_SITES"]
 
-#: mailbox words of one decode call site (the largest exchange: MAX_DECODE_BATCH rows of D <= 2,048) and the default
-#: number of decode sites (:func:`mailbox_sites` gives a model's)
+#: mailbox words of one slot of a decode call site (the largest exchange: MAX_DECODE_BATCH rows of D <= 2,048; a site
+#: holds N - 1 slots) and the default number of decode sites (:func:`mailbox_sites` gives a model's)
 DECODE_SITE_WORDS = MAX_DECODE_BATCH * 2048
 DECODE_SITES = 64
-#: mailbox words of one prefill call site (one per row of B x T) and the default number of prefill sites
+#: mailbox words of one slot of a prefill call site (one per row of B x T) and the default number of prefill sites
 PREFILL_SITE_WORDS = 65536
 PREFILL_SITES = 64
 
@@ -114,22 +117,36 @@ def mailbox_sites(model: NeuronSparkLMHeadModel) -> Tuple[int, int]:
     return 2 * n_den + n_hip + 1, n_den
 
 
-def vocab_split(vocab_size: int, widths) -> int:
-    """The first vocabulary row of rank 1: the largest multiple of every balance width at most V / 2."""
+def vocab_bounds(vocab_size: int, widths, n: int) -> List[int]:
+    """[S_0 = 0, S_1, ..., S_N = V]: rank r's vocabulary rows are [S_r, S_(r+1)), S_r (0 < r < N) a multiple of every
+    balance width: the largest one at most r V / N, raised to one step above S_(r-1) and lowered to leave a step below V
+    for each later shard where the shards would otherwise be empty (a split whose bounds all differ is unchanged)."""
     step = 1
     for w in widths:
         step = step * int(w) // math.gcd(step, int(w))
-    s = (int(vocab_size) // 2) // step * step
-    if s <= 0:
-        raise ValueError(f"vocab_split: no split of {vocab_size} rows at a multiple of {step}")
-    return s
+    V, n = int(vocab_size), int(n)
+    top = (V - 1) // step                                 # the multiples k step with k step < V: k = 1 .. top
+    if n < 1 or top < n - 1:
+        raise ValueError(f"vocab_bounds: no split of {V} rows into {n} shards at multiples of {step}")
+    s, k = [0], 0
+    for r in range(1, n):
+        k = min(max((r * V // n) // step, k + 1), top - (n - 1 - r))
+        s.append(k * step)
+    return s + [V]
 
 
 # ================================================================================================ communicator
 class TensorParallelComm:
-    """The process group of the two GPUs and the mailbox of the in-graph exchanges (module docstring), with
+    """The process group of the N GPUs and the mailbox of the in-graph exchanges (module docstring), with
     ``decode_sites`` regions of a decode step and ``prefill_sites`` regions and buffer sites of a prefill call
-    (:func:`mailbox_sites` of the model; both GPUs pass the same)."""
+    (:func:`mailbox_sites` of the model; every GPU passes the same).  Layout of a GPU's mailbox (int64 words): the
+    decode sites (N - 1 slots of DECODE_SITE_WORDS each), the prefill sites (N - 1 slots of PREFILL_SITE_WORDS), a row
+    of N flag words per prefill buffer site, the N call words, the two rows of N state words.  ``ticket``: the int32
+    word from which the prefill's gated norm programs take their rows (zero between calls).
+
+    Every GPU makes the same calls, and each call is eager on every GPU or a replay of graphs captured from the same
+    calls on every GPU: an eager call addresses the newest bulk and state buffers, a replay those of its capture, so a
+    call eager on one GPU and replayed on another would read buffers that the other GPU does not write."""
 
     def __init__(self, group=None, device: Optional[torch.device] = None, decode_sites: int = DECODE_SITES,
                  prefill_sites: int = PREFILL_SITES) -> None:
@@ -137,29 +154,30 @@ class TensorParallelComm:
         self.group = group if group is not None else dist.group.WORLD
         self.world = dist.get_world_size(self.group)
         self.rank = dist.get_rank(self.group)
-        if self.world != 2:
-            raise ValueError(f"TensorParallelComm: two GPUs, got a group of {self.world}")
+        if not 2 <= self.world <= MAX_GPUS:
+            raise ValueError(f"TensorParallelComm: 2 to {MAX_GPUS} GPUs, got a group of {self.world}")
         if int(decode_sites) < 1 or int(prefill_sites) < 1:
             raise ValueError(f"TensorParallelComm: at least one site of each kind, got {decode_sites} decode and "
                              f"{prefill_sites} prefill sites")
-        self.peer = 1 - self.rank
+        n = self.world
         self.device = torch.device("cuda", torch.cuda.current_device()) if device is None else torch.device(device)
         self.decode_sites, self.prefill_sites = int(decode_sites), int(prefill_sites)
         name = self.group.group_name
         self._decode_base = 0
-        self._prefill_base = self.decode_sites * DECODE_SITE_WORDS
-        self._flag_base = self._prefill_base + self.prefill_sites * PREFILL_SITE_WORDS
-        self._call_word = self._flag_base + self.prefill_sites
-        self._state_words = self._call_word + 1          # the state exchange's two flag words (to rows, to heads)
-        total = self._state_words + 2
+        self._prefill_base = self.decode_sites * (n - 1) * DECODE_SITE_WORDS
+        self._flag_base = self._prefill_base + self.prefill_sites * (n - 1) * PREFILL_SITE_WORDS
+        self._call_words = self._flag_base + self.prefill_sites * n
+        self._state_words = self._call_words + n         # the state exchange's two rows (to rows, to heads)
+        total = self._state_words + 2 * n
         self.local = symm_mem.empty(total, dtype=torch.int64, device=self.device)
         self.local.zero_()
         self.handle = symm_mem.rendezvous(self.local, name)
-        self.remote = self.handle.get_buffer(self.peer, (total,), torch.int64)
+        self.boxes = self._mapped(self.handle, self.local, total)    # GPU j's mailbox mapped on this GPU, at j
         self.epoch = torch.zeros(1, dtype=torch.int64, device=self.device)   # prefill calls so far (on the device)
-        self._bulk = None                                # (local, handle, remote, capacity) of the partial buffers
+        self.ticket = torch.zeros(1, dtype=torch.int32, device=self.device)  # the gated norm's rows (tp_dendritic)
+        self._bulk = None                                # (every GPU's buffer, handle, capacity): partial buffers
         self._bulk_kept: List[tuple] = []                # smaller buffers a captured call may still address
-        self._state = None                               # (local, handle, remote, capacity in bytes): state buffer
+        self._state = None                               # (every GPU's buffer, handle, capacity in bytes): states
         self._state_kept: List[tuple] = []
         torch.cuda.synchronize(self.device)
         dist.barrier(self.group)
@@ -167,102 +185,108 @@ class TensorParallelComm:
         self._site = 0
         self._bulk_site = 0
 
+    def _mapped(self, handle, local: torch.Tensor, numel: int) -> List[torch.Tensor]:
+        """Every GPU's buffer of a symmetric allocation as this GPU addresses it: GPU j's at j (this GPU's
+        ``local``)."""
+        return [local if j == self.rank else handle.get_buffer(j, (int(numel),), local.dtype)
+                for j in range(self.world)]
+
+    def _words(self, base: int, n: int) -> List[torch.Tensor]:
+        """Every GPU's words [base, base + n) of the mailbox, GPU j's at j."""
+        return [b[base:base + int(n)] for b in self.boxes]
+
     def begin(self, prefill: bool) -> None:
         """Start a forward: the next region is the first of the call's range; a prefill call advances the epoch and
-        passes the fence on the call word (both GPUs have finished their previous calls)."""
+        passes the fence on the call words (every GPU has finished its previous calls)."""
         self._prefill = bool(prefill)
         self._site = 0
         self._bulk_site = 0
         if self._prefill:
             self.epoch.add_(1)
-            c = self._call_word
-            tp_fence(self.remote[c:c + 1], self.local[c:c + 1], self.epoch)
+            tp_fence(self._words(self._call_words, self.world), self.rank, self.epoch)
 
-    def bulk(self, rows: int, cols: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """(this GPU's partial buffer (rows, cols) fp32, the peer's, this GPU's flag word, the peer's) of the next
-        prefill join site (:mod:`neuronspark.ops.triton.tp_bulk`).  The buffers grow in an eager call (both GPUs make
-        the same calls, so both grow together); a captured call needs an eager call of its size first."""
+    def bulk(self, rows: int, cols: int) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """(every GPU's partial buffer (rows, cols) fp32, every GPU's flag row (N,) int64 of the site; GPU j's at j) of
+        the next prefill join site (:mod:`neuronspark.ops.triton.tp_bulk`).  The buffers grow in an eager call (every
+        GPU makes the same calls, so all grow together); a captured call needs an eager call of its size first."""
         n = int(rows) * int(cols)
         site = self._bulk_site
         if site >= self.prefill_sites:
             raise RuntimeError(f"TensorParallelComm: a prefill call has {self.prefill_sites} join sites")
-        if self._bulk is None or n > self._bulk[3]:
+        if self._bulk is None or n > self._bulk[2]:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("TensorParallelComm: a captured prefill needs an eager call of its size first (its "
                                    "partial buffers are allocated there)")
             self._grow(n, int(cols))
         self._bulk_site += 1
-        local, _, remote, cap = self._bulk
+        bufs, _, cap = self._bulk
         lo = (site % 2) * cap
-        f = self._flag_base + site
-        return (local[lo:lo + n].view(int(rows), int(cols)), remote[lo:lo + n].view(int(rows), int(cols)),
-                self.local[f:f + 1], self.remote[f:f + 1])
+        return ([b[lo:lo + n].view(int(rows), int(cols)) for b in bufs],
+                self._words(self._flag_base + site * self.world, self.world))
 
     def _grow(self, n: int, cols: int) -> None:
         """New partial buffers of at least ``n`` values per parity: at least twice the old capacity, up to the largest
         call's (PREFILL_SITE_WORDS rows of ``cols``), so that the kept buffers total less than three times the
         largest."""
         import torch.distributed._symmetric_memory as symm_mem
-        old = 0 if self._bulk is None else self._bulk[3]
+        old = 0 if self._bulk is None else self._bulk[2]
         cap = max(int(n), min(2 * old, PREFILL_SITE_WORDS * int(cols)))
         cap = -(-cap // 1024) * 1024                     # the second parity's view starts 4 KiB aligned
         local = symm_mem.empty(2 * cap, dtype=torch.float32, device=self.device)
         handle = symm_mem.rendezvous(local, self.group.group_name)
-        remote = handle.get_buffer(self.peer, (2 * cap,), torch.float32)
         if self._bulk is not None:
             self._bulk_kept.append(self._bulk)
-        self._bulk = (local, handle, remote, cap)
+        self._bulk = (self._mapped(handle, local, 2 * cap), handle, cap)
         torch.cuda.synchronize(self.device)
         dist.barrier(self.group)
 
-    def states(self, nbytes: int, limit: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(this GPU's state buffer, the peer's) uint8, at least ``nbytes`` long: the recurrent states a split prefill
-        moves between the head split and the row split (:class:`TensorParallelLM`).  It grows in an eager call (both
-        GPUs make the same calls), at least doubling up to ``limit`` bytes (the largest call's); a captured call needs
+    def states(self, nbytes: int, limit: int) -> List[torch.Tensor]:
+        """Every GPU's state buffer uint8 (GPU j's at j), at least ``nbytes`` long: the recurrent states a split prefill
+        moves between the head split and the row split (:class:`TensorParallelLM`).  It grows in an eager call (every
+        GPU makes the same calls), at least doubling up to ``limit`` bytes (the largest call's); a captured call needs
         an eager call of its size first."""
         n = int(nbytes)
-        if self._state is None or n > self._state[3]:
+        if self._state is None or n > self._state[2]:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("TensorParallelComm: a captured prefill needs an eager call of its size first (its "
                                    "state buffer is allocated there)")
             import torch.distributed._symmetric_memory as symm_mem
-            old = 0 if self._state is None else self._state[3]
+            old = 0 if self._state is None else self._state[2]
             cap = -(-max(n, min(2 * old, int(limit))) // 4096) * 4096
             local = symm_mem.empty(cap, dtype=torch.uint8, device=self.device)
             handle = symm_mem.rendezvous(local, self.group.group_name)
-            remote = handle.get_buffer(self.peer, (cap,), torch.uint8)
             if self._state is not None:
                 self._state_kept.append(self._state)
-            self._state = (local, handle, remote, cap)
+            self._state = (self._mapped(handle, local, cap), handle, cap)
             torch.cuda.synchronize(self.device)
             dist.barrier(self.group)
-        return self._state[0], self._state[2]
+        return self._state[0]
 
-    def state_words(self, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(this GPU's, the peer's) flag word ``k`` of the state exchange (0: to the row split, 1: back to the head
-        split), written once per prefill call."""
-        w = self._state_words + int(k)
-        return self.local[w:w + 1], self.remote[w:w + 1]
+    def state_flags(self, k: int) -> List[torch.Tensor]:
+        """Every GPU's row ``k`` (N,) int64 of the state exchange's flag words (0: to the row split, 1: back to the head
+        split; GPU j's at j), written once per prefill call."""
+        return self._words(self._state_words + int(k) * self.world, self.world)
 
-    def region(self, words: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(the peer's words, this GPU's words) of the next call site, ``words`` long."""
+    def region(self, words: int, sum_site: bool = True) -> List[torch.Tensor]:
+        """Every GPU's region of the next call site (GPU j's at j): N - 1 slots of ``words`` for a site that sums the
+        GPUs' values, one slot for a site that gathers rows (:mod:`neuronspark.ops.triton.tp_exchange`)."""
         base, size, sites = ((self._prefill_base, PREFILL_SITE_WORDS, self.prefill_sites) if self._prefill
                              else (self._decode_base, DECODE_SITE_WORDS, self.decode_sites))
         if int(words) > size or self._site >= sites:
-            raise RuntimeError(f"TensorParallelComm: call site {self._site} needs {words} words; a "
-                               f"{'prefill' if self._prefill else 'decode'} call has {sites} sites of {size}")
-        off = base + self._site * size
+            raise RuntimeError(f"TensorParallelComm: call site {self._site} needs {words} words a slot; a "
+                               f"{'prefill' if self._prefill else 'decode'} call has {sites} sites of {size} a slot")
+        off = base + self._site * (self.world - 1) * size
         self._site += 1
-        return self.remote[off:off + int(words)], self.local[off:off + int(words)]
+        return self._words(off, int(words) * ((self.world - 1) if sum_site else 1))
 
     def close(self) -> None:
-        """Free the mailbox on both GPUs together (every rank calls it; before the process group is destroyed): no
+        """Free the mailbox on every GPU together (every rank calls it; before the process group is destroyed): no
         exchange may be pending, and no captured graph that addresses the mailbox may be replayed afterwards."""
         if self.local is None:
             return
         torch.cuda.synchronize(self.device)
         dist.barrier(self.group)
-        self.remote = self.handle = self.local = None
+        self.boxes = self.handle = self.local = None
         self._bulk, self._bulk_kept = None, []
         self._state, self._state_kept = None, []
         gc.collect()
@@ -272,16 +296,17 @@ class TensorParallelComm:
 
 # ================================================================================================ dendritic shard
 class _DendriticShard(nn.Module):
-    """This GPU's half of one dendritic neuron population (module docstring)."""
+    """This GPU's part (1 / N of the heads) of one dendritic neuron population (module docstring)."""
 
-    def __init__(self, m: DendriticNeurons, rank: int) -> None:
+    def __init__(self, m: DendriticNeurons, rank: int, n: int) -> None:
         super().__init__()
         H, P, N, di = m.nheads, m.head_dim, m.state_size, m.d_inner
-        if H % 2:
-            raise ValueError(f"tensor_parallel: a dendritic neuron layer of {H} heads does not split in two")
+        if H % int(n):
+            raise ValueError(f"tensor_parallel: a dendritic neuron layer of {H} heads does not split into {n} parts")
         self.layer_idx = m.layer_idx
-        self.H, self.P, self.N, self.di_all = H // 2, P, N, di
-        self.di = di // 2
+        self.rank = int(rank)
+        self.H, self.P, self.N, self.di_all = H // int(n), P, N, di
+        self.di = di // int(n)
         self.conv_dim = self.di + 2 * N
         self.K = m.conv_width - 1                                # conv inputs held (lags t-3 .. t-1)
         self.chunk_size = m.chunk_size
@@ -301,7 +326,7 @@ class _DendriticShard(nn.Module):
         self.gamma = f(m.gamma[c0:c1])
         self.rho = f(m.rho[c0:c1])
         self.W_out = f(m.W_out[:, c0:c1])
-        self.pre_norm_gain = m.pre_norm_gain                     # the layer's own (whole on both GPUs)
+        self.pre_norm_gain = m.pre_norm_gain                     # the layer's own (whole on every GPU)
         self._constants = WeightConstants()                      # (A, theta) per weight version, as the layer's
 
     def constants(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -331,12 +356,10 @@ class _DendriticShard(nn.Module):
             hn = o.dendritic_prenorm_rows(hc, self.pre_norm_gain, self.norm_eps)
         proj = o.linear(hn, self.in_proj)                                            # (B, 2 di + 2 N + H) bf16
         A, theta = self.constants()
-        send, recv = comm.region(k2_words(B, self.di))
         xs = tp_step_core(proj, st.conv, st.ssm, self.conv_weight, self.conv_bias, A, self.dt_bias, self.D,
-                          theta, self.gamma, self.norm_eps, self.di_all, send, recv)
+                          theta, self.gamma, self.norm_eps, self.di_all, comm.region(k2_words(B, self.di)), self.rank)
         part = torch.mm(xs, self._w_out().t(), out_dtype=torch.float32)             # (B, D) fp32 partial
-        send, recv = comm.region(B * Dm)
-        h_new, hn_next = tp_join(part, hc, send, recv, next_gain, self.norm_eps)
+        h_new, hn_next = tp_join(part, hc, comm.region(B * Dm), self.rank, next_gain, self.norm_eps)
         return h_new.unsqueeze(0), hn_next
 
     def prefill(self, o, comm: TensorParallelComm, h: torch.Tensor, st: DendriticState) -> torch.Tensor:
@@ -356,20 +379,19 @@ class _DendriticShard(nn.Module):
         y, final_state = o.dendritic_chunk_scan_prefill(x, dt, A, Bm, Cm, self.D, self.dt_bias, st.ssm,
                                                         chunk_size=self.chunk_size)
         st.ssm.copy_(final_state)
-        send, recv = comm.region(B * T)
         xo = tp_gated_norm_soma(y.reshape(B * T, di), z.reshape(B * T, di), theta, self.gamma, self.norm_eps,
-                                self.di_all, send, recv)
-        part, part_peer, flag, flag_peer = comm.bulk(B * T, Dm)
-        torch.mm(xo, self._w_out().t(), out_dtype=torch.float32, out=part)          # (B * T, D) fp32 partial
-        tp_release(flag_peer, comm.epoch)
-        return tp_prefill_join(part, part_peer, h, flag, comm.epoch)
+                                self.di_all, comm.region(B * T), self.rank, comm.ticket)
+        parts, flags = comm.bulk(B * T, Dm)
+        torch.mm(xo, self._w_out().t(), out_dtype=torch.float32, out=parts[self.rank])   # (B * T, D) fp32 partial
+        tp_release(flags, self.rank, comm.epoch)
+        return tp_prefill_join(parts, h, flags[self.rank], self.rank, comm.epoch)
 
 
 # ================================================================================================ the model
 class TensorParallelLM(nn.Module, GenerationMixin):
-    """The language model split across two GPUs for inference (module docstring).  ``forward(input_ids,
-    inference_params, num_last_tokens)`` -> ``CausalLMOutput(logits (B, R, V) bf16)`` on both GPUs (inference only:
-    an inference cache is required)."""
+    """The language model split across the N GPUs of the communicator for inference (module docstring).
+    ``forward(input_ids, inference_params, num_last_tokens)`` -> ``CausalLMOutput(logits (B, R, V) bf16)`` on every GPU
+    (inference only: an inference cache is required)."""
 
     def __init__(self, model: NeuronSparkLMHeadModel, comm: TensorParallelComm) -> None:
         super().__init__()
@@ -386,18 +408,17 @@ class TensorParallelLM(nn.Module, GenerationMixin):
         self.impl = model.impl
         cfg = model.config
         bb = model.backbone
-        self.rank = comm.rank
-        self.shards = nn.ModuleDict({str(i): _DendriticShard(layer.mixer_a, comm.rank)
+        self.rank, self.world = comm.rank, comm.world
+        self.shards = nn.ModuleDict({str(i): _DendriticShard(layer.mixer_a, comm.rank, comm.world)
                                      for i, layer in enumerate(bb.layers) if isinstance(layer, DendriticNeuronLayer)})
         if not self.shards:
             raise ValueError("tensor_parallel: the model has no dendritic neuron layer to split")
         self.den = [int(i) for i in self.shards]                 # the dendritic neuron layers, in order
         if len({(sh.H, sh.P, sh.N, sh.di, sh.K) for sh in self.shards.values()}) != 1:
             raise ValueError("tensor_parallel: the dendritic neuron layers differ in shape")
-        V = int(cfg.vocab_size)
-        s = vocab_split(V, bb.balance_stack.widths)
-        self.vocab_lo, self.vocab_hi = (0, s) if comm.rank == 0 else (s, V)
-        self.vocab_widths = (s, V - s)
+        s = vocab_bounds(int(cfg.vocab_size), bb.balance_stack.widths, comm.world)
+        self.vocab_lo, self.vocab_hi = s[comm.rank], s[comm.rank + 1]
+        self.vocab_widths = [b - a for a, b in zip(s, s[1:])]
         self.readout_weight = nn.Parameter(bb.embed_tokens.weight[self.vocab_lo:self.vocab_hi].detach().clone(),
                                            requires_grad=False)
         self._decode_graph = None
@@ -405,7 +426,7 @@ class TensorParallelLM(nn.Module, GenerationMixin):
 
     # ------------------------------------------------------------------------------------------------ weights
     def _whole_weights(self) -> List[nn.Parameter]:
-        """The projection weights run whole on both GPUs (every inference projection but the split ones)."""
+        """The projection weights run whole on every GPU (every inference projection but the split ones)."""
         bb = self.model.backbone
         split = {f"layers.{i}.mixer_a." for i in self.shards}
         return [p for n, p in bb.inference_linear_weights()
@@ -445,16 +466,16 @@ class TensorParallelLM(nn.Module, GenerationMixin):
 
     # ------------------------------------------------------------------------------------------------ cache
     def _rows(self, batch_size: int) -> Optional[Tuple[int, int]]:
-        """This GPU's rows [lo, hi) of the hippocampal layers' batch split (rank 0 the first ceil(B / 2), rank 1 the
-        rest); None for a batch of one row (both GPUs run it whole)."""
+        """This GPU's rows [lo, hi) of the batch split (:func:`row_bounds`) for a batch of at least N rows; None for a
+        smaller batch (every GPU runs it whole)."""
         B = int(batch_size)
-        if B < 2:
+        if B < self.world:
             return None
-        n0 = (B + 1) // 2
-        return (0, n0) if self.rank == 0 else (n0, B)
+        lo = row_bounds(B, self.world)
+        return lo[self.rank], lo[self.rank + 1]
 
     @staticmethod
-    def _half(ip: InferenceParams, lo: int, hi: int) -> InferenceParams:
+    def _rows_view(ip: InferenceParams, lo: int, hi: int) -> InferenceParams:
         """The cache as this GPU's hippocampal layers see it: rows [lo, hi) of the position counter, the ring pointer,
         the layers' states (the hippocampal ones hold hi - lo rows)."""
         return InferenceParams(max_seqlen=ip.max_seqlen, max_batch_size=hi - lo, pos=ip.pos[lo:hi],
@@ -501,28 +522,29 @@ class TensorParallelLM(nn.Module, GenerationMixin):
 
     @torch.no_grad()
     def gather_cache(self, ip: InferenceParams) -> Dict[str, torch.Tensor]:
-        """Copies of every state tensor of the cache, the dendritic states of both GPUs joined along the heads and the
+        """Copies of every state tensor of the cache, the dendritic states of every GPU joined along the heads and the
         hippocampal states of a split batch along the rows (the one-GPU cache's names and shapes), on every rank."""
         out = {}
-        B = int(ip.max_batch_size)
-        n0 = (B + 1) // 2
+        B, n = int(ip.max_batch_size), self.world
+        lo = row_bounds(B, n)
+        most = max(b - a for a, b in zip(lo, lo[1:]))
         split = self._rows(B) is not None
         for name, t in ip.tensors():
             parts = name.split(".")
             if parts[0] == "layers" and parts[1] in self.shards and parts[2] in ("conv", "ssm"):
-                both = [torch.empty_like(t) for _ in range(2)]
-                dist.all_gather(both, t.contiguous(), group=self.comm.group)
+                every = [torch.empty_like(t) for _ in range(n)]
+                dist.all_gather(every, t.contiguous(), group=self.comm.group)
                 if parts[2] == "ssm":
-                    t = torch.cat(both, dim=1)
-                else:
+                    t = torch.cat(every, dim=1)
+                else:                                    # every GPU's x channels, then the B and C channels
                     di = self.shards[parts[1]].di
-                    t = torch.cat([both[0][:, :di], both[1][:, :di], both[0][:, di:]], dim=1)
+                    t = torch.cat([e[:, :di] for e in every] + [every[0][:, di:]], dim=1)
             elif parts[0] == "layers" and split and isinstance(ip.layers[int(parts[1])], HippocampalState):
-                rows = torch.zeros((n0,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device)   # rank 1 padded
+                rows = torch.zeros((most,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device)   # padded rows
                 rows[:int(t.shape[0])].copy_(t)
-                both = [torch.empty_like(rows) for _ in range(2)]
-                dist.all_gather(both, rows, group=self.comm.group)
-                t = torch.cat([both[0], both[1][:B - n0]], dim=0)
+                every = [torch.empty_like(rows) for _ in range(n)]
+                dist.all_gather(every, rows, group=self.comm.group)
+                t = torch.cat([e[:b - a] for e, a, b in zip(every, lo, lo[1:])], dim=0)
             else:
                 t = t.clone()
             out[name] = t
@@ -559,7 +581,7 @@ class TensorParallelLM(nn.Module, GenerationMixin):
             hip = ip
             if rows is not None:                     # a decode step's hippocampal layers: this GPU's rows
                 lo, hi = rows
-                hip = self._half(ip, lo, hi)
+                hip = self._rows_view(ip, lo, hi)
                 lex = lex[:, lo:hi].contiguous()
                 ind = tuple(m[lo:hi] for m in ind)
                 copy = tuple(c[:, lo:hi].contiguous() for c in copy)
@@ -596,10 +618,10 @@ class TensorParallelLM(nn.Module, GenerationMixin):
         pre-norm (B, D) bf16 if the next layer is one, else None), one kernel."""
         gain, eps = ((nxt.mixer_a.pre_norm_gain, float(nxt.mixer_a.norm_eps))
                      if isinstance(nxt, DendriticNeuronLayer) else (None, 1e-5))
-        send, recv = self.comm.region(B * int(self.config.D))
+        boxes = self.comm.region(B * int(self.config.D), sum_site=False)
 
         def tail(h, ffn, y, rho):
-            ho, hn = tp_tail_gather(h, ffn, y, rho, lo, B, send, recv, gain, eps)
+            ho, hn = tp_tail_gather(h, ffn, y, rho, lo, B, boxes, self.rank, gain, eps)
             return ho.unsqueeze(0), hn
         return tail
 
@@ -610,7 +632,7 @@ class TensorParallelLM(nn.Module, GenerationMixin):
         norm; each GPU runs every layer on its rows [lo, hi), the dendritic states moved to the row split and back."""
         lo, hi = rows
         B = int(ip.max_batch_size)
-        hip = self._half(ip, lo, hi)
+        hip = self._rows_view(ip, lo, hi)
         lex = lex[:, lo:hi].contiguous()
         ind = tuple(m[lo:hi] for m in ind)
         copy = tuple(c[:, lo:hi].contiguous() for c in copy)
@@ -628,7 +650,7 @@ class TensorParallelLM(nn.Module, GenerationMixin):
         return self._join_rows(x, lo, B, R)
 
     def _stacked(self, ip: InferenceParams) -> Tuple[torch.Tensor, torch.Tensor]:
-        """(conv (L, B, (d_inner / 2 + 2 N) K) fp32, ssm (L, B, H / 2 P N)): this GPU's dendritic states of the L
+        """(conv (L, B, (d_inner / N + 2 N_s) K) fp32, ssm (L, B, H / N P N_s)): this GPU's dendritic states of the L
         layers as one view per field (the cache of :meth:`allocate_inference_cache` holds them so)."""
         out = []
         for field in ("conv", "ssm"):
@@ -647,76 +669,88 @@ class TensorParallelLM(nn.Module, GenerationMixin):
                                         t0.storage_offset()))
         return out[0], out[1]
 
-    def _state_regions(self, B: int, dt: torch.dtype) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """(this GPU's, the peer's) regions of the state buffer for a split prefill of B rows, ``cap`` = ceil(B / 2)
-        rows per layer: [rows' ssm (L, cap, H P N) dt, rows' conv (L, cap, (d_inner + 2 N) K) fp32 -- a GPU's rows
-        of every head; staged ssm (L, cap, H / 2 P N) dt, staged conv (L, cap, d_inner / 2 K) fp32 -- its heads of
-        the peer's rows]."""
+    def _state_regions(self, B: int, dt: torch.dtype) -> List[List[torch.Tensor]]:
+        """Every GPU's regions of the state buffer for a split prefill of B rows (GPU j's at j): [rows' ssm (L, c_r,
+        H P N_s) dt, rows' conv (L, c_r, (d_inner + 2 N_s) K) fp32 -- a GPU's rows of every head; staged ssm (L, c_s,
+        H / N P N_s) dt, staged conv (L, c_s, d_inner / N K) fp32 -- its heads of the other GPUs' rows], c_r = ceil(B /
+        N) (the most rows a GPU holds) and c_s = B - floor(B / N) (the most it stages)."""
         sh = self.shards[str(self.den[0])]
-        L, P, N, K = len(self.den), sh.P, sh.N, sh.K
+        L, P, N, K, n = len(self.den), sh.P, sh.N, sh.K, self.world
         es = torch.finfo(dt).bits // 8
-        parts = [(2 * sh.H * P * N, dt, es), ((sh.di_all + 2 * N) * K, torch.float32, 4),
-                 (sh.H * P * N, dt, es), (sh.di * K, torch.float32, 4)]
 
-        def layout(cap):
+        def layout(b):
+            c_r, c_s = -(-b // n), b - b // n
+            parts = [(c_r, n * sh.H * P * N, dt, es), (c_r, (sh.di_all + 2 * N) * K, torch.float32, 4),
+                     (c_s, sh.H * P * N, dt, es), (c_s, sh.di * K, torch.float32, 4)]
             offs, total = [], 0
-            for w, _, e in parts:
+            for c, w, _, e in parts:
                 offs.append(total)
-                total += -(-(L * cap * w * e) // 256) * 256
-            return offs, total
-        cap = (int(B) + 1) // 2
-        offs, total = layout(cap)
-        local, remote = self.comm.states(total, layout((MAX_DECODE_BATCH + 1) // 2)[1])
+                total += -(-(L * c * w * e) // 256) * 256
+            return parts, offs, total
+        parts, offs, total = layout(int(B))
+        bufs = self.comm.states(total, layout(MAX_DECODE_BATCH)[2])
 
         def carve(buf):
-            return [buf[o:o + L * cap * w * e].view(d).view(L, cap, w) for o, (w, d, e) in zip(offs, parts)]
-        return carve(local), carve(remote)
+            return [buf[o:o + L * c * w * e].view(d).view(L, c, w) for o, (c, w, d, e) in zip(offs, parts)]
+        return [carve(b) for b in bufs]
 
     def _to_rows(self, stacked, regions, lo: int, hi: int, B: int) -> Dict[int, DendriticState]:
-        """Move the dendritic states of this GPU's rows [lo, hi) to the row split: this GPU's heads of the peer's rows
-        staged and released, its heads of its rows (and their B, C channels) copied, the peer's heads of its rows
-        pulled; -> the states of its rows, every head, of each dendritic neuron layer (views of the state buffer)."""
+        """Move the dendritic states of this GPU's rows [lo, hi) to the row split: this GPU's heads of the other GPUs'
+        rows staged (the rows before its own at [0, lo), the rows after them at [lo, B - n)) and released, its heads of
+        its rows (and their B, C channels) copied, every other GPU's heads of its rows pulled from that GPU's staged
+        rows; -> the states of its rows, every head, of each dendritic neuron layer (views of the state buffer)."""
         sh = self.shards[str(self.den[0])]
         c_conv, c_ssm = stacked
-        (s_ssm, s_conv, g_ssm, g_conv), (_, _, g_ssm_p, g_conv_p) = regions
-        r, p = self.rank, 1 - self.rank
-        plo, phi = (hi, B) if lo == 0 else (0, lo)
-        n, m = hi - lo, phi - plo
-        wh, xh, bc = sh.H * sh.P * sh.N, sh.di * sh.K, sh.di_all * sh.K   # per row: a half's SSM, x conv; B, C at
-        flag, flag_peer = self.comm.state_words(0)
+        r, bounds = self.rank, row_bounds(B, self.world)
+        s_ssm, s_conv, g_ssm, g_conv = regions[r]
+        n = hi - lo
+        wh, xh, bc = sh.H * sh.P * sh.N, sh.di * sh.K, sh.di_all * sh.K   # per row: a part's SSM, x conv; B, C at
+        flags = self.comm.state_flags(0)
         epoch = self.comm.epoch
-        g_ssm[:, :m].copy_(c_ssm[:, plo:phi])
-        g_conv[:, :m].copy_(c_conv[:, plo:phi, :xh])
-        tp_release(flag_peer, epoch)
+        if lo > 0:
+            g_ssm[:, :lo].copy_(c_ssm[:, :lo])
+            g_conv[:, :lo].copy_(c_conv[:, :lo, :xh])
+        if hi < B:
+            g_ssm[:, lo:B - n].copy_(c_ssm[:, hi:])
+            g_conv[:, lo:B - n].copy_(c_conv[:, hi:, :xh])
+        tp_release(flags, r, epoch)
         s_ssm[:, :n, r * wh:(r + 1) * wh].copy_(c_ssm[:, lo:hi])
         s_conv[:, :n, r * xh:(r + 1) * xh].copy_(c_conv[:, lo:hi, :xh])
         s_conv[:, :n, bc:].copy_(c_conv[:, lo:hi, xh:])
-        tp_state_pull(s_ssm[:, :n, p * wh:(p + 1) * wh], g_ssm_p[:, :n], flag, epoch)
-        tp_state_pull(s_conv[:, :n, p * xh:(p + 1) * xh], g_conv_p[:, :n], flag, epoch)
-        H, cd = 2 * sh.H, sh.di_all + 2 * sh.N
-        return {i: DendriticState(conv=s_conv[j, :n].view(n, cd, sh.K), ssm=s_ssm[j, :n].view(n, H, sh.P, sh.N))
-                for j, i in enumerate(self.den)}
+        for j in range(self.world):
+            if j != r:
+                at = lo if lo < bounds[j] else lo - (bounds[j + 1] - bounds[j])   # these rows in GPU j's staged rows
+                _, _, g_ssm_j, g_conv_j = regions[j]
+                tp_state_pull(s_ssm[:, :n, j * wh:(j + 1) * wh], g_ssm_j[:, at:at + n], flags[r][j:j + 1], epoch)
+                tp_state_pull(s_conv[:, :n, j * xh:(j + 1) * xh], g_conv_j[:, at:at + n], flags[r][j:j + 1], epoch)
+        H, cd = self.world * sh.H, sh.di_all + 2 * sh.N
+        return {i: DendriticState(conv=s_conv[k, :n].view(n, cd, sh.K), ssm=s_ssm[k, :n].view(n, H, sh.P, sh.N))
+                for k, i in enumerate(self.den)}
 
     def _to_heads(self, stacked, regions, lo: int, hi: int, B: int) -> None:
         """Move the dendritic states back to the head split after a split prefill: this GPU's rows of every head
-        released, its heads of its rows (and their B, C channels) copied into the cache, its heads of the peer's rows
-        (and theirs) pulled from the peer's rows."""
+        released, its heads of its rows (and their B, C channels) copied into the cache, its heads of every other GPU's
+        rows (and their B, C channels) pulled from that GPU's rows."""
         sh = self.shards[str(self.den[0])]
         c_conv, c_ssm = stacked
-        (s_ssm, s_conv, _, _), (s_ssm_p, s_conv_p, _, _) = regions
-        r = self.rank
-        plo, phi = (hi, B) if lo == 0 else (0, lo)
-        n, m = hi - lo, phi - plo
+        r, bounds = self.rank, row_bounds(B, self.world)
+        s_ssm, s_conv, _, _ = regions[r]
+        n = hi - lo
         wh, xh, bc = sh.H * sh.P * sh.N, sh.di * sh.K, sh.di_all * sh.K
-        flag, flag_peer = self.comm.state_words(1)
+        flags = self.comm.state_flags(1)
         epoch = self.comm.epoch
-        tp_release(flag_peer, epoch)
+        tp_release(flags, r, epoch)
         c_ssm[:, lo:hi].copy_(s_ssm[:, :n, r * wh:(r + 1) * wh])
         c_conv[:, lo:hi, :xh].copy_(s_conv[:, :n, r * xh:(r + 1) * xh])
         c_conv[:, lo:hi, xh:].copy_(s_conv[:, :n, bc:])
-        tp_state_pull(c_ssm[:, plo:phi], s_ssm_p[:, :m, r * wh:(r + 1) * wh], flag, epoch)
-        tp_state_pull(c_conv[:, plo:phi, :xh], s_conv_p[:, :m, r * xh:(r + 1) * xh], flag, epoch)
-        tp_state_pull(c_conv[:, plo:phi, xh:], s_conv_p[:, :m, bc:], flag, epoch)
+        for j in range(self.world):
+            if j != r:
+                lj, hj = bounds[j], bounds[j + 1]
+                s_ssm_j, s_conv_j, _, _ = regions[j]
+                f = flags[r][j:j + 1]
+                tp_state_pull(c_ssm[:, lj:hj], s_ssm_j[:, :hj - lj, r * wh:(r + 1) * wh], f, epoch)
+                tp_state_pull(c_conv[:, lj:hj, :xh], s_conv_j[:, :hj - lj, r * xh:(r + 1) * xh], f, epoch)
+                tp_state_pull(c_conv[:, lj:hj, xh:], s_conv_j[:, :hj - lj, bc:], f, epoch)
 
     def _join_rows(self, y: torch.Tensor, lo: int, B: int, last: int) -> torch.Tensor:
         """Every row of the stream from this GPU's rows ``y`` (T, n, D) fp32 = rows [lo, lo + n) of a split prefill's
@@ -725,13 +759,13 @@ class TensorParallelLM(nn.Module, GenerationMixin):
         T, n, D = (int(s) for s in y.shape)
         if last < T:
             y = y[T - last:]
-        part, part_peer, flag, flag_peer = comm.bulk(last * ((B + 1) // 2), D)   # the same size on both GPUs
-        part[:last * n].copy_(y.reshape(last * n, D))
-        tp_release(flag_peer, comm.epoch)
-        return tp_prefill_gather(y, part_peer, flag, comm.epoch, lo, B)
+        bufs, flags = comm.bulk(last * -(-B // self.world), D)   # the same size on every GPU: the most rows a GPU holds
+        bufs[self.rank][:last * n].copy_(y.reshape(last * n, D))
+        tp_release(flags, self.rank, comm.epoch)
+        return tp_prefill_gather(y, bufs, flags[self.rank], self.rank, comm.epoch, B)
 
     def _readout(self, hidden: torch.Tensor, greedy: bool = False) -> torch.Tensor:
-        """hidden (B, R, D) fp32 -> the balanced logits (B, R, V) bf16, gathered from both GPUs; ``greedy``: the
+        """hidden (B, R, D) fp32 -> the balanced logits (B, R, V) bf16, gathered from every GPU; ``greedy``: the
         greedy tokens (B, R, 1) int64 instead."""
         B, R, D = (int(s) for s in hidden.shape)
         rows = hidden.reshape(B * R, D)
@@ -739,19 +773,18 @@ class TensorParallelLM(nn.Module, GenerationMixin):
         local = self.model.backbone.balance_stack.balance(o.linear(rows, self.readout_weight), rows)
         if greedy:
             value, index = local.max(dim=-1)
-            send, recv = self.comm.region(2 * B * R)
-            return tp_greedy_pick(value, index, self.vocab_lo, send, recv).view(B, R, 1)
-        v0, v1 = self.vocab_widths
-        width = max(v0, v1)
+            return tp_greedy_pick(value, index, self.vocab_lo, self.comm.region(2 * B * R), self.rank).view(B, R, 1)
+        widths = self.vocab_widths
+        width = max(widths)
         send = torch.zeros((B * R, width), dtype=torch.bfloat16, device=rows.device)
         send[:, :int(local.shape[1])].copy_(local)
-        both = torch.empty((2 * B * R, width), dtype=torch.bfloat16, device=rows.device)
-        dist.all_gather_into_tensor(both, send, group=self.comm.group)
-        logits = torch.cat([both[:B * R, :v0], both[B * R:, :v1]], dim=1)
-        return logits.view(B, R, v0 + v1)
+        every = torch.empty((len(widths) * B * R, width), dtype=torch.bfloat16, device=rows.device)
+        dist.all_gather_into_tensor(every, send, group=self.comm.group)
+        logits = torch.cat([every[j * B * R:(j + 1) * B * R, :w] for j, w in enumerate(widths)], dim=1)
+        return logits.view(B, R, sum(widths))
 
     def agree_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Rank 0's sampled tokens on both GPUs (``decode`` calls it after sampling: the two processes' random streams
+        """Rank 0's sampled tokens on every GPU (``decode`` calls it after sampling: the processes' random streams
         differ, the logits do not)."""
         t = tokens.contiguous()
         dist.broadcast(t, src=dist.get_global_rank(self.comm.group, 0), group=self.comm.group)
@@ -806,8 +839,8 @@ class GreedyTokens(nn.Module):
 
 
 def tensor_parallel(model: NeuronSparkLMHeadModel, group=None) -> Union[NeuronSparkLMHeadModel, TensorParallelLM]:
-    """The model split across the two GPUs of ``group`` (default: the world); the model itself when the group has one
-    process (or none is initialised)."""
+    """The model split across the GPUs of ``group`` (default: the world; 2 to ``MAX_GPUS``, one process per GPU); the
+    model itself when the group has one process (or none is initialised)."""
     if not dist.is_available() or not dist.is_initialized():
         return model
     g = group if group is not None else dist.group.WORLD

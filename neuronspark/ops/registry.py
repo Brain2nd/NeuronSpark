@@ -424,60 +424,67 @@ del _decode_spec
 
 
 # ================================================================================================== tensor-parallel block
-# The exchanges of the tensor-parallel inference on two GPUs (neuronspark.utils.tensor_parallel, which calls the kernels
-# themselves: a reference cannot wait for the other GPU), registered into OPS after the main table.  ``send`` is the
-# peer's mailbox region and ``recv`` this GPU's (int64 words: the fp32 bits and a flag); ``flag_peer`` / ``flag`` the
-# peer's and this GPU's flag word for a site and ``epoch`` the call's epoch (int64 (1,) each).  The references make the
-# exchange in torch on the words already in place (tp_exchange.publish_ref, take_ref) and refuse a word a kernel would
-# wait for.  One GPU calls them in loopback (``send`` is ``recv``, ``flag_peer`` is ``flag``) or with the peer's words
-# placed in ``recv`` before the call.  Shapes: one GPU's half of the 1.3B model's dendritic neuron layer (72 of 144
-# heads, 4,608 of 9,216 channels) and the model's width 1,536.
+# The exchanges of the tensor-parallel inference on N GPUs (2 to tp_exchange.MAX_GPUS;
+# neuronspark.utils.tensor_parallel, which calls the kernels themselves: a reference cannot wait for another GPU),
+# registered into OPS after the main table.  ``boxes`` are every GPU's mailbox region of the call site (int64 words: the
+# fp32 bits and a flag; GPU j's at j, N - 1 slots for a site that sums the GPUs' values, one for a gather) and ``rank``
+# this GPU's; ``parts`` every GPU's buffer of a bulk site, ``flags`` / ``calls`` every GPU's row of N flag / call words,
+# ``flag`` this GPU's row (or, for a state pull, its one word of the source GPU) and ``epoch`` the call's epoch (int64
+# (1,)).  The references make the exchange in torch on the words already in place (tp_exchange.publish_ref, take_ref)
+# and refuse a word a kernel would wait for.  One GPU calls them standing for every GPU (the same region or buffer
+# passed for every GPU) or with the other GPUs' words placed in its own before the call.  Shapes: one GPU's part of the
+# 1.3B model's dendritic neuron layer at N = 2 (72 of 144 heads, 4,608 of 9,216 channels) and the model's width 1,536.
 _TENSOR_PARALLEL_SPECS: List[OpSpec] = [
     _op("tp_step_core", _T + "tp_dendritic",
-        "proj conv_state ssm_state conv_w conv_b A dt_bias D theta gamma eps n_all send recv",
+        "proj conv_state ssm_state conv_w conv_b A dt_bias D theta gamma eps n_all boxes rank",
         "xs (B, 4608) bf16: the soma read-out of this GPU's heads, normalized over n_all channels", "decode",
-        mutates="conv_state ssm_state send recv",
+        mutates="conv_state ssm_state boxes",
         doc="proj (B, 9544) bf16 local projection [z | x | B | C | dt], conv_state (B, 4864, 3) fp32, ssm_state (B, 72, "
             "64, 128) bf16|fp32, conv_w (4864, 4) / conv_b (4864,) / A / dt_bias / D (72,) / theta / gamma (4608,) "
-            "fp32, eps 1e-5, n_all 9216, send / recv k2_words(B, 4608) words (one per row and K2 program)"),
-    _op("tp_join", _T + "tp_exchange", "partial h send recv gain eps",
-        "(h_new (B, 1536) fp32 = h + f32(bf16(partial + partial_peer)), hn (B, 1536) bf16 pre-norm of h_new or None)",
-        "decode", mutates="send recv",
-        doc="partial (B, 1536) fp32 out-projection partial, h (B, 1536) fp32 residual stream, send / recv B x 1536 "
-            "words, gain (1536,) fp32 the next dendritic layer's pre-norm gain or None, eps 1e-5"),
-    _op("tp_tail_gather", _T + "tp_exchange", "h ffn y rho lo batch send recv gain eps",
-        "(h_out (batch, 1536) fp32 every row: this GPU's the tail of its rows, the others the peer's; hn (batch, "
-        "1536) bf16 or None)", "decode", mutates="send recv",
+            "fp32, eps 1e-5, n_all 9216, boxes N regions of N - 1 slots of k2_words(B, 4608) words (one per row and K2 "
+            "program), rank"),
+    _op("tp_join", _T + "tp_exchange", "partial h boxes rank gain eps",
+        "(h_new (B, 1536) fp32 = h + f32(bf16(the N partials summed in rank order)), hn (B, 1536) bf16 pre-norm of "
+        "h_new or None)", "decode", mutates="boxes",
+        doc="partial (B, 1536) fp32 out-projection partial, h (B, 1536) fp32 residual stream, boxes N regions of N - 1 "
+            "slots of B x 1536 words, rank, gain (1536,) fp32 the next dendritic layer's pre-norm gain or None, "
+            "eps 1e-5"),
+    _op("tp_tail_gather", _T + "tp_exchange", "h ffn y rho lo batch boxes rank gain eps",
+        "(h_out (batch, 1536) fp32 every row: this GPU's the tail of its rows, the others' rows theirs; hn (batch, "
+        "1536) bf16 or None)", "decode", mutates="boxes",
         doc="h (n, 1536) fp32, ffn / y (n, 1536) bf16, rho (n,) fp32 (this GPU's rows [lo, lo + n) of the batch), "
-            "send / recv batch x 1536 words, gain (1536,) fp32 or None, eps 1e-5"),
-    _op("tp_greedy_pick", _T + "tp_exchange", "value index offset send recv",
-        "(B,) int64 greedy tokens across the two vocabulary shards", "prefill decode", mutates="send recv",
+            "boxes N regions of batch x 1536 words, rank, gain (1536,) fp32 or None, eps 1e-5"),
+    _op("tp_greedy_pick", _T + "tp_exchange", "value index offset boxes rank",
+        "(B,) int64 greedy tokens across the N vocabulary shards", "prefill decode", mutates="boxes",
         doc="value (B,) bf16 this shard's per-row maximum, index (B,) int64 its shard-local id, offset the shard's first "
-            "vocabulary row (0 or 75808), send / recv 2 B words"),
-    _op("tp_gated_norm_soma", _T + "tp_dendritic", "y z theta gamma eps n_all send recv rstd_out n_out",
+            "vocabulary row (0 or 75808 at N = 2), boxes N regions of N - 1 slots of 2 B words, rank"),
+    _op("tp_gated_norm_soma", _T + "tp_dendritic", "y z theta gamma eps n_all boxes rank ticket rstd_out n_out",
         "x (M, 4608) bf16 contiguous soma read-out, normalized over n_all channels", "prefill",
-        mutates="send recv rstd_out n_out",
-        doc="y (M, 4608) bf16, z (M, 4608) bf16 view with unit last stride, theta / gamma (4608,) fp32, eps 1e-5, n_all "
-            "9216, send / recv M words, rstd_out (M,) fp32 or None, n_out (M, 4608) bf16 or None"),
-    _op("tp_fence", _T + "tp_bulk", "flag_peer flag epoch",
-        "None: the epoch stored into the peer's call word, then a wait until this GPU's holds at least it", "prefill",
-        mutates="flag_peer", doc="flag_peer / flag / epoch int64 (1,)"),
-    _op("tp_release", _T + "tp_bulk", "flag_peer epoch",
-        "None: the epoch stored into the peer's flag word of the site", "prefill", mutates="flag_peer",
-        doc="flag_peer / epoch int64 (1,)"),
-    _op("tp_prefill_join", _T + "tp_bulk", "part part_peer h flag epoch",
-        "(T, B, 1536) fp32 contiguous h + f32(bf16(part + part_peer))", "prefill",
-        doc="part / part_peer (B T, 1536) fp32 contiguous out-projection partials in (b, t) row order (part_peer read "
-            "through the peer's mapping), h (T, B, 1536) fp32 with unit last stride, flag / epoch int64 (1,)"),
-    _op("tp_prefill_gather", _T + "tp_bulk", "x part_peer flag epoch lo batch",
-        "(T, batch, 1536) fp32 contiguous every row: this GPU's rows [lo, lo + n) and the peer's", "prefill",
-        doc="x (T, n, 1536) fp32 with unit last stride, part_peer (>= T (batch - n), 1536) fp32 contiguous the peer's "
-            "rows in (t, row) order, flag / epoch int64 (1,), lo 0 or batch - n"),
+        mutates="boxes ticket rstd_out n_out",
+        doc="y (M, 4608) bf16, z (M, 4608) bf16 view with unit last stride, theta / gamma (4608,) fp32, eps 1e-5, "
+            "n_all 9216, boxes N regions of N - 1 slots of M words, rank, ticket int32 (1,) zero (the programs take "
+            "their rows from it; left zero), rstd_out (M,) fp32 or None, n_out (M, 4608) bf16 or None"),
+    _op("tp_fence", _T + "tp_bulk", "calls rank epoch",
+        "None: the epoch stored into word rank of every other GPU's call words, then a wait until every other word of "
+        "this GPU's holds at least it", "prefill", mutates="calls",
+        doc="calls N int64 (N,) rows, rank, epoch int64 (1,)"),
+    _op("tp_release", _T + "tp_bulk", "flags rank epoch",
+        "None: the epoch stored into word rank of every other GPU's flag row of the site", "prefill", mutates="flags",
+        doc="flags N int64 (N,) rows, rank, epoch int64 (1,)"),
+    _op("tp_prefill_join", _T + "tp_bulk", "parts h flag rank epoch",
+        "(T, B, 1536) fp32 contiguous h + f32(bf16(the N partials summed in rank order))", "prefill",
+        doc="parts N (B T, 1536) fp32 contiguous out-projection partials in (b, t) row order (the other GPUs' read "
+            "through their mappings), h (T, B, 1536) fp32 with unit last stride, flag int64 (N,) this GPU's row, "
+            "rank, epoch int64 (1,)"),
+    _op("tp_prefill_gather", _T + "tp_bulk", "x parts flag rank epoch batch",
+        "(T, batch, 1536) fp32 contiguous every row: this GPU's rows (row_bounds) and every other GPU's", "prefill",
+        doc="x (T, n, 1536) fp32 with unit last stride (this GPU's rows), parts N buffers (>= T n_j, 1536) fp32 "
+            "contiguous, GPU j's rows in (t, row) order, flag int64 (N,) this GPU's row, rank, epoch int64 (1,)"),
     _op("tp_state_pull", _T + "tp_bulk", "dst src_peer flag epoch",
-        "None: dst set to the peer's block src_peer once this GPU's flag word holds the epoch", "prefill",
+        "None: dst set to another GPU's block src_peer once this GPU's flag word of it holds the epoch", "prefill",
         mutates="dst",
         doc="dst / src_peer (18, 4, 589824) bf16 (the 18 dendritic layers' SSM states of 72 heads for 4 rows) or (18, "
-            "4, 13824) fp32 (conv taps of 4,608 channels), unit last stride, src_peer read through the peer's mapping; "
+            "4, 13824) fp32 (conv taps of 4,608 channels), unit last stride, src_peer read through that GPU's mapping; "
             "flag / epoch int64 (1,)"),
 ]
 for _tp_spec in _TENSOR_PARALLEL_SPECS:

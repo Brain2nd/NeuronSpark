@@ -12,24 +12,28 @@ Numerics contract (training, whole-row regime):
   and a weight modified in place after the copy was bound raises at the next training call until it is bound again.
 * weight gradient: ``dW = torch.mm(dy2.t(), x2, out_dtype=torch.float32)`` with ``dy2`` / ``x2`` the row-major
   ``(rows, N)`` / ``(rows, K)`` bf16 views of ``dy`` / the saved input: one GEMM with bf16 operands, fp32 accumulation
-  and an fp32 result.  It is returned as the weight's gradient (fp32 ``.grad`` through AccumulateGrad); nothing is
-  rounded to bf16.  A weight used twice in one backward (the tied embedding: readout + lookup) receives the fp32
-  sum of its contributions from autograd.
+  and an fp32 result; on CUDA a product of few output tiles over at least 2,048 rows (the gates, low-rank factors and
+  head projections, which leave cuBLAS's GEMM short of the GPU) runs instead as cuBLAS's batched GEMM of S row chunks
+  and one kernel that adds the S fp32 partials in a fixed order (:mod:`neuronspark.ops.triton.wgrad`: the same bits at
+  every call).  It is returned as the weight's gradient (fp32 ``.grad`` through AccumulateGrad); nothing is rounded to
+  bf16.  A weight used twice in one backward (the tied embedding: readout + lookup) receives the fp32 sum of its
+  contributions from autograd.
 * weight gradient of a weight bound with :func:`bind_grad_` (an optimizer that owns the weight's ``.grad`` buffer):
   the same GEMM accumulates into ``weight.grad`` itself, ``grad = grad + dy2^T x2`` (``torch.addmm`` with ``out=`` the
-  buffer: beta 1, no temporary and no separate add), and autograd receives no gradient for the weight from this
-  operator.  What accumulates in the buffer is what AccumulateGrad would have added: several backwards accumulate,
-  and another use of the weight in the same backward (the tied embedding's lookup) adds its contribution through
-  autograd as before.  ``torch.autograd.grad`` with respect to a bound weight and tensor hooks on it do not see this
-  operator's contribution, and every backward that runs through the operator writes the buffer, also one asked for
-  other tensors only (``torch.autograd.grad`` with respect to an activation): bind only weights whose gradient is read
-  from ``.grad`` in a step made of ``backward()`` calls.  The bound buffer must stay the weight's ``.grad``: a
-  training call or a backward that finds another tensor there, or none, raises.  A bound weight armed with
-  :func:`arm_grad_overwrite_` has its next weight-gradient GEMM write the buffer instead (``grad = dy2^T x2``,
-  ``torch.mm`` with ``out=`` the buffer: beta 0, the buffer not read); that GEMM disarms the weight, so its later
-  GEMMs accumulate as before: an owner whose step begins with this operator's GEMM as the first writer of the weight's
-  gradient (the projections; the tied embedding, whose readout runs its GEMMs before the lookup adds its rows) arms
-  the weight before that backward instead of zeroing the buffer.
+  buffer: beta 1, no temporary and no separate add; the chunked form adds its sum into the buffer), and autograd
+  receives no gradient for the weight from this operator.  What accumulates in the buffer is what AccumulateGrad
+  would have added: several backwards accumulate, and another use of the weight in the same backward (the tied
+  embedding's lookup) adds its contribution through autograd as before.  ``torch.autograd.grad`` with respect to a
+  bound weight and tensor hooks on it do not see this operator's contribution, and every backward that runs through
+  the operator writes the buffer, also one asked for other tensors only (``torch.autograd.grad`` with respect to an
+  activation): bind only weights whose gradient is read from ``.grad`` in a step made of ``backward()`` calls.  The
+  bound buffer must stay the weight's ``.grad``: a training call or a backward that finds another tensor there, or
+  none, raises.  A bound weight armed with :func:`arm_grad_overwrite_` has its next weight-gradient GEMM write the
+  buffer instead (``grad = dy2^T x2``, ``torch.mm`` with ``out=`` the buffer: beta 0, the buffer not read; the
+  chunked form writes its sum); that GEMM disarms the weight, so its later GEMMs accumulate as before: an owner
+  whose step begins with this operator's GEMM as the first writer of the weight's gradient (the projections; the
+  tied embedding, whose readout runs its GEMMs before the lookup adds its rows) arms the weight before that backward
+  instead of zeroing the buffer.
 * input gradient: ``dx = dy2 @ weight_bf16``, one GEMM with bf16 operands that writes the result in ``x.dtype``: bf16
   for a bf16 input, fp32 for an fp32 input (``torch.mm(dy2, weight_bf16, out_dtype=torch.float32)``: the fp32
   accumulation stored as it is, no bf16 output widened by a second kernel; a GEMM with an fp32 result exists on CUDA
@@ -238,7 +242,8 @@ def inference_weight(weight: torch.Tensor) -> torch.Tensor:
 def bind_grad_(param: torch.Tensor) -> None:
     """Make the training backward accumulate the weight gradient of ``param`` into its present ``param.grad`` (see
     the module docstring).  ``param`` is a 2-D fp32 leaf whose ``.grad`` exists: a dense contiguous fp32 tensor of the
-    weight's shape on its device, kept by the caller (an optimizer's gradient buffer).  That tensor is the bound
+    weight's shape on its device that is not a negative view (the kernels that add into it write the stored values),
+    kept by the caller (an optimizer's gradient buffer).  That tensor is the bound
     buffer; it must stay the weight's ``.grad`` (zeroed in place, never replaced or removed) until
     :func:`unbind_grad_` or the next ``bind_grad_``."""
     if param.dim() != 2 or param.dtype != torch.float32 or not param.is_leaf:
@@ -248,10 +253,10 @@ def bind_grad_(param: torch.Tensor) -> None:
     if g is None:
         raise RuntimeError("bind_grad_: the weight has no .grad to bind")
     if g.layout != torch.strided or g.dtype != torch.float32 or g.shape != param.shape or g.device != param.device \
-            or not g.is_contiguous() or g.requires_grad:
+            or not g.is_contiguous() or g.requires_grad or g.is_neg():
         raise RuntimeError(f"bind_grad_: the .grad of a weight {tuple(param.shape)} on {param.device} must be a dense "
-                           f"contiguous fp32 tensor of that shape on that device without a graph, got {g.layout} "
-                           f"{g.dtype} {tuple(g.shape)} on {g.device}")
+                           f"contiguous fp32 tensor of that shape on that device without a graph and not a negative "
+                           f"view, got {g.layout} {g.dtype} {tuple(g.shape)} on {g.device}")
     setattr(param, _GRAD_ATTR, g)
 
 
@@ -359,6 +364,21 @@ def _operands(x: torch.Tensor, weight: torch.Tensor) -> Tuple[torch.Tensor, torc
     return xb, wb
 
 
+def _weight_grad(dy2: torch.Tensor, x2: torch.Tensor, n: int, out: Optional[torch.Tensor] = None,
+                 accumulate: bool = False) -> torch.Tensor:
+    """``dy2[:, :n]^T x2`` in fp32, written into ``out`` (a new tensor when None) or added into it: on CUDA
+    :func:`neuronspark.ops.triton.wgrad.weight_grad` (row chunks and a partial sum for the products it takes, else
+    this GEMM), elsewhere one GEMM (``torch.mm`` / ``torch.addmm`` with ``out_dtype=float32``)."""
+    if dy2.is_cuda:
+        from neuronspark.ops.triton.wgrad import weight_grad
+        return weight_grad(dy2, x2, n, out=out, accumulate=accumulate)
+    if out is None:
+        return torch.mm(dy2[:, :n].t(), x2, out_dtype=torch.float32)
+    if accumulate:
+        return torch.addmm(out, dy2[:, :n].t(), x2, out_dtype=torch.float32, out=out)
+    return torch.mm(dy2[:, :n].t(), x2, out_dtype=torch.float32, out=out)
+
+
 # ------------------------------------------------------------------------------------------------ autograd Function
 class Fp32WgradLinearFn(torch.autograd.Function):
     """``y = x @ W^T`` with bf16 operands, bf16 output, fp32 weight gradient, input gradient in ``x.dtype``.
@@ -402,12 +422,12 @@ class Fp32WgradLinearFn(torch.autograd.Function):
                 x2 = xb.reshape(-1, xb.shape[-1]).contiguous()
                 g = None if ctx.bound_weight is None else _bound_grad(ctx.bound_weight)
                 if g is None:
-                    dw = torch.mm(dy2[:, :n].t(), x2, out_dtype=torch.float32)
+                    dw = _weight_grad(dy2, x2, n)
                 elif getattr(ctx.bound_weight, _OVERWRITE_ATTR, False):
                     delattr(ctx.bound_weight, _OVERWRITE_ATTR)
-                    torch.mm(dy2[:, :n].t(), x2, out_dtype=torch.float32, out=g)
+                    _weight_grad(dy2, x2, n, out=g)
                 else:
-                    torch.addmm(g, dy2[:, :n].t(), x2, out_dtype=torch.float32, out=g)
+                    _weight_grad(dy2, x2, n, out=g, accumulate=True)
             if ctx.needs_input_grad[0]:
                 if ctx.input_dtype == torch.float32 and dy2.is_cuda:
                     dx = torch.mm(dy2, wb, out_dtype=torch.float32).reshape(ctx.input_shape)

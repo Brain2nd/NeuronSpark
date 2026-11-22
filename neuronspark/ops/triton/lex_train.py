@@ -26,8 +26,9 @@ and position t (positions before the row start read the pad id V)::
   nothing to a buffer that holds no -0, as one zeroed and then only added into), and autograd receives no gradient for
   it.  As for the linear operator's bound weights, every bound table that requires a gradient gets its rows, whichever
   gradients the backward was asked for (``torch.autograd.grad``, ``backward(inputs=...)``).  Bound buffers must not
-  overlap (checked).  A bound table armed to overwrite (:func:`neuronspark.ops.linear.arm_grad_overwrite_`) is refused:
-  the backward writes only the rows read.
+  overlap (checked); each written buffer's version counter is advanced as an in-place add advances it.  A bound table
+  armed to overwrite (:func:`neuronspark.ops.linear.arm_grad_overwrite_`) is refused: the backward writes only the rows
+  read.
 
 Contract: the ids lie in [0, V), which is not checked on the device (an id outside reads a row outside its table and
 its backward writes one; the model's token embedding looks up the same ids and reports one out of range); first-order
@@ -314,6 +315,9 @@ class LexicalTrainFn(torch.autograd.Function):
                                "(their rows would be added concurrently)")
         g = g.resolve_neg()                                                # the kernel reads the stored values
         grads = _lexical_train_bwd(g, keys, ctx.tables, ctx.orders, B, T, ctx.scale, bound)
+        written = [b for b in bound if b is not None]
+        if written:
+            torch.autograd.graph.increment_version(written)                # as an in-place add: saved copies see it
         return (None,) * 7 + tuple(gr if need[k] else None for k, gr in enumerate(grads))
 
 

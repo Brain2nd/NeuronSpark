@@ -89,6 +89,7 @@ __all__ = [
     "stacked_inference_weight",
     "stacked_bands",
     "bind_grad_",
+    "bound_grad",
     "unbind_grad_",
     "arm_grad_overwrite_",
     "armed_grad_overwrites",
@@ -278,6 +279,13 @@ def armed_grad_overwrites(params: Sequence[torch.Tensor]) -> list:
     """The weights of ``params`` still armed (:func:`arm_grad_overwrite_`): none after a backward that ran a
     weight-gradient GEMM of each."""
     return [p for p in params if getattr(p, _OVERWRITE_ATTR, False)]
+
+
+def bound_grad(param: torch.Tensor) -> Optional[torch.Tensor]:
+    """The gradient buffer bound to ``param`` (:func:`bind_grad_`) or None, for another operator that writes a bound
+    parameter's gradient itself (the lexical tables' row sums, :mod:`neuronspark.ops.triton.lex_train`); raises when
+    the parameter's ``.grad`` is no longer that buffer."""
+    return _bound_grad(param)
 
 
 def _bound_grad(weight: torch.Tensor) -> Optional[torch.Tensor]:

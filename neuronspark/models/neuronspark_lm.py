@@ -286,7 +286,7 @@ class NeuronSparkModel(nn.Module):
                         # autograd runs the ready node created last first, so the backward then writes the lexical
                         # tables' gradients right after this layer's backward, not after the layers below it (which
                         # leaves data-parallel training their reduction to hide behind those layers' backward)
-                        lex = self.lexical_memory(ids)                       # (T, B, 160) fp32
+                        lex = self.lexical_memory(ids, ops=_ops.namespace(self.impl))   # (T, B, 160) fp32
                         ind = induction_token_windows(ids, cfg.hippocampal_induction_bias_orders,
                                                       pad=int(cfg.vocab_size))
                         copy = copy_stats_whole_row(lex, tuple(cfg.lexical_order1_slice))

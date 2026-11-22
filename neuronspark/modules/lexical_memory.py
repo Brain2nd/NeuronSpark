@@ -25,7 +25,8 @@ Inference (:meth:`LexicalMemory.session_vector`): the cache keeps the last ``n_m
 ``cat([window, ids])`` and keeps the last T rows, so every bucket is the integer the whole row computes at that position
 (the same keys, the same integer arithmetic); the window then holds the last ``n_max - 1`` ids.
 
-No gradient flows through the indices; the tables receive dense fp32 gradients through ``m``.
+No gradient flows through the indices; the tables receive their fp32 gradients through ``m`` (whole row: dense, or
+added into a buffer bound with :func:`neuronspark.ops.linear.bind_grad_`, :mod:`neuronspark.ops.triton.lex_train`).
 """
 from __future__ import annotations
 
@@ -186,10 +187,17 @@ class LexicalMemory(nn.Module):
         return torch.cat([p.float() for p in parts], dim=-1) * self.scale
 
     # ------------------------------------------------------------------------------------------------ regimes
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Whole row: ``token_ids`` (B, T) -> ``m`` (T, B, M) fp32 (row start padded)."""
+    def forward(self, token_ids: torch.Tensor, ops=None) -> torch.Tensor:
+        """Whole row: ``token_ids`` (B, T) -> ``m`` (T, B, M) fp32 (row start padded).  ``ops``: the operator namespace
+        of the model (:func:`neuronspark.ops.namespace`; None = the kernels on CUDA), whose ``lexical_train`` hashes and
+        gathers every table in one kernel and sums the tables' gradients in one sort and one kernel (the same integers,
+        gathers and products); without ``ops`` on the CPU, the torch chain of :meth:`buckets` and :meth:`lookup`."""
         if token_ids.dim() != 2:
             raise ValueError(f"LexicalMemory: expected (B, T) token ids, got {tuple(token_ids.shape)}")
+        if ops is not None or token_ids.is_cuda:
+            o = namespace("kernel") if ops is None else ops
+            return o.lexical_train(token_ids.to(torch.int64), list(self.tables), [n for n, _, _ in self.spec],
+                                   self.hash_mult, self.hash_add, self.hash_wrap, self.vocab_size, self.scale)
         ids = token_ids.transpose(0, 1)                                    # (T, B)
         return self.lookup(self.buckets(ids))
 

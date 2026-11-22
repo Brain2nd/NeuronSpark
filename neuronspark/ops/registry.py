@@ -8,9 +8,9 @@ given for the default configuration.  Modules do not import kernels directly: th
 
 Regimes: ``train`` = whole-row forward (+ backward), ``prefill`` = inference call with T >= 2, ``decode`` = inference
 call with T == 1.  ``mutates`` names the arguments an op writes in place (declared to ``torch.library`` by the
-implementing module).  Pure-torch computations of the modules (lexical hash and lookup, induction matches, copy
-statistics, decay, pool constants, novelty, PKM softmax, the decode-time torch forms) have no entry: the module code
-is their own reference.
+implementing module).  Pure-torch computations of the modules (the lexical hash and lookup of a prefill call,
+induction matches, copy statistics, decay, pool constants, novelty, PKM softmax, the decode-time torch forms) have no
+entry: the module code is their own reference.
 
 The registered callables are plain Python functions (the public function of each family, which applies the family's
 autograd Function or calls its ``torch.library`` custom ops), so :func:`check_signature` can read their parameter lists.
@@ -151,6 +151,12 @@ _SPECS: List[OpSpec] = [
         "(T, B, 1536) fp32 h + alpha * o in h's layout; backward: every tensor argument", "train",
         doc="h (T, B, 1536) fp32, q_raw / k_raw (T, B, 64) bf16, o (T, B, 1536) bf16, q_gain / k_gain (64,) fp32, "
             "beta (1,) fp32, eps = 1e-6"),
+    # ---------------------------------------------------------------------------------------------- lexical memory (train)
+    _op("lexical_train", _T + "lex_train", "ids tables orders hash_mult hash_add hash_wrap vocab_size scale",
+        "(T, B, 160) fp32 lexical vectors of the whole row; backward: the tables (dense fp32, or added into a buffer "
+        "bound with bind_grad_)", "train",
+        doc="ids (B, T) int64, tables 5 x (rows, d) fp32, orders (1, 2, 2, 3, 3), hash_mult / hash_add / hash_wrap "
+            "(4,) int64, vocab_size 151669, scale 50.0"),
     # ---------------------------------------------------------------------------------------------- cumulative sums
     _op("cumsum0", _T + "cumsum", "x",
         "inclusive cumsum over dim 0, fp32", "train",

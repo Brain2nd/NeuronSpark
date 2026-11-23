@@ -1,0 +1,47 @@
+{
+  "name": "neuronspark-pool-read",
+  "id": "_neuronspark_pool_read_cuda_fe59ef632f032694",
+  "version": 1,
+  "kernels-minver": "0.14.0",
+  "license": "cc-by-nc-sa-4.0",
+  "python-depends": [],
+  "kernel-depends": [],
+  "backend": {
+    "type": "cuda",
+    "archs": [
+      "10.0"
+    ]
+  },
+  "digest": {
+    "algorithm": "sha256",
+    "files": {
+      "LICENSE.txt": "E0mkthSEkrRPYp5k7tZ2YS4jT+moOeTzsnfBSCyISfE=",
+      "__init__.py": "/istGQ/b0gm6Om3nuCGt0bmywhCCZ+wr/ONDAp9lfNs=",
+      "_ops.py": "ooYn3qGiuEjI/OHtMbpKqrGFFe92DGDkfWMyPcPcMng=",
+      "_solution/__init__.py": "wprR/QOX02O1yv/Q4w1cu1KZ94YTnK98DeFQKE4cYAg=",
+      "_solution/kernel.py": "QgFo/mrkLC7FEWr22m3tLmFq7cjHTer6T7DlocHBPLs=",
+      "_solution/manifest.json": "9cVhZl6GgQijzMcnpLZ0/F6Tqq5AtnTV4E+7xVnu0SM=",
+      "_solution/neuronspark/__init__.py": "WOAQE276SDYg1Zo+QDeHGijlJZTgNAHGJKiq9xq1F/E=",
+      "_solution/neuronspark/modules/__init__.py": "KiBPRg3/HiOpecvVtMVAk+Rgbl2szCD1/249oVlbNoU=",
+      "_solution/neuronspark/modules/induction.py": "IULzzIGNPX2A+je2U4u+HaD/YIqzOldM3ynMvBVzsz4=",
+      "_solution/neuronspark/ops/__init__.py": "Q1SUPelfoZOuaHiekMPDI5o3ofrTOkvEwv0JBwkvcII=",
+      "_solution/neuronspark/ops/gluon/__init__.py": "EUhdP+15lXeMWJPJHb2fKblIOp7EWt60dIEqsj/ciw8=",
+      "_solution/neuronspark/ops/gluon/_ptx.py": "ack9EY1+MHSN48VnlELq7O1Tzw0VPTm0UAM5m74IM7E=",
+      "_solution/neuronspark/ops/gluon/pool_read_bwd.py": "ExpDhbv2Z+1fVvXzqZsqRQRx3EdEqGTcGuGKTvy6xjw=",
+      "_solution/neuronspark/ops/gluon/pool_read_fwd.py": "VPA4tPeup9zviHzCmwCQgRU3Go7sKLtU5jKrlsIl/6Q=",
+      "_solution/neuronspark/ops/gluon/pool_read_tile.py": "GHBvOOjoAXHet2h56grQTJF1jwQyw06zmVwYzx81sC0=",
+      "_solution/neuronspark/ops/pool_read.py": "+ZpZshXgDT0e5nn6IZMzhLr67gcwuxfwksiS+6G4OQ4=",
+      "_solution/neuronspark/ops/triton/__init__.py": "DDoMNs9TnypF2Ma4nJol+vXrfd5+kh8HFa1Hkmq1whc=",
+      "_solution/neuronspark/utils/__init__.py": "NiC3BpOvCXkVEGFV5S94i8KBFonEtMxVuy5ip4DcSB8=",
+      "_solution/neuronspark/utils/cache.py": "EXArEzSPw3M2q+cU2/YWNwKx3wEGpjw4RSj8qg98Sik=",
+      "_solution/third_party_notices.py": "AGB+ScsNG49+d9n6gW7/T42xRywh0Rhz7yGQEJgPCGo="
+    }
+  },
+  "provenance": {
+    "kernel-builder": {
+      "version": "0.18.3",
+      "commit": "ba5ac4a8be6f041ba906534326eb36b76642716b",
+      "dirty": false
+    }
+  }
+}

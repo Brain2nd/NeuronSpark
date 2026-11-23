@@ -1,0 +1,784 @@
+{
+  "operator": "pool_attend",
+  "run": "neuronspark.ops.pool_attend:pool_attend",
+  "ref": "neuronspark.ops.pool_attend:pool_attend_ref",
+  "kernel_name": "neuronspark-pool-attend",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "93d2f380531b05cedf5fb5d199cd636b771669b4",
+    "branch": "b200",
+    "dirty": false
+  },
+  "sources_sha256": "d5815263028c4c57a6b4223716092920342525a89f4b3661402f51dc7a170c8f",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "79f1fb9b15f2ff839382ac4b453e28e20e2a51dcab7dadd055a5d5c177e082a4",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/_namespace.py",
+      "sha256": "3a8da18c74a9c5271d6b427b45d4235117aa8f14a7a10f80c2507fd241d63722",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the torch.library namespace of the copy"
+      ]
+    },
+    {
+      "path": "neuronspark/modules/__init__.py",
+      "sha256": "2a204f460dff1e23a979cbd5b4c54093e4606e5daccc20f5ff6e3da1595b3685",
+      "source_sha256": "9a55989d335053f5aba8080d5a497390bffe8d3e393d2e9a9ecaf3f8279a3d9e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/modules/induction.py",
+      "sha256": "1bfffb2fcf9b20426f4ceb46611cdb749c23d9df6b16cac082cf5cd5d868ceb0",
+      "source_sha256": "1bfffb2fcf9b20426f4ceb46611cdb749c23d9df6b16cac082cf5cd5d868ceb0",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/modules/rope.py",
+      "sha256": "9b7801637bf317e5b36be88538b4e23b84b8ca6e8f20ddd8701721b424b52725",
+      "source_sha256": "9b7801637bf317e5b36be88538b4e23b84b8ca6e8f20ddd8701721b424b52725",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "7e7fa936254881278e1a139904f446539404eb08baff2f237068d987b9fa6582",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/dendritic_combined.py",
+      "sha256": "92b1c7ffd201bf55acaf815897d60778a97d2029edb48d96063de180c3c3afd8",
+      "source_sha256": "eb74abdfa3058d193f423ea16aa08e177bfe0f27ee7f66c28ddd2012df8d9d5b",
+      "unchanged": false,
+      "changes": [
+        "line 90: operator neuronspark::dendritic_chunk_scan_soma_fwd registered in the package's namespace",
+        "line 142: operator neuronspark::dendritic_chunk_scan_soma_bwd registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 49: the import is written on one line and 1 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/dendritic_prefill.py",
+      "sha256": "692d62ece0a72921d2d68b99a03dc59966496c2f576383a9e63e51bd2c818ec5",
+      "source_sha256": "a817afa390692cfcdefbd54055b6a16bd825630f4ca3cbbf3fae49bbdd09d56d",
+      "unchanged": false,
+      "changes": [
+        "line 157: operator neuronspark::dendritic_chunk_scan_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/gluon/__init__.py",
+      "sha256": "11485d3fed7995778c5893c91dbd9f29b9483a9ec45adeb474812ab23fdc8b0f",
+      "source_sha256": "d9b7c577ef532ad30f10e0397520c594dd6f1d21f43dfe59e820e8fb75642ac1",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/gluon/_ptx.py",
+      "sha256": "69c93d118d7e30748de3c5679442eaeced53cf0d153d39b45003399bbe0833b1",
+      "source_sha256": "69c93d118d7e30748de3c5679442eaeced53cf0d153d39b45003399bbe0833b1",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/dendritic_chunk_scan_dx.py",
+      "sha256": "e72b26ecb54d66f38b0f7f7ec56723914a0e4c1101fbc94d9207753695591445",
+      "source_sha256": "e72b26ecb54d66f38b0f7f7ec56723914a0e4c1101fbc94d9207753695591445",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/dendritic_chunk_scan_fwd.py",
+      "sha256": "1858a4c17f6b817ccd59b3e21d94f72e88cd875a52e17869d85374a5e6f1c537",
+      "source_sha256": "1858a4c17f6b817ccd59b3e21d94f72e88cd875a52e17869d85374a5e6f1c537",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/dendritic_chunk_states.py",
+      "sha256": "af5622aafb0d947b8a7da8b83d2de09eeaafc4c036f0bcea80cec73bd31474fe",
+      "source_sha256": "af5622aafb0d947b8a7da8b83d2de09eeaafc4c036f0bcea80cec73bd31474fe",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/dendritic_dda.py",
+      "sha256": "f1e9c4337cf9befc5a885b93d67dadebe994712f6593e50ec2a21730aa8f984a",
+      "source_sha256": "f1e9c4337cf9befc5a885b93d67dadebe994712f6593e50ec2a21730aa8f984a",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/dendritic_dstates.py",
+      "sha256": "56c9d2ce847f843675585d8e80a0eb5b13fc5dd604b11515b738f69c87ba00a7",
+      "source_sha256": "56c9d2ce847f843675585d8e80a0eb5b13fc5dd604b11515b738f69c87ba00a7",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/plif_k1_bwd.py",
+      "sha256": "cce67e4d862715cce7d3e38495809e87ff18fcc9121230a887295be5eb3a3f45",
+      "source_sha256": "3c15d913b4742eb3fbd464dc55ada5915551eb799145a3ba226f145fb7c5516b",
+      "unchanged": false,
+      "changes": [
+        "line 107: operator neuronspark::plif_k1_bwd registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 34: the import is written on one line and 7 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/gluon/pool_read_bwd.py",
+      "sha256": "57e16542df54c1a5d9186391b457e00172ea6fe7132344c20a49d9829e455d44",
+      "source_sha256": "57e16542df54c1a5d9186391b457e00172ea6fe7132344c20a49d9829e455d44",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/pool_read_fwd.py",
+      "sha256": "c5764b834c20cfbb692457e2a4ccaa0a436905a0290f35d144d74de62dcc1a04",
+      "source_sha256": "c5764b834c20cfbb692457e2a4ccaa0a436905a0290f35d144d74de62dcc1a04",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/pool_read_tile.py",
+      "sha256": "18706f38e8e80171deb76879ea0ad04c91758f0432c34eb3995c18cf1f35b02d",
+      "source_sha256": "18706f38e8e80171deb76879ea0ad04c91758f0432c34eb3995c18cf1f35b02d",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/linear.py",
+      "sha256": "bd44c5a362116ef8e6e45a1b3062cc384816119d145b9e2da04f51b4a799834c",
+      "source_sha256": "bd44c5a362116ef8e6e45a1b3062cc384816119d145b9e2da04f51b4a799834c",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/pool_attend.py",
+      "sha256": "d4da833f4e418c1eacc39de2d1a1c8f13cc352f14bff14ffdeaf370771f29736",
+      "source_sha256": "1b75744e1914658c68ac21f3dd785373945fc1198069849c84bcf66e8059b749",
+      "unchanged": false,
+      "changes": [
+        "line 45: the import is written on one line and 10 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/pool_read.py",
+      "sha256": "76b7db7c994854d3a326ba51dbcb140614b24a2d0974c321e6fe462d177c4b58",
+      "source_sha256": "76b7db7c994854d3a326ba51dbcb140614b24a2d0974c321e6fe462d177c4b58",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/registry.py",
+      "sha256": "cb9dd549fcd2533b730af1c8e01d48db7d6ff4741aebe33cd39cc95ac6b9f114",
+      "source_sha256": "4a42df591f978f66686dd114d3c2cfe7caee9403b658ce57f0b221c3e4f0270a",
+      "unchanged": false,
+      "changes": [
+        "_load: importlib.import_module -> a static table of 81 operators"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "02bcbf803865449f259a907098a1ed4c16a69a698fdabd889b5d00ddeeacec71",
+      "source_sha256": "9006675f6755f62c22b3fee4426786c0f6d035acf6b67557f90a44372b1e3ea7",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: num_sms, require_cuda, require_no_grad, require_sm100"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/_ptx.py",
+      "sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "source_sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/attn_out_step.py",
+      "sha256": "5fd54b8abb203ddb991bba0a254367df3e12f2a92d1b2bdc3656f90dc4f013e7",
+      "source_sha256": "5112480939aec11481f5d6baf5e7dd4b98204b48909d0a26a2fe5dd794df5e7e",
+      "unchanged": false,
+      "changes": [
+        "line 98: operator neuronspark::attn_out_step registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 25: the import is written on one line and 4 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/balance_add.py",
+      "sha256": "ca3bc64c5fc5fa5fa2f6d498ad6dbb35e47df371c6b752765540bfd095c5ece2",
+      "source_sha256": "23f36d7a21df9bf28e88de9dbf32f166314ac18130ec58bdfd7f2c7fa9856d36",
+      "unchanged": false,
+      "changes": [
+        "line 89: operator neuronspark::balance_add registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/balance_stack_ce.py",
+      "sha256": "1c16ee5933d9008144222017a39e5ae6eabf340b640b63d27d17fc4b3118323d",
+      "source_sha256": "1c16ee5933d9008144222017a39e5ae6eabf340b640b63d27d17fc4b3118323d",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/copy_gate.py",
+      "sha256": "57f15e24ea8193a2471cf187235602a2ac70618541e8983ccf60d8c7ea44e5b0",
+      "source_sha256": "ba969fb523a8bcd57e9b941691670c9937bc5828894d3c2d4ba31b77243f5efe",
+      "unchanged": false,
+      "changes": [
+        "line 94: operator neuronspark::copy_gate_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/copy_stats.py",
+      "sha256": "5f623b4b60b75d414fe5322c84655096dd5e7a15acb19a1f5fefb50c4b0bfb26",
+      "source_sha256": "4515a791f6720e88805bcc81cea744d02e64613297e6bc8457dfa2bb8af4a9bc",
+      "unchanged": false,
+      "changes": [
+        "line 150: operator neuronspark::copy_stats_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/copy_step.py",
+      "sha256": "999c50f6800250b48be88fbd6965adf84ae7d0415a97339e996e282b280463dc",
+      "source_sha256": "d2c5169232e6d420d5323a4555b833ff364bd35d9d3cb0d56d92f05339322e66",
+      "unchanged": false,
+      "changes": [
+        "line 124: operator neuronspark::copy_stats_step registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/copy_switch.py",
+      "sha256": "51b81f338e8c9cb66419e57efa63bf7fdaadee8dce6f999cb2c9777e190ba5a9",
+      "source_sha256": "df2eeb22938e3807377526fad67dc1910399ad7c8618c4f9d1d4dffe3444d668",
+      "unchanged": false,
+      "changes": [
+        "line 175: operator neuronspark::copy_switch_labels registered in the package's namespace",
+        "line 186: operator neuronspark::copy_switch_fwd registered in the package's namespace",
+        "line 205: operator neuronspark::copy_switch_bwd registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/cumsum.py",
+      "sha256": "b38f2c2a7ae67b2fa6756ba3f8f1145e559d330578e40ef0d49f910b6d1f8cc3",
+      "source_sha256": "c678a26d9bea89796cf2b22d011642389c62034c989b42e5727db637930646b5",
+      "unchanged": false,
+      "changes": [
+        "line 713: operator neuronspark::cumsum0 registered in the package's namespace",
+        "line 842: operator neuronspark::centred_running registered in the package's namespace",
+        "line 49: the import is written on one line and 7 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_chunk.py",
+      "sha256": "6d9522477e1d13d38207e32204aa75c5cd2820a12d281be55852b955882baa99",
+      "source_sha256": "6d9522477e1d13d38207e32204aa75c5cd2820a12d281be55852b955882baa99",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_conv.py",
+      "sha256": "41326861ce30dbc40d7a1f842a72839e85c800a9432d4635e49685739f266974",
+      "source_sha256": "19daef6c1ac18779ac6f337b9646f39bb83273f6ea2f0bd0cfcf154e75434619",
+      "unchanged": false,
+      "changes": [
+        "line 548: operator neuronspark::dendritic_conv_silu_fwd registered in the package's namespace",
+        "line 561: operator neuronspark::dendritic_conv_silu_bwd registered in the package's namespace",
+        "line 585: operator neuronspark::dendritic_conv_silu_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_gated_norm.py",
+      "sha256": "79a678776e0d110010ef573c97f31df1ef8a06997bc8a332e259d00c0d8e4582",
+      "source_sha256": "0b4e886041149eab226e740c741477756c57c6b35ab8ea138559b24cd5f35e46",
+      "unchanged": false,
+      "changes": [
+        "line 235: operator neuronspark::dendritic_gated_norm_soma registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_glue.py",
+      "sha256": "207ec970055ea445a2b5d06e7f883f3d0dc64767d470572ab0b4c07649111667",
+      "source_sha256": "207ec970055ea445a2b5d06e7f883f3d0dc64767d470572ab0b4c07649111667",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_prenorm.py",
+      "sha256": "174cac8e3653eb570843aa13102633d4d10594641a69c25db2870d81f52832c5",
+      "source_sha256": "d83a3dbf8be6b44e49faef7308dcb54ce675af07c2988e530744bae7f1ebb871",
+      "unchanged": false,
+      "changes": [
+        "line 334: operator neuronspark::dendritic_norm_fwd registered in the package's namespace",
+        "line 354: operator neuronspark::dendritic_norm_bwd registered in the package's namespace",
+        "line 376: operator neuronspark::dendritic_resid_norm_fwd registered in the package's namespace",
+        "line 399: operator neuronspark::dendritic_resid_norm_bwd registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_residual.py",
+      "sha256": "cc40e6833a273222e35ee6659679139b81c37f7e2f7aa7c8e880d7fddf5e8de3",
+      "source_sha256": "8d724f3566bdb9a69e840e2ce55ac404234c43c61352a5700d9f2c674d81de21",
+      "unchanged": false,
+      "changes": [
+        "line 68: operator neuronspark::dendritic_res_add registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_scan.py",
+      "sha256": "00c17de1f14adaa51db4fab29550916b6c00b6bbf51a61cb9d5a09bd1de370dd",
+      "source_sha256": "00c17de1f14adaa51db4fab29550916b6c00b6bbf51a61cb9d5a09bd1de370dd",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_soma.py",
+      "sha256": "6862ea2c11635ce42c92ea767d82346f08ef329a3717fa52d4c163c479098f4c",
+      "source_sha256": "6862ea2c11635ce42c92ea767d82346f08ef329a3717fa52d4c163c479098f4c",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_states.py",
+      "sha256": "8bbaa8b488dfc4b159d9657b90ce96520e5a6f12e34fb1ffe98adcb13c9fc28d",
+      "source_sha256": "8bbaa8b488dfc4b159d9657b90ce96520e5a6f12e34fb1ffe98adcb13c9fc28d",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_step.py",
+      "sha256": "f869f08bc3ba8e3c35dd520fe5eeb3f696deae598db47c851f76bef159bf07bf",
+      "source_sha256": "ccf8e9a048b87dfc084040f7cdaa775a394bf2b426db3e8984edcadf7afd23be",
+      "unchanged": false,
+      "changes": [
+        "line 589: operator neuronspark::dendritic_prenorm_rows registered in the package's namespace",
+        "line 602: operator neuronspark::dendritic_step_core registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 82: the import is written on one line and 8 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/hippo_norms.py",
+      "sha256": "b939b470a38c043052305c3caac1d87bf392f05656d9c2076b5086ac1d178a78",
+      "source_sha256": "53627bd6f73128d525797cda1f19f58f186308b9928f1bffddfdcdeac83aaf7f",
+      "unchanged": false,
+      "changes": [
+        "line 443: operator neuronspark::hippo_rownorm_fwd registered in the package's namespace",
+        "line 467: operator neuronspark::hippo_rownorm_bwd registered in the package's namespace",
+        "line 593: operator neuronspark::hippo_outnorm_gate_fwd registered in the package's namespace",
+        "line 622: operator neuronspark::hippo_outnorm_gate_bwd registered in the package's namespace",
+        "line 703: operator neuronspark::hippo_rmsnorm_rows registered in the package's namespace",
+        "line 750: operator neuronspark::hippo_rmsnorm_gate_rows registered in the package's namespace",
+        "line 56: the import is written on one line and 14 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/hippo_residual.py",
+      "sha256": "0997106c8e03b9ec3227e7b8fc975265a32aa7c4cba64fa282f218d3b61c4afd",
+      "source_sha256": "4e19e316486bc7e3060a8756ab106e5657f6d748dff00f817e4f267f81720b7c",
+      "unchanged": false,
+      "changes": [
+        "line 457: operator neuronspark::hippo_read_gain_fwd registered in the package's namespace",
+        "line 482: operator neuronspark::hippo_read_gain_bwd registered in the package's namespace",
+        "line 553: operator neuronspark::hippo_pkm_tail_fwd registered in the package's namespace",
+        "line 583: operator neuronspark::hippo_pkm_tail_bwd registered in the package's namespace",
+        "line 53: the import is written on one line and 21 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/hippo_rope.py",
+      "sha256": "8900b6a43d164e3265391f6c91d3dbc1e920e9917a80c83fb0159a7947a42722",
+      "source_sha256": "7c1599c5759d12bd2a1e22285924e1832e2e41e1dda615dc1a29113a1848406f",
+      "unchanged": false,
+      "changes": [
+        "line 210: operator neuronspark::hippo_silu_rope_fwd registered in the package's namespace",
+        "line 236: operator neuronspark::hippo_silu_rope_bwd registered in the package's namespace",
+        "line 293: operator neuronspark::hippo_rope_interleaved registered in the package's namespace",
+        "line 41: the import is written on one line and 11 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/hippo_step.py",
+      "sha256": "1472d8f7cd8619460cd7dfb8a7751498a70e27cca0143647676cf8f041de140e",
+      "source_sha256": "d74edc7ea2d086eddc2220a28a83075cfa3eb492faa1877b825a429d3d21b493",
+      "unchanged": false,
+      "changes": [
+        "line 173: operator neuronspark::read_gain_step registered in the package's namespace",
+        "line 190: operator neuronspark::pkm_tail_step registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 33: the import is written on one line and 4 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/induction_prefill.py",
+      "sha256": "467bca9a2e91a9ec19a52e78c1b16b7a98ce5dc25952b44af4f0c91f0807aa89",
+      "source_sha256": "f495df6f4830202b5c323641b28caa217467f61f8f765eead4224fb12ab7df56",
+      "unchanged": false,
+      "changes": [
+        "line 89: operator neuronspark::induction_match_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/induction_step.py",
+      "sha256": "ef2c3736d2f6d582998a74c6c14815b765639f4bcc7ec8739733563c37443c93",
+      "source_sha256": "20e03349ffac50acb8a851c5d45d4bd9c388f36ca617f5efc6292cb7b91727ac",
+      "unchanged": false,
+      "changes": [
+        "line 86: operator neuronspark::induction_step registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/lex_read.py",
+      "sha256": "69f6ce2d1b66029e41c61b09a8aa15d4c91c74766c823762917b81f7ba762d38",
+      "source_sha256": "e308a4a87c47017ce9dd72c684e97ba6ea1d18d63d02a9c8f324662c85f7cc57",
+      "unchanged": false,
+      "changes": [
+        "line 107: operator neuronspark::lex_read_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/lex_read_step.py",
+      "sha256": "2312b9b82bd3c44cb126d7b8c979461e0c501d8cc82a772c6b3d9c32cb995e07",
+      "source_sha256": "5baa0c594996ba479dfe2264b72a189204cac9c09b6bad02be7d9d9e6f702d1e",
+      "unchanged": false,
+      "changes": [
+        "line 105: operator neuronspark::lex_read_step registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 30: the import is written on one line and 4 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/lex_read_train.py",
+      "sha256": "062d0b6b3c18da2996702c6dfd87eb58daabb9f860205959e9172aa5774a7313",
+      "source_sha256": "29c95eba022dd942ef1a28d1b2db5ddfac45afc681740fa3394e7d25dc234212",
+      "unchanged": false,
+      "changes": [
+        "line 154: operator neuronspark::lex_read_train_fwd registered in the package's namespace",
+        "line 178: operator neuronspark::lex_read_train_bwd registered in the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/lex_step.py",
+      "sha256": "520b81e841983a735885c87f662051431fd1bcfc53b2abf5397c7c410dc3ea89",
+      "source_sha256": "28bd069d90ae32cbfd4252a0067e387724e5d76753bfc48f64ebc4a876335633",
+      "unchanged": false,
+      "changes": [
+        "line 103: operator neuronspark::lexical_step registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/lex_train.py",
+      "sha256": "95b5e094adf6c0d497bf8f8d6f103876a050db6a4468f87211b2393e46f62f22",
+      "source_sha256": "fd59e0c473181474319084438a2274b2d05e5d0ac0b74702abb8a28d371007ac",
+      "unchanged": false,
+      "changes": [
+        "line 223: operator neuronspark::lexical_train_fwd registered in the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/linear_row.py",
+      "sha256": "e14e32b31856b1f686f1564a309f0b03063dc0436cfd6aba3ea36a956d7d3c69",
+      "source_sha256": "e14e32b31856b1f686f1564a309f0b03063dc0436cfd6aba3ea36a956d7d3c69",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/linear_small_n.py",
+      "sha256": "bc2d4d807ceafcd36413356290c7365ebfe937e3368c711eb67295c29f14de59",
+      "source_sha256": "bc2d4d807ceafcd36413356290c7365ebfe937e3368c711eb67295c29f14de59",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/lm_tail.py",
+      "sha256": "204a5742af6a5811e37df830f1ea4a4fd652a28a6aa195dcef3345b04ec9a8d1",
+      "source_sha256": "cdd1e6613acb8c9c20ef2de9f66006a894ba4624e73fc092d1a2d86f392d86b9",
+      "unchanged": false,
+      "changes": [
+        "line 71: operator neuronspark::balance_ce_fwd registered in the package's namespace",
+        "line 84: operator neuronspark::balance_ce_bwd registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/novelty_gain.py",
+      "sha256": "2c209c0992341e8691f17b581a65b592b92ec0910011cf71274b75996c677cc8",
+      "source_sha256": "c6c8430843c9ea57b8de935a9a2cfd3fd95f61b484202f70354cb4eb29d34c0c",
+      "unchanged": false,
+      "changes": [
+        "line 123: operator neuronspark::novelty_read_gain_fwd registered in the package's namespace",
+        "line 144: operator neuronspark::novelty_read_gain_bwd registered in the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/pkm_gate.py",
+      "sha256": "ef37362d78ad7ec53c3ad18f69260e95ecbe75deab6a041b6766fd33867f88fe",
+      "source_sha256": "cfb6549cdd3a067e7163e09000f9cd7e09b20822b4dc22cd9d0f7c3158f8555f",
+      "unchanged": false,
+      "changes": [
+        "line 101: operator neuronspark::pkm_norm_gate_fwd registered in the package's namespace",
+        "line 121: operator neuronspark::pkm_norm_gate_bwd registered in the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/pkm_query.py",
+      "sha256": "427fac7fe49d53d27094d4bae2a51f2fde260e5cd110e47bb78eadb0d0658125",
+      "source_sha256": "2ab8e9c52db789d1069ab0aafc76fb6629f825db489a5f6e2bf60c5ed59d601f",
+      "unchanged": false,
+      "changes": [
+        "line 142: operator neuronspark::pkm_unit_queries_fwd registered in the package's namespace",
+        "line 160: operator neuronspark::pkm_unit_queries_bwd registered in the package's namespace",
+        "line 220: operator neuronspark::pkm_gained_keys_fwd registered in the package's namespace",
+        "line 234: operator neuronspark::pkm_gained_keys_bwd registered in the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/pkm_read.py",
+      "sha256": "e494f9a6393996fd4fee91e4d39b88f1c06f5302e9648c19b85cfacc0411964c",
+      "source_sha256": "bda7fcfaef46e99634008b75a07b8d3c5d54901866a2ad331c2204c3d74f1175",
+      "unchanged": false,
+      "changes": [
+        "line 129: operator neuronspark::pkm_read_fwd registered in the package's namespace",
+        "line 139: operator neuronspark::pkm_read_bwd registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/pkm_step.py",
+      "sha256": "cb8dae380a1f88b1c09a5e9f2bb6475a7d0a01d741d4bbf42aef2c2e753f28b3",
+      "source_sha256": "3f9b13d3fc969926e736381d7b1695cc5661c41d9e2d0654f992cbfdacea467f",
+      "unchanged": false,
+      "changes": [
+        "line 117: operator neuronspark::pkm_scores_step registered in the package's namespace",
+        "line 127: operator neuronspark::pkm_value_step registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/pkm_topk.py",
+      "sha256": "2ee76c6ce9e84b524f913f5833958a78459a2b8166ac1c80c57239c760623173",
+      "source_sha256": "c4575d136190a69423582fd7e99680bf06ec2ebf59836b3c1c5db74c9b945d5f",
+      "unchanged": false,
+      "changes": [
+        "line 162: operator neuronspark::pkm_topk_train_fwd registered in the package's namespace",
+        "line 174: operator neuronspark::pkm_topk_train_bwd registered in the package's namespace",
+        "line 240: operator neuronspark::pkm_topk_softmax_t1 registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/plif.py",
+      "sha256": "6198767b6aee7dcfdc07b81fd539c46cb86adfb1f4d4d83b3b6e7d35d82fdece",
+      "source_sha256": "e1b7eaadd2d2004b15f2e0cce1996d86f82b9fc027d7871ffb2c43c4abd4234b",
+      "unchanged": false,
+      "changes": [
+        "line 304: operator neuronspark::plif_k1x_scan registered in the package's namespace",
+        "line 413: operator neuronspark::plif_centre_fwd registered in the package's namespace",
+        "line 423: operator neuronspark::plif_centre_bwd registered in the package's namespace",
+        "line 501: operator neuronspark::plif_gate_prefill registered in the package's namespace",
+        "line 579: operator neuronspark::plif_scan_prefill registered in the package's namespace",
+        "line 606: operator neuronspark::plif_prefill_pair registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 63: the import is written on one line and 15 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/plif_step.py",
+      "sha256": "71f292797d7796335468022ca373c7bcf7b6c72ee20e6e586d61c4853a3660f8",
+      "source_sha256": "f8128996bc8f98a0c6468a7e1517c5f56b65c2c5310c8c5e690b27be7568e09b",
+      "unchanged": false,
+      "changes": [
+        "line 252: operator neuronspark::plif_step registered in the package's namespace",
+        "line 264: operator neuronspark::centred_step registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 45: the import is written on one line and 5 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/pool_clock.py",
+      "sha256": "a3660f14bb19dc87831574bf8fff3994d0f1927acf7f57384b413e88adb883db",
+      "source_sha256": "a3660f14bb19dc87831574bf8fff3994d0f1927acf7f57384b413e88adb883db",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/pool_clock_prefill.py",
+      "sha256": "1fc80c3d16603d4d01a79ec0ee39dfd957c2db83f4e51e6e49ea8273ddee7ea1",
+      "source_sha256": "4790b6315b60be2bb0b60ec8a3542b8a9c89a0a8cc8d583c64e84250eefda0dc",
+      "unchanged": false,
+      "changes": [
+        "line 221: operator neuronspark::pool_clock_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/pool_pack.py",
+      "sha256": "6cd3665620d1f2db0f35d5bf87f4fd3be0fb71ff1c9297e5f687524465916be2",
+      "source_sha256": "6cd3665620d1f2db0f35d5bf87f4fd3be0fb71ff1c9297e5f687524465916be2",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/pool_ring.py",
+      "sha256": "f5fa186222e449782231c295180d9577ebd23ad60f67858ad877cbb4c11fa179",
+      "source_sha256": "7c649d0c1af0c161be9504cbe583b5a950fadb4f361b5c3ec414cec07ab510df",
+      "unchanged": false,
+      "changes": [
+        "line 357: operator neuronspark::ring_t1_partials2 registered in the package's namespace",
+        "line 619: operator neuronspark::xq_form_t1 registered in the package's namespace",
+        "line 792: operator neuronspark::ring_write_prefill registered in the package's namespace",
+        "line 1306: operator neuronspark::ring_recall_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 79: the import is written on one line and 2 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/ring_step.py",
+      "sha256": "4a4f1d20b573aac5373e531d831d83868e2af6d221daeb467ebccda493223d14",
+      "source_sha256": "fe649d4797ba9208abde7e0d8ed543ec60ea79c72ba81c469f77f170ce3ef2bf",
+      "unchanged": false,
+      "changes": [
+        "line 275: operator neuronspark::ring_write_step registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 42: the import is written on one line and 5 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/shared_operand.py",
+      "sha256": "4f4106125460cea53a28fa2845c54620a26730af82351bc225d1d7dd334c4d35",
+      "source_sha256": "4f4106125460cea53a28fa2845c54620a26730af82351bc225d1d7dd334c4d35",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/short_conv.py",
+      "sha256": "c688b4d59245bf729ccf8a868a0ec5384b1ca52e674e0df0ab73e98a4a69cefd",
+      "source_sha256": "c44233e6fcaf85a9908d10e0e00c6c85aaaa0b1a10473ab73465f20663e76b83",
+      "unchanged": false,
+      "changes": [
+        "line 232: operator neuronspark::short_conv_fwd registered in the package's namespace",
+        "line 252: operator neuronspark::short_conv_bwd registered in the package's namespace",
+        "line 343: operator neuronspark::short_conv_silu_prefill registered in the package's namespace",
+        "line 39: the import is written on one line and 4 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/tp_bulk.py",
+      "sha256": "a5a548b8e8b8261135f6abcb27ce79894fa89bf4cf57d8f26e0c50e715ca5e5f",
+      "source_sha256": "a5a548b8e8b8261135f6abcb27ce79894fa89bf4cf57d8f26e0c50e715ca5e5f",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/tp_dendritic.py",
+      "sha256": "481f0ad9200473cf065ab5eaa1026c92e31c12b58571cde9d33de95f2ba1f80c",
+      "source_sha256": "a94674d4564272507762e772b631c65bbcad55d22b0e374b0ee09de05f500d26",
+      "unchanged": false,
+      "changes": [
+        "line 40: the import is written on one line and 1 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/tp_exchange.py",
+      "sha256": "2be92b4bc1e641c1b1b62363627d447d29c1d9843f01548d0685e435d0d6422f",
+      "source_sha256": "2be92b4bc1e641c1b1b62363627d447d29c1d9843f01548d0685e435d0d6422f",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/vr_mix.py",
+      "sha256": "aa8aeb87a8f03f8e16355d434ef63d9bebea9354696882512f0ec677370bbf5d",
+      "source_sha256": "64039fd4a9c0019fb2264cf6cf2289ed008a8bea013c028bac28670ae8237474",
+      "unchanged": false,
+      "changes": [
+        "line 109: operator neuronspark::vr_mix_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/wgrad.py",
+      "sha256": "1c69ea86eee2c52751803b3f858cc0e3fa2d9a3720c125e12751a82692dfdf92",
+      "source_sha256": "1c69ea86eee2c52751803b3f858cc0e3fa2d9a3720c125e12751a82692dfdf92",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/xq_query.py",
+      "sha256": "896c3deb3a62c0db1be3bf9d7620b7fa7bfbab38ab7e08774af43665b8983665",
+      "source_sha256": "54086aa25248703b997ba6c7f6d3454a0d5cfb3fd19d0b374d073e5e4a0e2449",
+      "unchanged": false,
+      "changes": [
+        "line 163: operator neuronspark::xq_queries_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/utils/__init__.py",
+      "sha256": "3620b70693af097915106155e52f788bc2811689c4b4cc55bb2e62a780dc481f",
+      "source_sha256": "2aa639d42de45a38c1f29c2c60e66e513997af31c725d6b7214c6d3e8ff87691",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/utils/cache.py",
+      "sha256": "706a1eacadcf2d3709c8bdb5adef3b65620919dfeb9b66075741ec22250b7a0a",
+      "source_sha256": "706a1eacadcf2d3709c8bdb5adef3b65620919dfeb9b66075741ec22250b7a0a",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "a3b5dfa7a92e2bd2468311c9c16040970556709403c0eb410a0f4e4a3c7c6b41",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

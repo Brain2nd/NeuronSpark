@@ -1,0 +1,39 @@
+{
+  "name": "neuronspark-vr-mix-prefill",
+  "id": "_neuronspark_vr_mix_prefill_cuda_304cb52a18fc5546",
+  "version": 1,
+  "kernels-minver": "0.14.0",
+  "license": "cc-by-nc-sa-4.0",
+  "python-depends": [],
+  "kernel-depends": [],
+  "backend": {
+    "type": "cuda",
+    "archs": [
+      "10.0"
+    ]
+  },
+  "digest": {
+    "algorithm": "sha256",
+    "files": {
+      "LICENSE.txt": "E0mkthSEkrRPYp5k7tZ2YS4jT+moOeTzsnfBSCyISfE=",
+      "__init__.py": "/istGQ/b0gm6Om3nuCGt0bmywhCCZ+wr/ONDAp9lfNs=",
+      "_ops.py": "5ikB5/iQNqkIJAAoHHOp0Mx1MOJpnW6Ym0fx27a2zi8=",
+      "_solution/__init__.py": "wprR/QOX02O1yv/Q4w1cu1KZ94YTnK98DeFQKE4cYAg=",
+      "_solution/kernel.py": "U3bpyRSwZi2UO7qZGfTscMHfytnyLmxKTuUqTr/AZhU=",
+      "_solution/manifest.json": "SZwPY6YlUEiFSr6Q9A4HYz14gcpwu1H7mDVMt0VBVfc=",
+      "_solution/neuronspark/__init__.py": "WOAQE276SDYg1Zo+QDeHGijlJZTgNAHGJKiq9xq1F/E=",
+      "_solution/neuronspark/_namespace.py": "Oo2hjHSpxScda0J7RdQjUReqjxSnoQ+AwlB/0kHWNyI=",
+      "_solution/neuronspark/ops/__init__.py": "Q1SUPelfoZOuaHiekMPDI5o3ofrTOkvEwv0JBwkvcII=",
+      "_solution/neuronspark/ops/triton/__init__.py": "B59VUCEOy4/aaRST++hB0WkT0t63DlwKV23+CkCM0qg=",
+      "_solution/neuronspark/ops/triton/vr_mix.py": "GdTpWBpRFhMinvwTTQqFLC5xkhSJG5QF3NJL57rV1Eo=",
+      "_solution/third_party_notices.py": "o7Xfp6kuK9JGgxHJwWBAlwVWcJQDwOtBCg9OSjx8a0E="
+    }
+  },
+  "provenance": {
+    "kernel-builder": {
+      "version": "0.18.3",
+      "commit": "ba5ac4a8be6f041ba906534326eb36b76642716b",
+      "dirty": false
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "name": "neuronspark-dendritic-chunk-scan-prefill",
+  "id": "_neuronspark_dendritic_chunk_scan_prefill_cuda_ed9aa16ce66114de",
+  "version": 1,
+  "kernels-minver": "0.14.0",
+  "license": "cc-by-nc-sa-4.0",
+  "python-depends": [],
+  "kernel-depends": [],
+  "backend": {
+    "type": "cuda",
+    "archs": [
+      "10.0"
+    ]
+  },
+  "digest": {
+    "algorithm": "sha256",
+    "files": {
+      "LICENSE.txt": "E0mkthSEkrRPYp5k7tZ2YS4jT+moOeTzsnfBSCyISfE=",
+      "__init__.py": "/istGQ/b0gm6Om3nuCGt0bmywhCCZ+wr/ONDAp9lfNs=",
+      "_ops.py": "+j86b8kNIZXogq2q284t788RJZ2mjCNUPx7Cgv3apHE=",
+      "_solution/__init__.py": "wprR/QOX02O1yv/Q4w1cu1KZ94YTnK98DeFQKE4cYAg=",
+      "_solution/kernel.py": "wu5BAESzdJChslZYs904Kb9YCTUhEXjt5El7DA7hcrE=",
+      "_solution/manifest.json": "E9X96QKpxC5DyGKcrOH8gGpog/uD/zxUN3Z2TlNobIg=",
+      "_solution/neuronspark/__init__.py": "WOAQE276SDYg1Zo+QDeHGijlJZTgNAHGJKiq9xq1F/E=",
+      "_solution/neuronspark/_namespace.py": "Oo2hjHSpxScda0J7RdQjUReqjxSnoQ+AwlB/0kHWNyI=",
+      "_solution/neuronspark/ops/__init__.py": "Q1SUPelfoZOuaHiekMPDI5o3ofrTOkvEwv0JBwkvcII=",
+      "_solution/neuronspark/ops/dendritic_prefill.py": "oonNNp3NPyC1gAwcSM9xlaIwCbGhJJUztlwYzFBV/CY=",
+      "_solution/neuronspark/ops/gluon/__init__.py": "EUhdP+15lXeMWJPJHb2fKblIOp7EWt60dIEqsj/ciw8=",
+      "_solution/neuronspark/ops/gluon/_ptx.py": "ack9EY1+MHSN48VnlELq7O1Tzw0VPTm0UAM5m74IM7E=",
+      "_solution/neuronspark/ops/gluon/dendritic_chunk_scan_fwd.py": "ZU/FTCEB03VsLCAL0IxsZJR3+i5HyVG0lAoDyNzXbSk=",
+      "_solution/neuronspark/ops/gluon/dendritic_chunk_states.py": "XgNLkUy0NgBMcECUOQj70u3cMXiKF6bFkJfvAejlVYM=",
+      "_solution/neuronspark/ops/triton/__init__.py": "2mUYLFXEDaYttU8l5e0h/ihQyCg/+pch4TGFMCfSRrc=",
+      "_solution/neuronspark/ops/triton/dendritic_chunk.py": "LAMWKAMuWhLML/3y4V2ZmHUtOZoD3NgwLa3IuSwBQTI=",
+      "_solution/neuronspark/ops/triton/dendritic_scan.py": "xg0It/MG/SzYFHGoH0ZTNVCw5dONm0P4mAhTXwrvmoM=",
+      "_solution/neuronspark/ops/triton/dendritic_states.py": "I6Sgj1QDn3FpGE8VxUfPFGEjaJF3bawxI4fbvgxk8Ps=",
+      "_solution/third_party_notices.py": "AGB+ScsNG49+d9n6gW7/T42xRywh0Rhz7yGQEJgPCGo="
+    }
+  },
+  "provenance": {
+    "kernel-builder": {
+      "version": "0.18.3",
+      "commit": "ba5ac4a8be6f041ba906534326eb36b76642716b",
+      "dirty": false
+    }
+  }
+}

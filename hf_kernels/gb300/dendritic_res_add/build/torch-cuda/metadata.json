@@ -1,0 +1,39 @@
+{
+  "name": "neuronspark-dendritic-res-add",
+  "id": "_neuronspark_dendritic_res_add_cuda_d8ebbffbc9dc04bc",
+  "version": 1,
+  "kernels-minver": "0.14.0",
+  "license": "cc-by-nc-sa-4.0",
+  "python-depends": [],
+  "kernel-depends": [],
+  "backend": {
+    "type": "cuda",
+    "archs": [
+      "10.0"
+    ]
+  },
+  "digest": {
+    "algorithm": "sha256",
+    "files": {
+      "LICENSE.txt": "E0mkthSEkrRPYp5k7tZ2YS4jT+moOeTzsnfBSCyISfE=",
+      "__init__.py": "/istGQ/b0gm6Om3nuCGt0bmywhCCZ+wr/ONDAp9lfNs=",
+      "_ops.py": "sBh+effdCmJNl748qykc4UYhDrRxkU4MxnUeFdX4i2U=",
+      "_solution/__init__.py": "wprR/QOX02O1yv/Q4w1cu1KZ94YTnK98DeFQKE4cYAg=",
+      "_solution/kernel.py": "ZG7FzePhUHEwSrK09m2N2UzDmb5JKeV7eq9RdfFqoDs=",
+      "_solution/manifest.json": "LJN2HshqTHG/34djY5eyow3gw8V6Hkq483EZ9a8hznk=",
+      "_solution/neuronspark/__init__.py": "WOAQE276SDYg1Zo+QDeHGijlJZTgNAHGJKiq9xq1F/E=",
+      "_solution/neuronspark/_namespace.py": "Oo2hjHSpxScda0J7RdQjUReqjxSnoQ+AwlB/0kHWNyI=",
+      "_solution/neuronspark/ops/__init__.py": "Q1SUPelfoZOuaHiekMPDI5o3ofrTOkvEwv0JBwkvcII=",
+      "_solution/neuronspark/ops/triton/__init__.py": "B59VUCEOy4/aaRST++hB0WkT0t63DlwKV23+CkCM0qg=",
+      "_solution/neuronspark/ops/triton/dendritic_residual.py": "SXrfnLZ/CXAZkHa+ahz2NpPfjUnpGm84clYJhv7rLHU=",
+      "_solution/third_party_notices.py": "AGB+ScsNG49+d9n6gW7/T42xRywh0Rhz7yGQEJgPCGo="
+    }
+  },
+  "provenance": {
+    "kernel-builder": {
+      "version": "0.18.3",
+      "commit": "ba5ac4a8be6f041ba906534326eb36b76642716b",
+      "dirty": false
+    }
+  }
+}

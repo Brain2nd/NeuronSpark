@@ -1,0 +1,88 @@
+{
+  "operator": "short_conv_silu_prefill",
+  "run": "neuronspark.ops.triton.short_conv:short_conv_silu_prefill",
+  "ref": "neuronspark.ops.triton.short_conv:short_conv_silu_prefill_ref",
+  "kernel_name": "neuronspark-short-conv-silu-prefill",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "b9556379c89f943f95dbf31d0a22967c75efa159",
+    "branch": "b200",
+    "dirty": false
+  },
+  "sources_sha256": "fb52dcc665ce4492c7d24399681ffbc5eb94fa31057f905896df4c4d2f0cf811",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "2e603bed4f4bd5cf090b8c6a0893014d1e6848a9f0fe3c1adfe4c249561ee303",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/_namespace.py",
+      "sha256": "3a8da18c74a9c5271d6b427b45d4235117aa8f14a7a10f80c2507fd241d63722",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the torch.library namespace of the copy"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "4354943de95fa193ae68789e90c3c3239a37a1fad33a4bc4c2fd0907092f7082",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "079f5550210ecb8fda691493fbe841d16913d2deb70e5c0a576dfe0a408cd2a8",
+      "source_sha256": "9006675f6755f62c22b3fee4426786c0f6d035acf6b67557f90a44372b1e3ea7",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: require_cuda"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/_ptx.py",
+      "sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "source_sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/short_conv.py",
+      "sha256": "c688b4d59245bf729ccf8a868a0ec5384b1ca52e674e0df0ab73e98a4a69cefd",
+      "source_sha256": "c44233e6fcaf85a9908d10e0e00c6c85aaaa0b1a10473ab73465f20663e76b83",
+      "unchanged": false,
+      "changes": [
+        "line 232: operator neuronspark::short_conv_fwd registered in the package's namespace",
+        "line 252: operator neuronspark::short_conv_bwd registered in the package's namespace",
+        "line 343: operator neuronspark::short_conv_silu_prefill registered in the package's namespace",
+        "line 39: the import is written on one line and 4 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "a3b5dfa7a92e2bd2468311c9c16040970556709403c0eb410a0f4e4a3c7c6b41",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "name": "neuronspark-silu-rope",
+  "id": "_neuronspark_silu_rope_cuda_ea51075062848e3e",
+  "version": 1,
+  "kernels-minver": "0.14.0",
+  "license": "cc-by-nc-sa-4.0",
+  "python-depends": [],
+  "kernel-depends": [],
+  "backend": {
+    "type": "cuda",
+    "archs": [
+      "10.0"
+    ]
+  },
+  "digest": {
+    "algorithm": "sha256",
+    "files": {
+      "LICENSE.txt": "E0mkthSEkrRPYp5k7tZ2YS4jT+moOeTzsnfBSCyISfE=",
+      "__init__.py": "/istGQ/b0gm6Om3nuCGt0bmywhCCZ+wr/ONDAp9lfNs=",
+      "_ops.py": "Lo86+l2XtsRtABshZNukrpGrjIxJW3Wcs9M50rrMdAI=",
+      "_solution/__init__.py": "wprR/QOX02O1yv/Q4w1cu1KZ94YTnK98DeFQKE4cYAg=",
+      "_solution/kernel.py": "hZ+2xGf/7ZrOkOfF1NhdtF2cRO+Vt95CGBuw7xTVluc=",
+      "_solution/manifest.json": "ctcsMEC5XjD0GBxxAwmNpCFHsjYCTNiq9XLx/RC6oFg=",
+      "_solution/neuronspark/__init__.py": "WOAQE276SDYg1Zo+QDeHGijlJZTgNAHGJKiq9xq1F/E=",
+      "_solution/neuronspark/_namespace.py": "Oo2hjHSpxScda0J7RdQjUReqjxSnoQ+AwlB/0kHWNyI=",
+      "_solution/neuronspark/modules/__init__.py": "KiBPRg3/HiOpecvVtMVAk+Rgbl2szCD1/249oVlbNoU=",
+      "_solution/neuronspark/modules/rope.py": "m3gBY3vzF+Wza+iFOLTiO4S4ym6PIN3YcBchtCS1JyU=",
+      "_solution/neuronspark/ops/__init__.py": "Q1SUPelfoZOuaHiekMPDI5o3ofrTOkvEwv0JBwkvcII=",
+      "_solution/neuronspark/ops/triton/__init__.py": "B59VUCEOy4/aaRST++hB0WkT0t63DlwKV23+CkCM0qg=",
+      "_solution/neuronspark/ops/triton/_ptx.py": "ltuIGKsS8gampXNmbxo7/E14fA1r4AGRlwPaYVKWxEU=",
+      "_solution/neuronspark/ops/triton/hippo_norms.py": "07jD6FBqJci0ubeQcIgRh8N1ZYvAUA5WpCCrS5F54MI=",
+      "_solution/neuronspark/ops/triton/hippo_rope.py": "cDLuo34E1AxnePVm4w1n6L5dgMahk/5f5+6ylyFdL2I=",
+      "_solution/third_party_notices.py": "AGB+ScsNG49+d9n6gW7/T42xRywh0Rhz7yGQEJgPCGo="
+    }
+  },
+  "provenance": {
+    "kernel-builder": {
+      "version": "0.18.3",
+      "commit": "ba5ac4a8be6f041ba906534326eb36b76642716b",
+      "dirty": false
+    }
+  }
+}

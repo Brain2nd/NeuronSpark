@@ -257,6 +257,24 @@ custom ops.  `neuronspark/ops/registry.py` lists every operator with its signatu
 | readout balance | `ops/triton/balance_add.py` | scoring, prefill, decode |
 | readout balance + cross entropy | `ops/triton/lm_tail.py` | train |
 
+## Hugging Face kernels
+
+`hf_kernels/` holds every registered operator as a Hugging Face kernel package (the format of the `kernels`
+library), so that an operator can be loaded and run without installing this repository:
+
+```python
+from pathlib import Path
+from kernels import get_local_kernel
+
+kernel = get_local_kernel(Path("hf_kernels/b200/pool_read"), trust_remote_code=True)
+out = kernel.run(q, k, gv, cum, beta, qtok, ktok, orders, scale)               # the operator
+ref = kernel._entrypoint.ref(q, k, gv, cum, beta, qtok, ktok, orders, scale)   # its pure-PyTorch reference
+```
+
+`hf_kernels/b200`: the 81 operators of this branch; `hf_kernels/gb300`: the 51 operators of `main` at tag
+`gb300-operators-20261116`.  `hf_kernels/README.md` describes the packages; the `TABLE.md` of each set lists how
+every package was checked on a B200.
+
 ## Correctness
 
 Every kernel matches its reference implementation under one tolerance rule, the default rule of flashinfer-bench

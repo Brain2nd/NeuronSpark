@@ -1,0 +1,89 @@
+{
+  "operator": "dendritic_resid_norm",
+  "run": "neuronspark.ops.triton.dendritic_prenorm:dendritic_resid_norm",
+  "ref": "neuronspark.ops.triton.dendritic_prenorm:dendritic_resid_norm_ref",
+  "kernel_name": "neuronspark-dendritic-resid-norm",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "b9556379c89f943f95dbf31d0a22967c75efa159",
+    "branch": "b200",
+    "dirty": false
+  },
+  "sources_sha256": "ea3ad3dd571557e84b0d2795bb8875580dbacf19fb1befcabf4d2af177177d34",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "6b71b55ca590e904eedc82db07a1d0fa4e7563375d653fb6b9a4b90220ba232f",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/_namespace.py",
+      "sha256": "3a8da18c74a9c5271d6b427b45d4235117aa8f14a7a10f80c2507fd241d63722",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the torch.library namespace of the copy"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "4354943de95fa193ae68789e90c3c3239a37a1fad33a4bc4c2fd0907092f7082",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "0ae454ab50a8c9d52c11ba8ced78e93b5ca5057c787afb347fb18fb4d30b91d5",
+      "source_sha256": "9006675f6755f62c22b3fee4426786c0f6d035acf6b67557f90a44372b1e3ea7",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: num_sms, require_cuda"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/_ptx.py",
+      "sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "source_sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_prenorm.py",
+      "sha256": "174cac8e3653eb570843aa13102633d4d10594641a69c25db2870d81f52832c5",
+      "source_sha256": "d83a3dbf8be6b44e49faef7308dcb54ce675af07c2988e530744bae7f1ebb871",
+      "unchanged": false,
+      "changes": [
+        "line 334: operator neuronspark::dendritic_norm_fwd registered in the package's namespace",
+        "line 354: operator neuronspark::dendritic_norm_bwd registered in the package's namespace",
+        "line 376: operator neuronspark::dendritic_resid_norm_fwd registered in the package's namespace",
+        "line 399: operator neuronspark::dendritic_resid_norm_bwd registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "a3b5dfa7a92e2bd2468311c9c16040970556709403c0eb410a0f4e4a3c7c6b41",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

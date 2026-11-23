@@ -1,0 +1,136 @@
+{
+  "operator": "pool_read",
+  "run": "neuronspark.ops.pool_read:pool_read",
+  "ref": "neuronspark.ops.pool_read:pool_read_ref",
+  "kernel_name": "neuronspark-pool-read",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "5c2720b46b2d91587454c3ef1a3107ac1f568901",
+    "branch": "main",
+    "dirty": false
+  },
+  "sources_sha256": "fa7b17707a349a68aa396b4dd63ba39bf73744de1ee902ca949756224bcbd9fd",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "435978e75413edc5490ff51a2dfcc507195fcd0352c49333df5136938a17cdfd",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/modules/__init__.py",
+      "sha256": "2a204f460dff1e23a979cbd5b4c54093e4606e5daccc20f5ff6e3da1595b3685",
+      "source_sha256": "9a55989d335053f5aba8080d5a497390bffe8d3e393d2e9a9ecaf3f8279a3d9e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/modules/induction.py",
+      "sha256": "534ca190b25fc798321b73ed0ba11ab940fc6749c98cb5133fe38bd20a230a78",
+      "source_sha256": "534ca190b25fc798321b73ed0ba11ab940fc6749c98cb5133fe38bd20a230a78",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "4354943de95fa193ae68789e90c3c3239a37a1fad33a4bc4c2fd0907092f7082",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/gluon/__init__.py",
+      "sha256": "11485d3fed7995778c5893c91dbd9f29b9483a9ec45adeb474812ab23fdc8b0f",
+      "source_sha256": "d9b7c577ef532ad30f10e0397520c594dd6f1d21f43dfe59e820e8fb75642ac1",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/gluon/_ptx.py",
+      "sha256": "69c93d118d7e30748de3c5679442eaeced53cf0d153d39b45003399bbe0833b1",
+      "source_sha256": "69c93d118d7e30748de3c5679442eaeced53cf0d153d39b45003399bbe0833b1",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/pool_read_bwd.py",
+      "sha256": "0ae0915c085780e7493ce9dc19a3224619af1536cffef47af923f40c20ac7f43",
+      "source_sha256": "0ae0915c085780e7493ce9dc19a3224619af1536cffef47af923f40c20ac7f43",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/pool_read_fwd.py",
+      "sha256": "c5764b834c20cfbb692457e2a4ccaa0a436905a0290f35d144d74de62dcc1a04",
+      "source_sha256": "c5764b834c20cfbb692457e2a4ccaa0a436905a0290f35d144d74de62dcc1a04",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/pool_read_tile.py",
+      "sha256": "18706f38e8e80171deb76879ea0ad04c91758f0432c34eb3995c18cf1f35b02d",
+      "source_sha256": "18706f38e8e80171deb76879ea0ad04c91758f0432c34eb3995c18cf1f35b02d",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/pool_read.py",
+      "sha256": "c5a050cc0bb4833b71d164bfab3b3f711e11066da78eab91172af802d006c060",
+      "source_sha256": "c5a050cc0bb4833b71d164bfab3b3f711e11066da78eab91172af802d006c060",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "0c3a0c36cf539f2a45d8c6b89c9a25faf5eb7dde7e921f0715ad47926ab5c217",
+      "source_sha256": "de4b2ec294755c6784ec83cec28c340671e8f3f3e65141b15d3927b39f10a20c",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: require_cuda, require_sm100"
+      ]
+    },
+    {
+      "path": "neuronspark/utils/__init__.py",
+      "sha256": "3620b70693af097915106155e52f788bc2811689c4b4cc55bb2e62a780dc481f",
+      "source_sha256": "2aa639d42de45a38c1f29c2c60e66e513997af31c725d6b7214c6d3e8ff87691",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/utils/cache.py",
+      "sha256": "11702b13348fc37336abe714dbf6163702b1df0106a63c384528fcaa0f7c4a29",
+      "source_sha256": "11702b13348fc37336abe714dbf6163702b1df0106a63c384528fcaa0f7c4a29",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "00607e49cb0d1b8f7e77d9fa816eff4f8db1472c21d11873ef219010980f086a",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

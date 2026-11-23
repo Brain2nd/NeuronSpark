@@ -1,0 +1,80 @@
+{
+  "operator": "pkm_value_read",
+  "run": "neuronspark.ops.triton.pkm_read:pkm_value_read",
+  "ref": "neuronspark.ops.triton.pkm_read:pkm_value_read_ref",
+  "kernel_name": "neuronspark-pkm-value-read",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "b9556379c89f943f95dbf31d0a22967c75efa159",
+    "branch": "b200",
+    "dirty": false
+  },
+  "sources_sha256": "e99999bb0bcc6dc38ff0fd5f0159c2fba6c3c453e59b4b8d674ee04227396590",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "cdc1b4d34971ecb9fca3f3acaa4912b1c4ec81cc23f3d8f8e6ced5a018d38a9f",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/_namespace.py",
+      "sha256": "3a8da18c74a9c5271d6b427b45d4235117aa8f14a7a10f80c2507fd241d63722",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the torch.library namespace of the copy"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "4354943de95fa193ae68789e90c3c3239a37a1fad33a4bc4c2fd0907092f7082",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "079f5550210ecb8fda691493fbe841d16913d2deb70e5c0a576dfe0a408cd2a8",
+      "source_sha256": "9006675f6755f62c22b3fee4426786c0f6d035acf6b67557f90a44372b1e3ea7",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: require_cuda"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/pkm_read.py",
+      "sha256": "e494f9a6393996fd4fee91e4d39b88f1c06f5302e9648c19b85cfacc0411964c",
+      "source_sha256": "bda7fcfaef46e99634008b75a07b8d3c5d54901866a2ad331c2204c3d74f1175",
+      "unchanged": false,
+      "changes": [
+        "line 129: operator neuronspark::pkm_read_fwd registered in the package's namespace",
+        "line 139: operator neuronspark::pkm_read_bwd registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "a3b5dfa7a92e2bd2468311c9c16040970556709403c0eb410a0f4e4a3c7c6b41",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

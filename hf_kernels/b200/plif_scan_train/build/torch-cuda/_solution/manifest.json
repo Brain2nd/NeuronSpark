@@ -1,0 +1,130 @@
+{
+  "operator": "plif_scan_train",
+  "run": "neuronspark.ops.triton.plif:plif_scan_train",
+  "ref": "neuronspark.ops.triton.plif:plif_scan_train_ref",
+  "kernel_name": "neuronspark-plif-scan-train",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "b9556379c89f943f95dbf31d0a22967c75efa159",
+    "branch": "b200",
+    "dirty": false
+  },
+  "sources_sha256": "d66ab00dbcef59c01537a7ed083a647e7b8fbd4ab22578354bbc7d67c352d3d7",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "d48d868101d9b0abc9ee065a3864ac6a48ab2517050a9abc8ed6e1ebbdc1c2b7",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/_namespace.py",
+      "sha256": "3a8da18c74a9c5271d6b427b45d4235117aa8f14a7a10f80c2507fd241d63722",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the torch.library namespace of the copy"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "4354943de95fa193ae68789e90c3c3239a37a1fad33a4bc4c2fd0907092f7082",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/gluon/__init__.py",
+      "sha256": "11485d3fed7995778c5893c91dbd9f29b9483a9ec45adeb474812ab23fdc8b0f",
+      "source_sha256": "d9b7c577ef532ad30f10e0397520c594dd6f1d21f43dfe59e820e8fb75642ac1",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/gluon/_ptx.py",
+      "sha256": "69c93d118d7e30748de3c5679442eaeced53cf0d153d39b45003399bbe0833b1",
+      "source_sha256": "69c93d118d7e30748de3c5679442eaeced53cf0d153d39b45003399bbe0833b1",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/plif_k1_bwd.py",
+      "sha256": "cce67e4d862715cce7d3e38495809e87ff18fcc9121230a887295be5eb3a3f45",
+      "source_sha256": "3c15d913b4742eb3fbd464dc55ada5915551eb799145a3ba226f145fb7c5516b",
+      "unchanged": false,
+      "changes": [
+        "line 107: operator neuronspark::plif_k1_bwd registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 34: the import is written on one line and 7 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "0c3a0c36cf539f2a45d8c6b89c9a25faf5eb7dde7e921f0715ad47926ab5c217",
+      "source_sha256": "9006675f6755f62c22b3fee4426786c0f6d035acf6b67557f90a44372b1e3ea7",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: require_cuda, require_sm100"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/_ptx.py",
+      "sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "source_sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/cumsum.py",
+      "sha256": "b38f2c2a7ae67b2fa6756ba3f8f1145e559d330578e40ef0d49f910b6d1f8cc3",
+      "source_sha256": "c678a26d9bea89796cf2b22d011642389c62034c989b42e5727db637930646b5",
+      "unchanged": false,
+      "changes": [
+        "line 713: operator neuronspark::cumsum0 registered in the package's namespace",
+        "line 842: operator neuronspark::centred_running registered in the package's namespace",
+        "line 49: the import is written on one line and 7 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/plif.py",
+      "sha256": "6198767b6aee7dcfdc07b81fd539c46cb86adfb1f4d4d83b3b6e7d35d82fdece",
+      "source_sha256": "e1b7eaadd2d2004b15f2e0cce1996d86f82b9fc027d7871ffb2c43c4abd4234b",
+      "unchanged": false,
+      "changes": [
+        "line 304: operator neuronspark::plif_k1x_scan registered in the package's namespace",
+        "line 413: operator neuronspark::plif_centre_fwd registered in the package's namespace",
+        "line 423: operator neuronspark::plif_centre_bwd registered in the package's namespace",
+        "line 501: operator neuronspark::plif_gate_prefill registered in the package's namespace",
+        "line 579: operator neuronspark::plif_scan_prefill registered in the package's namespace",
+        "line 606: operator neuronspark::plif_prefill_pair registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 63: the import is written on one line and 15 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "a3b5dfa7a92e2bd2468311c9c16040970556709403c0eb410a0f4e4a3c7c6b41",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

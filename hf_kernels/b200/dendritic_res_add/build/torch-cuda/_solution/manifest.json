@@ -1,0 +1,79 @@
+{
+  "operator": "dendritic_res_add",
+  "run": "neuronspark.ops.triton.dendritic_residual:dendritic_res_add",
+  "ref": "neuronspark.ops.triton.dendritic_residual:dendritic_res_add_ref",
+  "kernel_name": "neuronspark-dendritic-res-add",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "b9556379c89f943f95dbf31d0a22967c75efa159",
+    "branch": "b200",
+    "dirty": false
+  },
+  "sources_sha256": "b3198d6adab490715d19a5003b97d23bfa4a02d509ce699b9a1ea55eaa0feba2",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "e73b7707978946b5db8ce8ce72a72c04f2957461f28ce0301558093bc17bb1de",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/_namespace.py",
+      "sha256": "3a8da18c74a9c5271d6b427b45d4235117aa8f14a7a10f80c2507fd241d63722",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the torch.library namespace of the copy"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "4354943de95fa193ae68789e90c3c3239a37a1fad33a4bc4c2fd0907092f7082",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "079f5550210ecb8fda691493fbe841d16913d2deb70e5c0a576dfe0a408cd2a8",
+      "source_sha256": "9006675f6755f62c22b3fee4426786c0f6d035acf6b67557f90a44372b1e3ea7",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: require_cuda"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_residual.py",
+      "sha256": "cc40e6833a273222e35ee6659679139b81c37f7e2f7aa7c8e880d7fddf5e8de3",
+      "source_sha256": "8d724f3566bdb9a69e840e2ce55ac404234c43c61352a5700d9f2c674d81de21",
+      "unchanged": false,
+      "changes": [
+        "line 68: operator neuronspark::dendritic_res_add registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "a3b5dfa7a92e2bd2468311c9c16040970556709403c0eb410a0f4e4a3c7c6b41",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

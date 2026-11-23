@@ -1,0 +1,119 @@
+{
+  "operator": "rope_interleaved",
+  "run": "neuronspark.ops.triton.hippo_rope:rope_interleaved",
+  "ref": "neuronspark.ops.triton.hippo_rope:rope_interleaved_ref",
+  "kernel_name": "neuronspark-rope-interleaved",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "b9556379c89f943f95dbf31d0a22967c75efa159",
+    "branch": "b200",
+    "dirty": false
+  },
+  "sources_sha256": "8fda5b23769ddc87aedc005affc03a0e8e8765ff013a853178bca0737ac51620",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "a82a7b1d7ffad3d1989a350a070e12a6cbc29263f43277822fd3b42bea2b6b61",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/_namespace.py",
+      "sha256": "3a8da18c74a9c5271d6b427b45d4235117aa8f14a7a10f80c2507fd241d63722",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the torch.library namespace of the copy"
+      ]
+    },
+    {
+      "path": "neuronspark/modules/__init__.py",
+      "sha256": "2a204f460dff1e23a979cbd5b4c54093e4606e5daccc20f5ff6e3da1595b3685",
+      "source_sha256": "9a55989d335053f5aba8080d5a497390bffe8d3e393d2e9a9ecaf3f8279a3d9e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/modules/rope.py",
+      "sha256": "9b7801637bf317e5b36be88538b4e23b84b8ca6e8f20ddd8701721b424b52725",
+      "source_sha256": "9b7801637bf317e5b36be88538b4e23b84b8ca6e8f20ddd8701721b424b52725",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "4354943de95fa193ae68789e90c3c3239a37a1fad33a4bc4c2fd0907092f7082",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "079f5550210ecb8fda691493fbe841d16913d2deb70e5c0a576dfe0a408cd2a8",
+      "source_sha256": "9006675f6755f62c22b3fee4426786c0f6d035acf6b67557f90a44372b1e3ea7",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: require_cuda"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/_ptx.py",
+      "sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "source_sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/hippo_norms.py",
+      "sha256": "b939b470a38c043052305c3caac1d87bf392f05656d9c2076b5086ac1d178a78",
+      "source_sha256": "53627bd6f73128d525797cda1f19f58f186308b9928f1bffddfdcdeac83aaf7f",
+      "unchanged": false,
+      "changes": [
+        "line 443: operator neuronspark::hippo_rownorm_fwd registered in the package's namespace",
+        "line 467: operator neuronspark::hippo_rownorm_bwd registered in the package's namespace",
+        "line 593: operator neuronspark::hippo_outnorm_gate_fwd registered in the package's namespace",
+        "line 622: operator neuronspark::hippo_outnorm_gate_bwd registered in the package's namespace",
+        "line 703: operator neuronspark::hippo_rmsnorm_rows registered in the package's namespace",
+        "line 750: operator neuronspark::hippo_rmsnorm_gate_rows registered in the package's namespace",
+        "line 56: the import is written on one line and 14 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/hippo_rope.py",
+      "sha256": "8900b6a43d164e3265391f6c91d3dbc1e920e9917a80c83fb0159a7947a42722",
+      "source_sha256": "7c1599c5759d12bd2a1e22285924e1832e2e41e1dda615dc1a29113a1848406f",
+      "unchanged": false,
+      "changes": [
+        "line 210: operator neuronspark::hippo_silu_rope_fwd registered in the package's namespace",
+        "line 236: operator neuronspark::hippo_silu_rope_bwd registered in the package's namespace",
+        "line 293: operator neuronspark::hippo_rope_interleaved registered in the package's namespace",
+        "line 41: the import is written on one line and 11 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "a3b5dfa7a92e2bd2468311c9c16040970556709403c0eb410a0f4e4a3c7c6b41",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

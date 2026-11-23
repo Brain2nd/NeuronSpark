@@ -1,0 +1,187 @@
+{
+  "operator": "dendritic_chunk_scan_soma",
+  "run": "neuronspark.ops.dendritic_combined:dendritic_chunk_scan_soma",
+  "ref": "neuronspark.ops.dendritic_combined:dendritic_chunk_scan_soma_ref",
+  "kernel_name": "neuronspark-dendritic-chunk-scan-soma",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "5c2720b46b2d91587454c3ef1a3107ac1f568901",
+    "branch": "main",
+    "dirty": false
+  },
+  "sources_sha256": "e862e5b3c8938cbac8a9cad3321f5e6677023a85ca50fbf3af55c8a8e4226e0d",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "1ec2cbe4c55b4b10674c7a76850c7eec468d80b18764ec775980e84a0b6719b9",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/_namespace.py",
+      "sha256": "3a8da18c74a9c5271d6b427b45d4235117aa8f14a7a10f80c2507fd241d63722",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the torch.library namespace of the copy"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "4354943de95fa193ae68789e90c3c3239a37a1fad33a4bc4c2fd0907092f7082",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/dendritic_combined.py",
+      "sha256": "026d68548ff5d38a8b11d178e0ffbaf2205f5fc47cb8a5e8fd2157a48b4a3042",
+      "source_sha256": "72c6a8fb7da1c07483787ad43d06fb981fb240570aa16ca6e45d97a489ef3b1c",
+      "unchanged": false,
+      "changes": [
+        "line 91: operator neuronspark::dendritic_chunk_scan_soma_fwd registered in the package's namespace",
+        "line 143: operator neuronspark::dendritic_chunk_scan_soma_bwd registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 50: the import is written on one line and 1 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)",
+        "line 55: the import is written on one line and 1 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/gluon/__init__.py",
+      "sha256": "11485d3fed7995778c5893c91dbd9f29b9483a9ec45adeb474812ab23fdc8b0f",
+      "source_sha256": "d9b7c577ef532ad30f10e0397520c594dd6f1d21f43dfe59e820e8fb75642ac1",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/gluon/_ptx.py",
+      "sha256": "69c93d118d7e30748de3c5679442eaeced53cf0d153d39b45003399bbe0833b1",
+      "source_sha256": "69c93d118d7e30748de3c5679442eaeced53cf0d153d39b45003399bbe0833b1",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/dendritic_chunk_scan_dx.py",
+      "sha256": "e72b26ecb54d66f38b0f7f7ec56723914a0e4c1101fbc94d9207753695591445",
+      "source_sha256": "e72b26ecb54d66f38b0f7f7ec56723914a0e4c1101fbc94d9207753695591445",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/dendritic_chunk_scan_fwd.py",
+      "sha256": "1858a4c17f6b817ccd59b3e21d94f72e88cd875a52e17869d85374a5e6f1c537",
+      "source_sha256": "1858a4c17f6b817ccd59b3e21d94f72e88cd875a52e17869d85374a5e6f1c537",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/dendritic_chunk_states.py",
+      "sha256": "b9305752bd52877cdbb666ccaecdf407ed2620e787c98ffcb9869f92cbfb91f9",
+      "source_sha256": "b9305752bd52877cdbb666ccaecdf407ed2620e787c98ffcb9869f92cbfb91f9",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/dendritic_dda.py",
+      "sha256": "f1e9c4337cf9befc5a885b93d67dadebe994712f6593e50ec2a21730aa8f984a",
+      "source_sha256": "f1e9c4337cf9befc5a885b93d67dadebe994712f6593e50ec2a21730aa8f984a",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/dendritic_dstates.py",
+      "sha256": "5bd2fcab3e5c2824c057fb999baf2ef0683c309e047da8f7089bb47ebc236f8e",
+      "source_sha256": "5bd2fcab3e5c2824c057fb999baf2ef0683c309e047da8f7089bb47ebc236f8e",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "da65182c55c40da62db54f25e5ed21fe2850c8283ffa9721e131853027d246b7",
+      "source_sha256": "de4b2ec294755c6784ec83cec28c340671e8f3f3e65141b15d3927b39f10a20c",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: num_sms, require_cuda, require_sm100"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/_ptx.py",
+      "sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "source_sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_chunk.py",
+      "sha256": "6d9522477e1d13d38207e32204aa75c5cd2820a12d281be55852b955882baa99",
+      "source_sha256": "6d9522477e1d13d38207e32204aa75c5cd2820a12d281be55852b955882baa99",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_conv.py",
+      "sha256": "26d2a8b8acfcd7a0351623f8a5f9933669f28a6c271b37237745d8917378e709",
+      "source_sha256": "6cd7c99da614094fecd65c962f75521fdc346fb19641c64944325426d4e0b376",
+      "unchanged": false,
+      "changes": [
+        "line 534: operator neuronspark::dendritic_conv_silu_fwd registered in the package's namespace",
+        "line 547: operator neuronspark::dendritic_conv_silu_bwd registered in the package's namespace",
+        "line 571: operator neuronspark::dendritic_conv_silu_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_glue.py",
+      "sha256": "d4a1af2d7156c8088492e9346012a278f4897ac3d2be796d6b2c0a3242499e44",
+      "source_sha256": "d4a1af2d7156c8088492e9346012a278f4897ac3d2be796d6b2c0a3242499e44",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_scan.py",
+      "sha256": "bd9257f21c172ad73fdd0ec4e04bd0f31310a095ac5111abfd43505751896067",
+      "source_sha256": "bd9257f21c172ad73fdd0ec4e04bd0f31310a095ac5111abfd43505751896067",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_soma.py",
+      "sha256": "559630fc84a60180daab517cd2a48e19d23ec9494fa741d309b1e3f7c39235f1",
+      "source_sha256": "559630fc84a60180daab517cd2a48e19d23ec9494fa741d309b1e3f7c39235f1",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_states.py",
+      "sha256": "4ca7d53c1a4039deae4c1663eb2f86ee4c0f7f08188663ee7790a547bbb166a1",
+      "source_sha256": "4ca7d53c1a4039deae4c1663eb2f86ee4c0f7f08188663ee7790a547bbb166a1",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "00607e49cb0d1b8f7e77d9fa816eff4f8db1472c21d11873ef219010980f086a",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

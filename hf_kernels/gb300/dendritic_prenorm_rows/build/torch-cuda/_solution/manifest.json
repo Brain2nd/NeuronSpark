@@ -1,0 +1,109 @@
+{
+  "operator": "dendritic_prenorm_rows",
+  "run": "neuronspark.ops.triton.dendritic_step:dendritic_prenorm_rows",
+  "ref": "neuronspark.ops.triton.dendritic_step:dendritic_prenorm_rows_ref",
+  "kernel_name": "neuronspark-dendritic-prenorm-rows",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "5c2720b46b2d91587454c3ef1a3107ac1f568901",
+    "branch": "main",
+    "dirty": false
+  },
+  "sources_sha256": "78f38996af38dc4b539e964b8104cf79f054977f75db2ffc6f860a3994d06357",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "1286aed49f26bc856d1bd950dc42e1573262ae7cb24673a8e5f80c67587e9549",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/_namespace.py",
+      "sha256": "3a8da18c74a9c5271d6b427b45d4235117aa8f14a7a10f80c2507fd241d63722",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the torch.library namespace of the copy"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "4354943de95fa193ae68789e90c3c3239a37a1fad33a4bc4c2fd0907092f7082",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "079f5550210ecb8fda691493fbe841d16913d2deb70e5c0a576dfe0a408cd2a8",
+      "source_sha256": "de4b2ec294755c6784ec83cec28c340671e8f3f3e65141b15d3927b39f10a20c",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: require_cuda"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/_ptx.py",
+      "sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "source_sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_scan.py",
+      "sha256": "bd9257f21c172ad73fdd0ec4e04bd0f31310a095ac5111abfd43505751896067",
+      "source_sha256": "bd9257f21c172ad73fdd0ec4e04bd0f31310a095ac5111abfd43505751896067",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_soma.py",
+      "sha256": "559630fc84a60180daab517cd2a48e19d23ec9494fa741d309b1e3f7c39235f1",
+      "source_sha256": "559630fc84a60180daab517cd2a48e19d23ec9494fa741d309b1e3f7c39235f1",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_states.py",
+      "sha256": "4ca7d53c1a4039deae4c1663eb2f86ee4c0f7f08188663ee7790a547bbb166a1",
+      "source_sha256": "4ca7d53c1a4039deae4c1663eb2f86ee4c0f7f08188663ee7790a547bbb166a1",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_step.py",
+      "sha256": "b494e01410c7bae76313da993e39bba6ac9b50c622db59b2051b7e0ff675b5cd",
+      "source_sha256": "2f7ac710b40eec82080173d8b90c3d8a890b5a6a64f4bde425079c1494b9fc19",
+      "unchanged": false,
+      "changes": [
+        "line 589: operator neuronspark::dendritic_prenorm_rows registered in the package's namespace",
+        "line 602: operator neuronspark::dendritic_step_core registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 82: the import is written on one line and 8 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "00607e49cb0d1b8f7e77d9fa816eff4f8db1472c21d11873ef219010980f086a",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

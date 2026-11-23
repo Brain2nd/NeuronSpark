@@ -5,6 +5,8 @@ __pycache__/
 .eggs/
 build/
 dist/
+# (the kernel packages keep their build/ directory: it is the package the loader reads)
+!hf_kernels/**/build/
 .venv/
 venv/
 

@@ -1,0 +1,44 @@
+{
+  "name": "neuronspark-plif-centred-input",
+  "id": "_neuronspark_plif_centred_input_cuda_f2991201dfc20612",
+  "version": 1,
+  "kernels-minver": "0.14.0",
+  "license": "cc-by-nc-sa-4.0",
+  "python-depends": [],
+  "kernel-depends": [],
+  "backend": {
+    "type": "cuda",
+    "archs": [
+      "10.0"
+    ]
+  },
+  "digest": {
+    "algorithm": "sha256",
+    "files": {
+      "LICENSE.txt": "E0mkthSEkrRPYp5k7tZ2YS4jT+moOeTzsnfBSCyISfE=",
+      "__init__.py": "/istGQ/b0gm6Om3nuCGt0bmywhCCZ+wr/ONDAp9lfNs=",
+      "_ops.py": "ZRQEYoZIajxdCSwJ8+z/eNu5U+xn1z/Qil9r6MeFt8M=",
+      "_solution/__init__.py": "wprR/QOX02O1yv/Q4w1cu1KZ94YTnK98DeFQKE4cYAg=",
+      "_solution/kernel.py": "Bo6sVC7RO/9z54fhHopul7JGQGEvtRjgcTEqOh4ZBMw=",
+      "_solution/manifest.json": "zQc2RHjGgFJP71NhGRVIbkLGoAohrtie4b2Ka3Azfzc=",
+      "_solution/neuronspark/__init__.py": "WOAQE276SDYg1Zo+QDeHGijlJZTgNAHGJKiq9xq1F/E=",
+      "_solution/neuronspark/_namespace.py": "Oo2hjHSpxScda0J7RdQjUReqjxSnoQ+AwlB/0kHWNyI=",
+      "_solution/neuronspark/ops/__init__.py": "Q1SUPelfoZOuaHiekMPDI5o3ofrTOkvEwv0JBwkvcII=",
+      "_solution/neuronspark/ops/gluon/__init__.py": "EUhdP+15lXeMWJPJHb2fKblIOp7EWt60dIEqsj/ciw8=",
+      "_solution/neuronspark/ops/gluon/_ptx.py": "ack9EY1+MHSN48VnlELq7O1Tzw0VPTm0UAM5m74IM7E=",
+      "_solution/neuronspark/ops/gluon/plif_k1_bwd.py": "6Io1W9ErKa6rkTQfL7yZWONaRR0SI3K7KOzBHDDmweY=",
+      "_solution/neuronspark/ops/triton/__init__.py": "DDoMNs9TnypF2Ma4nJol+vXrfd5+kh8HFa1Hkmq1whc=",
+      "_solution/neuronspark/ops/triton/_ptx.py": "ltuIGKsS8gampXNmbxo7/E14fA1r4AGRlwPaYVKWxEU=",
+      "_solution/neuronspark/ops/triton/cumsum.py": "ZSlRdn1EW3EpFiXuZAoo6uYK1Z8ZRMSpJ5b5EL2zZrI=",
+      "_solution/neuronspark/ops/triton/plif.py": "aU8XbuSZa6EeWLbl4KLwC3Oxo5bfOBftPzklgg+8VFM=",
+      "_solution/third_party_notices.py": "AGB+ScsNG49+d9n6gW7/T42xRywh0Rhz7yGQEJgPCGo="
+    }
+  },
+  "provenance": {
+    "kernel-builder": {
+      "version": "0.18.3",
+      "commit": "ba5ac4a8be6f041ba906534326eb36b76642716b",
+      "dirty": false
+    }
+  }
+}

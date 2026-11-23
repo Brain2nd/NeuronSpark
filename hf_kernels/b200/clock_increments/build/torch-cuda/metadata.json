@@ -1,0 +1,39 @@
+{
+  "name": "neuronspark-clock-increments",
+  "id": "_neuronspark_clock_increments_cuda_d831bee4220b99e3",
+  "version": 1,
+  "kernels-minver": "0.14.0",
+  "license": "cc-by-nc-sa-4.0",
+  "python-depends": [],
+  "kernel-depends": [],
+  "backend": {
+    "type": "cuda",
+    "archs": [
+      "10.0"
+    ]
+  },
+  "digest": {
+    "algorithm": "sha256",
+    "files": {
+      "LICENSE.txt": "E0mkthSEkrRPYp5k7tZ2YS4jT+moOeTzsnfBSCyISfE=",
+      "__init__.py": "/istGQ/b0gm6Om3nuCGt0bmywhCCZ+wr/ONDAp9lfNs=",
+      "_ops.py": "MV6ZWJ/X9Nt8GK5LLT75pyqsoZF0D9OzUiXCpjsMcgw=",
+      "_solution/__init__.py": "wprR/QOX02O1yv/Q4w1cu1KZ94YTnK98DeFQKE4cYAg=",
+      "_solution/kernel.py": "qK5NMCDE6s6oNkFFssNxseLUFgrT77sckpa37/j79uc=",
+      "_solution/manifest.json": "Ou5J8GeaRpFlQgT7Syzg1y0u3ayYV49eoPuF2khsmXA=",
+      "_solution/neuronspark/__init__.py": "WOAQE276SDYg1Zo+QDeHGijlJZTgNAHGJKiq9xq1F/E=",
+      "_solution/neuronspark/ops/__init__.py": "Q1SUPelfoZOuaHiekMPDI5o3ofrTOkvEwv0JBwkvcII=",
+      "_solution/neuronspark/ops/triton/__init__.py": "B59VUCEOy4/aaRST++hB0WkT0t63DlwKV23+CkCM0qg=",
+      "_solution/neuronspark/ops/triton/_ptx.py": "ltuIGKsS8gampXNmbxo7/E14fA1r4AGRlwPaYVKWxEU=",
+      "_solution/neuronspark/ops/triton/pool_clock.py": "IVtOjKZH6t0GusBEh6KLBvBxmV8QUo01tb1NZFILNBw=",
+      "_solution/third_party_notices.py": "o7Xfp6kuK9JGgxHJwWBAlwVWcJQDwOtBCg9OSjx8a0E="
+    }
+  },
+  "provenance": {
+    "kernel-builder": {
+      "version": "0.18.3",
+      "commit": "ba5ac4a8be6f041ba906534326eb36b76642716b",
+      "dirty": false
+    }
+  }
+}

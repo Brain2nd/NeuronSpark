@@ -1,0 +1,44 @@
+"""Third-party notices of the NeuronSpark repository (its NOTICE file, unchanged).
+
+NeuronSpark
+Licensed under the Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International license (see LICENSE),
+except for the third-party material listed below, which keeps its own license.
+
+-----------------------------------------------------------------------------------------------------------------------
+1. flash-linear-attention (fla-core), version 0.5.2
+   Copyright (c) the flash-linear-attention authors
+   (https://github.com/fla-org/flash-linear-attention, LICENSE)
+   Licensed under the MIT License.
+
+   Kernel bodies transcribed from fla-core's normalization kernels (rms_norm / layer_norm_fwd), with the reduction
+   layout and rounding points kept:
+     neuronspark/ops/triton/dendritic_prenorm.py       dendritic-layer pre-norm forward / backward
+     neuronspark/ops/triton/dendritic_gated_norm.py    gated RMSNorm of the dendritic-layer prefill path
+     neuronspark/ops/triton/dendritic_step.py          pre-norm rows kernel of the prefill / decode path and the gated-norm
+                                                lines of the decode step kernels
+
+   MIT License text:
+     Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
+     documentation files (the "Software"), to deal in the Software without restriction, including without limitation
+     the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and
+     to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+     The above copyright notice and this permission notice shall be included in all copies or substantial portions of
+     the Software.
+     THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO
+     THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+     AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+     CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+     IN THE SOFTWARE.
+
+-----------------------------------------------------------------------------------------------------------------------
+2. PyTorch, version 2.9.1
+   Copyright (c) 2016- Facebook, Inc. and its affiliates, and the PyTorch contributors
+   Licensed under the BSD 3-Clause License (https://github.com/pytorch/pytorch/blob/main/LICENSE).
+
+   Kernels that reproduce the arithmetic order of ATen CUDA kernels (reduction trees, scans, top-k selection,
+   softmax / cross-entropy sequences) follow the structure of those kernels:
+     neuronspark/ops/triton/hippo_norms.py     row reductions of the RMS norms (at::native reduce kernel order)
+     neuronspark/ops/triton/cumsum.py        outer-dimension inclusive scan
+     neuronspark/ops/triton/pkm_topk.py      top-k selection (radix select + bitonic sort semantics)
+     neuronspark/ops/triton/lm_tail.py       softmax / cross-entropy and reduction sequences
+"""

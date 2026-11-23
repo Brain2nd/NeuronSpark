@@ -1,0 +1,116 @@
+{
+  "operator": "xq_queries_prefill",
+  "run": "neuronspark.ops.triton.xq_query:xq_queries_prefill",
+  "ref": "neuronspark.ops.triton.xq_query:xq_queries_prefill_ref",
+  "kernel_name": "neuronspark-xq-queries-prefill",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "93d2f380531b05cedf5fb5d199cd636b771669b4",
+    "branch": "b200",
+    "dirty": false
+  },
+  "sources_sha256": "8661226c78c7513fe134fd3188052665e1a1dd12db3f5894823cf32a169aeb56",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "fb66988d062ba882092305d2d359b65aee86a75d624e1e42ef2f4eab6e19620e",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/_namespace.py",
+      "sha256": "3a8da18c74a9c5271d6b427b45d4235117aa8f14a7a10f80c2507fd241d63722",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the torch.library namespace of the copy"
+      ]
+    },
+    {
+      "path": "neuronspark/modules/__init__.py",
+      "sha256": "2a204f460dff1e23a979cbd5b4c54093e4606e5daccc20f5ff6e3da1595b3685",
+      "source_sha256": "9a55989d335053f5aba8080d5a497390bffe8d3e393d2e9a9ecaf3f8279a3d9e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/modules/rope.py",
+      "sha256": "9b7801637bf317e5b36be88538b4e23b84b8ca6e8f20ddd8701721b424b52725",
+      "source_sha256": "9b7801637bf317e5b36be88538b4e23b84b8ca6e8f20ddd8701721b424b52725",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "4354943de95fa193ae68789e90c3c3239a37a1fad33a4bc4c2fd0907092f7082",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "079f5550210ecb8fda691493fbe841d16913d2deb70e5c0a576dfe0a408cd2a8",
+      "source_sha256": "9006675f6755f62c22b3fee4426786c0f6d035acf6b67557f90a44372b1e3ea7",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: require_cuda"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/_ptx.py",
+      "sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "source_sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/pool_ring.py",
+      "sha256": "f5fa186222e449782231c295180d9577ebd23ad60f67858ad877cbb4c11fa179",
+      "source_sha256": "7c649d0c1af0c161be9504cbe583b5a950fadb4f361b5c3ec414cec07ab510df",
+      "unchanged": false,
+      "changes": [
+        "line 357: operator neuronspark::ring_t1_partials2 registered in the package's namespace",
+        "line 619: operator neuronspark::xq_form_t1 registered in the package's namespace",
+        "line 792: operator neuronspark::ring_write_prefill registered in the package's namespace",
+        "line 1306: operator neuronspark::ring_recall_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 79: the import is written on one line and 2 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/xq_query.py",
+      "sha256": "896c3deb3a62c0db1be3bf9d7620b7fa7bfbab38ab7e08774af43665b8983665",
+      "source_sha256": "54086aa25248703b997ba6c7f6d3454a0d5cfb3fd19d0b374d073e5e4a0e2449",
+      "unchanged": false,
+      "changes": [
+        "line 163: operator neuronspark::xq_queries_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "a3b5dfa7a92e2bd2468311c9c16040970556709403c0eb410a0f4e4a3c7c6b41",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

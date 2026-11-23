@@ -1,0 +1,116 @@
+{
+  "operator": "plif_step",
+  "run": "neuronspark.ops.triton.plif_step:plif_step",
+  "ref": "neuronspark.ops.triton.plif_step:plif_step_ref",
+  "kernel_name": "neuronspark-plif-step",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "b9556379c89f943f95dbf31d0a22967c75efa159",
+    "branch": "b200",
+    "dirty": false
+  },
+  "sources_sha256": "15a27c137f48bf46fdf969360de8f1871eac013d47c3818d6f1083355e0d518b",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "19e99369821b73accdf79b03faf32a8a7c676bebd24bb38830c3e92a5d783a00",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/_namespace.py",
+      "sha256": "3a8da18c74a9c5271d6b427b45d4235117aa8f14a7a10f80c2507fd241d63722",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the torch.library namespace of the copy"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "4354943de95fa193ae68789e90c3c3239a37a1fad33a4bc4c2fd0907092f7082",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/linear.py",
+      "sha256": "bd44c5a362116ef8e6e45a1b3062cc384816119d145b9e2da04f51b4a799834c",
+      "source_sha256": "bd44c5a362116ef8e6e45a1b3062cc384816119d145b9e2da04f51b4a799834c",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "079f5550210ecb8fda691493fbe841d16913d2deb70e5c0a576dfe0a408cd2a8",
+      "source_sha256": "9006675f6755f62c22b3fee4426786c0f6d035acf6b67557f90a44372b1e3ea7",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: require_cuda"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/_ptx.py",
+      "sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "source_sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/linear_row.py",
+      "sha256": "e14e32b31856b1f686f1564a309f0b03063dc0436cfd6aba3ea36a956d7d3c69",
+      "source_sha256": "e14e32b31856b1f686f1564a309f0b03063dc0436cfd6aba3ea36a956d7d3c69",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/linear_small_n.py",
+      "sha256": "bc2d4d807ceafcd36413356290c7365ebfe937e3368c711eb67295c29f14de59",
+      "source_sha256": "bc2d4d807ceafcd36413356290c7365ebfe937e3368c711eb67295c29f14de59",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/plif_step.py",
+      "sha256": "71f292797d7796335468022ca373c7bcf7b6c72ee20e6e586d61c4853a3660f8",
+      "source_sha256": "f8128996bc8f98a0c6468a7e1517c5f56b65c2c5310c8c5e690b27be7568e09b",
+      "unchanged": false,
+      "changes": [
+        "line 252: operator neuronspark::plif_step registered in the package's namespace",
+        "line 264: operator neuronspark::centred_step registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 45: the import is written on one line and 5 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/wgrad.py",
+      "sha256": "1c69ea86eee2c52751803b3f858cc0e3fa2d9a3720c125e12751a82692dfdf92",
+      "source_sha256": "1c69ea86eee2c52751803b3f858cc0e3fa2d9a3720c125e12751a82692dfdf92",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "a3b5dfa7a92e2bd2468311c9c16040970556709403c0eb410a0f4e4a3c7c6b41",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

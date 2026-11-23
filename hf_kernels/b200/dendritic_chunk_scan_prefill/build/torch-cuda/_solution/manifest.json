@@ -1,0 +1,130 @@
+{
+  "operator": "dendritic_chunk_scan_prefill",
+  "run": "neuronspark.ops.dendritic_prefill:dendritic_chunk_scan_prefill",
+  "ref": "neuronspark.ops.dendritic_prefill:dendritic_chunk_scan_prefill_ref",
+  "kernel_name": "neuronspark-dendritic-chunk-scan-prefill",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "b9556379c89f943f95dbf31d0a22967c75efa159",
+    "branch": "b200",
+    "dirty": false
+  },
+  "sources_sha256": "6d1a5c8ce41b43f52c2c7f679f3fe6664b9fc0d6325d053b6b5bc35a25aeb169",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "3aa6daec786cc8056b02a3a98a3a7059d3f4f7f3a0641a44dc92320f88402f1a",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/_namespace.py",
+      "sha256": "3a8da18c74a9c5271d6b427b45d4235117aa8f14a7a10f80c2507fd241d63722",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the torch.library namespace of the copy"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "4354943de95fa193ae68789e90c3c3239a37a1fad33a4bc4c2fd0907092f7082",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/dendritic_prefill.py",
+      "sha256": "692d62ece0a72921d2d68b99a03dc59966496c2f576383a9e63e51bd2c818ec5",
+      "source_sha256": "a817afa390692cfcdefbd54055b6a16bd825630f4ca3cbbf3fae49bbdd09d56d",
+      "unchanged": false,
+      "changes": [
+        "line 157: operator neuronspark::dendritic_chunk_scan_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/gluon/__init__.py",
+      "sha256": "11485d3fed7995778c5893c91dbd9f29b9483a9ec45adeb474812ab23fdc8b0f",
+      "source_sha256": "d9b7c577ef532ad30f10e0397520c594dd6f1d21f43dfe59e820e8fb75642ac1",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/gluon/_ptx.py",
+      "sha256": "69c93d118d7e30748de3c5679442eaeced53cf0d153d39b45003399bbe0833b1",
+      "source_sha256": "69c93d118d7e30748de3c5679442eaeced53cf0d153d39b45003399bbe0833b1",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/dendritic_chunk_scan_fwd.py",
+      "sha256": "1858a4c17f6b817ccd59b3e21d94f72e88cd875a52e17869d85374a5e6f1c537",
+      "source_sha256": "1858a4c17f6b817ccd59b3e21d94f72e88cd875a52e17869d85374a5e6f1c537",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/gluon/dendritic_chunk_states.py",
+      "sha256": "af5622aafb0d947b8a7da8b83d2de09eeaafc4c036f0bcea80cec73bd31474fe",
+      "source_sha256": "af5622aafb0d947b8a7da8b83d2de09eeaafc4c036f0bcea80cec73bd31474fe",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "da65182c55c40da62db54f25e5ed21fe2850c8283ffa9721e131853027d246b7",
+      "source_sha256": "9006675f6755f62c22b3fee4426786c0f6d035acf6b67557f90a44372b1e3ea7",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: num_sms, require_cuda, require_sm100"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_chunk.py",
+      "sha256": "6d9522477e1d13d38207e32204aa75c5cd2820a12d281be55852b955882baa99",
+      "source_sha256": "6d9522477e1d13d38207e32204aa75c5cd2820a12d281be55852b955882baa99",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_scan.py",
+      "sha256": "00c17de1f14adaa51db4fab29550916b6c00b6bbf51a61cb9d5a09bd1de370dd",
+      "source_sha256": "00c17de1f14adaa51db4fab29550916b6c00b6bbf51a61cb9d5a09bd1de370dd",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/dendritic_states.py",
+      "sha256": "8bbaa8b488dfc4b159d9657b90ce96520e5a6f12e34fb1ffe98adcb13c9fc28d",
+      "source_sha256": "8bbaa8b488dfc4b159d9657b90ce96520e5a6f12e34fb1ffe98adcb13c9fc28d",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "a3b5dfa7a92e2bd2468311c9c16040970556709403c0eb410a0f4e4a3c7c6b41",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

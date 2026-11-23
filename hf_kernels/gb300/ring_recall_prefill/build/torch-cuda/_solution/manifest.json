@@ -1,0 +1,90 @@
+{
+  "operator": "ring_recall_prefill",
+  "run": "neuronspark.ops.triton.pool_ring:ring_recall_prefill",
+  "ref": "neuronspark.ops.triton.pool_ring:ring_recall_prefill_ref",
+  "kernel_name": "neuronspark-ring-recall-prefill",
+  "source": {
+    "repository": "NeuronSpark",
+    "commit": "5c2720b46b2d91587454c3ef1a3107ac1f568901",
+    "branch": "main",
+    "dirty": false
+  },
+  "sources_sha256": "cdd5b21a10c0bbd1015a176ee81eac4eea0ad3e1581f556fcb482983ddbdf89c",
+  "files": [
+    {
+      "path": "kernel.py",
+      "sha256": "e20473c511fa46aeb396c25c4855dfc19d604217185296fffa36d8d77ce3ea79",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the entrypoint"
+      ]
+    },
+    {
+      "path": "neuronspark/__init__.py",
+      "sha256": "58e010136efa483620d59a3e4037871a28e52594e03401c624a8aaf71ab517f1",
+      "source_sha256": "8ddda17e2b4159568ec5f36e3507419f57b33af0046b50cd18d7740ac4fc9413",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/_namespace.py",
+      "sha256": "3a8da18c74a9c5271d6b427b45d4235117aa8f14a7a10f80c2507fd241d63722",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the torch.library namespace of the copy"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/__init__.py",
+      "sha256": "4354943de95fa193ae68789e90c3c3239a37a1fad33a4bc4c2fd0907092f7082",
+      "source_sha256": "cd6d95efd65e0bbf13dbff520b831705d108c139b18297b46316fbeffff6789e",
+      "unchanged": false,
+      "changes": [
+        "reduced to its docstring (nothing is imported from the package itself)"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/__init__.py",
+      "sha256": "079f5550210ecb8fda691493fbe841d16913d2deb70e5c0a576dfe0a408cd2a8",
+      "source_sha256": "de4b2ec294755c6784ec83cec28c340671e8f3f3e65141b15d3927b39f10a20c",
+      "unchanged": false,
+      "changes": [
+        "reduced to the definitions of: require_cuda"
+      ]
+    },
+    {
+      "path": "neuronspark/ops/triton/_ptx.py",
+      "sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "source_sha256": "96db8818ab12f206a6a573666f1a3bfc4d787c0d6be001919703da615296c445",
+      "unchanged": true,
+      "changes": []
+    },
+    {
+      "path": "neuronspark/ops/triton/pool_ring.py",
+      "sha256": "8c2ff66ba7ef852fa84f7caeec7b3f823473caa131e951177dc457e83b9be6f1",
+      "source_sha256": "08813ab166fc9ae7bb8c50fedffa2101cfb09985694a267e616eb82b63d54b36",
+      "unchanged": false,
+      "changes": [
+        "line 323: operator neuronspark::ring_t1_partials2 registered in the package's namespace",
+        "line 582: operator neuronspark::xq_form_t1 registered in the package's namespace",
+        "line 752: operator neuronspark::ring_write_prefill registered in the package's namespace",
+        "line 1135: operator neuronspark::ring_recall_prefill registered in the package's namespace",
+        "torch.ops.neuronspark -> the package's namespace",
+        "line 70: the import is written on one line and 2 empty lines (the exporter writes a repository import on one line; the lines below keep their numbers)"
+      ]
+    },
+    {
+      "path": "third_party_notices.py",
+      "sha256": "00607e49cb0d1b8f7e77d9fa816eff4f8db1472c21d11873ef219010980f086a",
+      "source_sha256": null,
+      "unchanged": false,
+      "changes": [
+        "added: the repository's NOTICE"
+      ]
+    }
+  ]
+}

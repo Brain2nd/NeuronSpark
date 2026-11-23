@@ -6,8 +6,15 @@ threshold); a hippocampal layer adds an episodic slot memory written by PLIF wri
 spiking FFN of PLIF neurons and a product-key associative memory.  The model level holds a lexical n-gram memory and
 induction match matrices.
 
+A trained model and its tokenizer come from a repository on the Hugging Face Hub or a local path::
+
+    from neuronspark import NeuronSparkLMHeadModel, load_tokenizer
+
+    model = NeuronSparkLMHeadModel.from_pretrained("owner/name")
+    tokenizer = load_tokenizer("owner/name")
+
 Importing the package has no side effects: it sets no process-wide state, reads no environment variable and registers
-nothing with other libraries.  The model classes are imported on first access.
+nothing with other libraries.  The model classes and :func:`load_tokenizer` are imported on first access.
 """
 from __future__ import annotations
 
@@ -15,11 +22,12 @@ from neuronspark.models.config_neuronspark import NeuronSparkConfig
 
 __version__ = "1.0.0"
 
-__all__ = ["NeuronSparkConfig", "NeuronSparkModel", "NeuronSparkLMHeadModel", "__version__"]
+__all__ = ["NeuronSparkConfig", "NeuronSparkModel", "NeuronSparkLMHeadModel", "load_tokenizer", "__version__"]
 
 _LAZY = {
     "NeuronSparkModel": "neuronspark.models.neuronspark_lm",
     "NeuronSparkLMHeadModel": "neuronspark.models.neuronspark_lm",
+    "load_tokenizer": "neuronspark.utils.hub",
 }
 
 

@@ -1,6 +1,6 @@
 # The GB300 kernel packages: how each was checked
 
-51 operators of `main` at 5c2720b (tag `gb300-operators-20261116`), each exported with the exporter of Kernel Design
+51 operators of tag `gb300-operators-20261116` (5c2720b), each exported with the exporter of Kernel Design
 Agents (NVlabs/kda, `scripts/export_huggingface.py`) and kernel-builder 0.18.3, loaded with
 `kernels.get_local_kernel(<package>, trust_remote_code=True)` in a process without a GPU and without this repository,
 and then run on an NVIDIA B200 (torch 2.9.1+cu130, triton 3.5.1) against the operator of that commit.

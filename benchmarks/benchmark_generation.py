@@ -16,8 +16,8 @@ printed too).  The prompts are uniform random ids (``--seed``); the ring capacit
 dendritic-layer state storage is ``--dendritic-state-dtype`` (default: the configuration's, bfloat16).
 
 By default a fresh model is launched from ``NeuronSparkConfig()`` (the default configuration) and calibrated on random
-rows (the launch calibration; the timings do not depend on trained weights); ``--ckpt`` loads a local checkpoint
-directory (``config.json`` + ``model.safetensors``, as written by ``save_pretrained``) instead.
+rows (the launch calibration; the timings do not depend on trained weights); ``--ckpt`` loads a checkpoint instead
+(anything ``from_pretrained`` takes: a checkpoint directory, a training line, a repository on the Hugging Face Hub).
 
 Example::
 
@@ -48,8 +48,9 @@ def _sizes(text: str) -> List[int]:
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--ckpt", default=None, help="a local checkpoint directory (config.json + model.safetensors); "
-                                                "default: a fresh model of the default configuration")
+    p.add_argument("--ckpt", default=None, help="a checkpoint: a local path or a repository on the Hugging Face Hub "
+                                                "(what from_pretrained takes); default: a fresh model of the default "
+                                                "configuration")
     p.add_argument("--prompt-len", type=int, default=1024)
     p.add_argument("--prefill-batches", default="1,8")
     p.add_argument("--decode-batches", default="1,8,32")

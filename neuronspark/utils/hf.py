@@ -1,13 +1,18 @@
-"""Checkpoint loading and saving (local directories; no hub access and no transformers dependency).
+"""Checkpoint loading and saving (no transformers dependency).
 
-Checkpoint directory format (written by :func:`save_pretrained`, read by :func:`load_pretrained` /
-``NeuronSparkLMHeadModel.from_pretrained``; no other format is read):
+:func:`load_pretrained` / ``NeuronSparkLMHeadModel.from_pretrained`` take a checkpoint directory, a training line of
+NeuronSpark-Trainer or a repository on the Hugging Face Hub holding either: :mod:`neuronspark.utils.hub` finds the
+configuration and the weights file (and fetches them from the Hub once); what is then loaded and verified is the same
+in every case.
+
+Checkpoint directory format (written by :func:`save_pretrained` and :func:`neuronspark.utils.hub.export`):
 
 * ``config.json`` (:data:`CONFIG_NAME`): the configuration file of :mod:`neuronspark.models.config_neuronspark` --
   ``"model_type": "neuronspark"``, ``"architectures": ["NeuronSparkLMHeadModel"]`` and the
   :class:`NeuronSparkConfig` fields under their own names;
-* ``model.safetensors`` (:data:`WEIGHTS_NAME`, metadata ``{"format": "pt"}``): ``NeuronSparkLMHeadModel.state_dict()``
-  with its own key names, every key under the prefix ``backbone.`` (:data:`PREFIX`)::
+* ``model.safetensors`` (:data:`WEIGHTS_NAME`; :func:`save_pretrained` writes the metadata ``{"format": "pt"}``, which
+  no load reads): ``NeuronSparkLMHeadModel.state_dict()`` with its own key names, every key under the prefix
+  ``backbone.`` (:data:`PREFIX`)::
 
       backbone.embed_tokens.weight                  (vocab_size, D) fp32, also the tied readout weight (stored once)
       backbone.layers.{i}.mixer_a.<name>            dendritic neuron layer i: pre_norm_gain, in_proj.weight,
@@ -37,7 +42,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import json
 import os
 import shutil
 from pathlib import Path
@@ -46,7 +50,8 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, Type, Union
 import torch
 from safetensors.torch import load_file, save_file
 
-from neuronspark.models.config_neuronspark import MODEL_TYPE, NeuronSparkConfig
+from neuronspark.models.config_neuronspark import NeuronSparkConfig
+from neuronspark.utils.hub import CONFIG_NAME, PREFIX, TOKENIZER_FILES, WEIGHTS_NAME, locate, read_config_file
 from neuronspark.utils.testing import match_stats
 
 __all__ = [
@@ -63,21 +68,7 @@ __all__ = [
     "copy_tokenizer_files",
 ]
 
-CONFIG_NAME = "config.json"
-WEIGHTS_NAME = "model.safetensors"
-# tokenizer files copied next to a saved checkpoint when present in the tokenizer directory
-TOKENIZER_FILES = (
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "vocab.json",
-    "merges.txt",
-    "added_tokens.json",
-    "chat_template.jinja",
-    "generation_config.json",
-)
-# prefix of every tensor key of model.safetensors (the LM head model's backbone)
-PREFIX = "backbone."
+# CONFIG_NAME, WEIGHTS_NAME, TOKENIZER_FILES and PREFIX are defined in neuronspark.utils.hub (which imports no torch)
 
 _PathLike = Union[str, "os.PathLike[str]"]
 
@@ -91,15 +82,7 @@ def _config_file(path: _PathLike) -> Path:
 def load_config(path: _PathLike) -> NeuronSparkConfig:
     """The :class:`NeuronSparkConfig` of a checkpoint directory (or of a ``config.json`` path).  The file must be a
     JSON object with ``"model_type": "neuronspark"``; it is read by :meth:`NeuronSparkConfig.from_dict`."""
-    f = _config_file(path)
-    with open(f, "r", encoding="utf-8") as fh:
-        d = json.load(fh)
-    if not isinstance(d, dict):
-        raise ValueError(f"{f}: the configuration is not a JSON object")
-    mt = d.get("model_type", None)
-    if mt != MODEL_TYPE:
-        raise ValueError(f"{f}: model_type {mt!r} is not {MODEL_TYPE!r}")
-    return NeuronSparkConfig.from_dict(d)
+    return read_config_file(_config_file(path))
 
 
 # ------------------------------------------------------------------------------------------------ tensors
@@ -205,11 +188,14 @@ def verify_state_dict(config: NeuronSparkConfig, state_dict: Mapping[str, torch.
 # ------------------------------------------------------------------------------------------------ models
 def load_pretrained(path: _PathLike, device: Union[str, torch.device] = "cuda", allow_uncalibrated: bool = False,
                     impl: str = "kernel", inference_dendritic_state_dtype: Optional[str] = None,
-                    model_cls: Optional[Type] = None):
-    """Build and load a :class:`NeuronSparkLMHeadModel` (or ``model_cls``) from a checkpoint directory.
+                    model_cls: Optional[Type] = None, revision: Optional[str] = None):
+    """Build and load a :class:`NeuronSparkLMHeadModel` (or ``model_cls``) from ``path``: a checkpoint directory, a
+    training line (its run directory, one of its checkpoints, its backup) or a repository on the Hugging Face Hub
+    (``"owner/name"``, at ``revision`` when given) holding a checkpoint directory or a line's backup.
 
-    1. :func:`load_config`; ``inference_dendritic_state_dtype`` (``"bfloat16"`` / ``"float32"``) replaces the
-       configuration's dendritic-layer state storage option when given;
+    1. :func:`neuronspark.utils.hub.locate`: the configuration and the weights file (fetched from the Hub once);
+       ``inference_dendritic_state_dtype`` (``"bfloat16"`` / ``"float32"``) replaces the configuration's
+       dendritic-layer state storage option when given;
     2. the tensors onto ``device``, :func:`verify_state_dict`;
     3. the model built with ``init="empty"`` on ``device`` (fp32, no random draw), ``load_state_dict(strict=True)``;
     4. post-load checks: the lexical hash buffers, the product-key memories marked ready, fp32 parameters.
@@ -218,10 +204,11 @@ def load_pretrained(path: _PathLike, device: Union[str, torch.device] = "cuda", 
 
     if model_cls is None:
         from neuronspark.models.neuronspark_lm import NeuronSparkLMHeadModel as model_cls
-    config = load_config(path)
+    src = locate(path, revision=revision)
+    config = src.config
     if inference_dendritic_state_dtype is not None:
         config = dataclasses.replace(config, inference_dendritic_state_dtype=str(inference_dendritic_state_dtype))
-    sd = load_state_dict(path, device=device)
+    sd = load_state_dict(src.weights, device=device)
     verify_state_dict(config, sd, allow_uncalibrated=allow_uncalibrated)
     model = model_cls(config, device=device, dtype=torch.float32, impl=impl, init="empty")
     model.load_state_dict(sd, strict=True)

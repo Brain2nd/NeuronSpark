@@ -33,6 +33,146 @@ This repository contains the NeuronSpark architecture and its GPU operators: the
 an inference cache with CUDA-graph decoding), Triton and Gluon kernels for training, prefill and single-token decoding,
 and benchmarks.
 
+## Installation
+
+```bash
+pip install git+https://github.com/Brain2nd/NeuronSpark --extra-index-url https://download.pytorch.org/whl/cu130
+```
+
+From a clone of this repository, `pip install . --extra-index-url https://download.pytorch.org/whl/cu130` installs the
+same (`-e .` for an editable install).  The extra index holds PyTorch 2.9.1 built for CUDA 13.0.  The package is pure
+Python: nothing is compiled at installation, and every kernel is compiled by Triton the first time it is used.
+
+Requirements:
+
+- Linux and an NVIDIA B200 or an NVIDIA GB300 (see [Supported GPUs](#supported-gpus))
+- Python ≥ 3.10
+- PyTorch 2.9.1 (CUDA 13.0) and Triton 3.5.1, both installed by the command above
+
+If the `ptxas` bundled with Triton does not know your GPU architecture (for example `sm_103a`), set `TRITON_PTXAS_PATH`
+to the one in your CUDA toolkit.
+
+### Supported GPUs
+
+Two GPU models are supported: the **NVIDIA B200** and the **NVIDIA GB300**.  The operators are tuned and validated per
+model, so each model has its own operator set:
+
+| GPU | operator set | validated |
+|---|---|---|
+| NVIDIA B200 | `main`: 81 operators (`hf_kernels/b200`) | on a B200, with one GPU and with two (tensor-parallel inference) |
+| NVIDIA GB300 | tag `gb300-operators-20261116`: 51 operators (`hf_kernels/gb300`) | on a GB300 |
+
+The command above installs `main`, the B200's set.  On a GB300, install the tag (append `@gb300-operators-20261116` to
+the repository URL): the same model and the same checkpoint format, with the GB300's operators.  The tag predates
+loading by repository name; its `from_pretrained` takes a local checkpoint directory.  `main` has not been run on a
+GB300, and no other GPU model is supported.  The speed tables under [Results](#results) were measured on a GB300 with
+the tag's operators.
+
+## Usage
+
+### Pretrained model
+
+```python
+import torch
+from neuronspark import NeuronSparkLMHeadModel, load_tokenizer
+
+name = "Brain2nd/trunk2b-backup"                        # a repository on the Hugging Face Hub, or a local path
+tokenizer = load_tokenizer(name)
+model = NeuronSparkLMHeadModel.from_pretrained(name)    # fetched once, then read from the local cache
+
+ids = tokenizer.encode("The capital of France is", add_special_tokens=False).ids
+prompt = torch.tensor([ids], device="cuda")
+out = model.generate(prompt, max_length=64)                                          # greedy
+out = model.generate(prompt, max_length=64, top_k=50, top_p=0.9, temperature=0.8)    # sampling
+print(tokenizer.decode(out[0].tolist()))
+```
+
+`from_pretrained` and `load_tokenizer` take a repository on the Hugging Face Hub (`"owner/name"`) or a local path.
+What they find there is either a checkpoint directory (`config.json`, `model.safetensors`, `tokenizer.json`) or a
+training line of [NeuronSpark-Trainer](https://github.com/Brain2nd/NeuronSpark-Trainer): its run directory, one of its
+checkpoints, or its backup, whose newest checkpoint is loaded.  Only the files of the load are fetched.  The trainer
+ends every document with the tokenizer's end token and adds no start token, hence `add_special_tokens=False`.
+
+| checkpoint | parameters | trained on |
+|---|---|---|
+| `Brain2nd/trunk2b-backup` | 2.04B (8.2 GB of weights) | 4.30B tokens of the open MiniCPM pre-training corpora: the public backup of a pre-training line (two B200s) |
+
+### Generation
+
+`generate` decodes with CUDA graphs.  `max_length` counts the prompt and the new tokens together.  A batch holds 1 to 32
+prompts of equal length.
+
+The inference cache can also be driven step by step:
+
+```python
+with torch.no_grad():
+    cache = model.allocate_inference_cache(batch_size=1, max_seqlen=2048)
+    logits = model(prompt, inference_params=cache, num_last_tokens=1).logits    # prefill
+    token = logits[:, -1].argmax(-1, keepdim=True)
+    logits = model(token, inference_params=cache).logits                       # one decode step
+```
+
+The dendritic-layer state in the cache is stored in bf16 by default.  To store it in fp32, pass
+`dendritic_state_dtype="float32"` to `allocate_inference_cache` or `generate`, or
+`inference_dendritic_state_dtype="float32"` to `from_pretrained`.  fp32 storage uses twice the memory.
+
+### Operators
+
+Every operator is a function of the installed package, next to its pure-PyTorch reference of the same signature:
+
+```python
+import torch
+from neuronspark import ops
+
+h = torch.randn(1024, 8, 2048, device="cuda")       # (T, B, D) fp32
+gain = torch.ones(2048, device="cuda")
+y = ops.KERNELS.dendritic_norm(h, gain, 1e-5)       # the kernel: the dendritic layer's pre-norm, bf16
+r = ops.REFS.dendritic_norm(h, gain, 1e-5)          # its reference
+```
+
+`ops.op_names()` lists the operators and `ops.OPS[name]` gives an operator's arguments, shapes and the code paths that
+use it; [Operator families](#operator-families) maps them to files.
+
+### A new model
+
+```python
+import torch
+from neuronspark import NeuronSparkConfig, NeuronSparkLMHeadModel
+from neuronspark.utils.calibration import calibrate_fresh_model
+
+config = NeuronSparkConfig()                                      # the default configuration
+model = NeuronSparkLMHeadModel(config, device="cuda")
+
+# launch calibration of a new model (neuron thresholds, product-key memories) on its first 64 training rows
+first_rows = [torch.randint(0, config.vocab_size, (8, 1024), device="cuda") for _ in range(8)]
+calibrate_fresh_model(model, first_rows)
+
+ids = torch.randint(0, config.vocab_size, (8, 1024), device="cuda")  # (B, T); T % dendritic_chunk_size == 0
+logits = model(ids).logits                                        # (B, T, V)
+
+targets = torch.roll(ids, -1, dims=1)
+targets[:, -1] = -100                                             # -100 is ignored
+loss = model.loss(ids, targets).loss                              # cross entropy + copy-switch auxiliary loss
+loss.backward()
+```
+
+To recompute the dendritic neuron layers in the backward pass, set `model.gradient_checkpointing = True` (or an
+integer `k`: the first `k` dendritic neuron layers, as many as a memory budget needs); to recompute the hippocampal
+layers as well (long rows), also set `model.hippocampal_checkpointing = True`.
+
+### Checkpoints
+
+`model.save_pretrained(path)` writes a checkpoint directory (`config.json` and `model.safetensors`).  A training line
+becomes one with
+
+```bash
+python -m neuronspark.utils.hub runs/my-line release/
+```
+
+which writes `config.json` with every field, the line's newest weights byte for byte and its tokenizer; the source can
+be anything `from_pretrained` takes.  The directory loads with `from_pretrained("release/")`; uploaded to the
+Hugging Face Hub as it is, it loads with `from_pretrained("owner/name")`.
+
 ## Architecture
 
 NeuronSpark stacks two kinds of layers in a fixed 3:1 pattern: three dendritic neuron layers, then one hippocampal
@@ -160,79 +300,7 @@ FusedAdam.
 
 The speed tables are updated with every operator improvement.
 
-## Installation
-
-Requirements:
-
-- Linux and an NVIDIA datacenter Blackwell GPU (compute capability 10.x: B200, GB200, B300, GB300)
-- Python ≥ 3.10
-- PyTorch 2.9.1 (CUDA 13.0) and Triton 3.5.1
-
-```bash
-pip install -r requirements.txt
-pip install -e .
-```
-
-All kernels are compiled by Triton the first time they are used.  If the `ptxas` bundled with Triton does not know your
-GPU architecture (for example `sm_103a`), set `TRITON_PTXAS_PATH` to the one in your CUDA toolkit.
-
-## Usage
-
-### Model
-
-```python
-import torch
-from neuronspark import NeuronSparkConfig, NeuronSparkLMHeadModel
-from neuronspark.utils.calibration import calibrate_fresh_model
-
-config = NeuronSparkConfig()                                      # the default configuration
-model = NeuronSparkLMHeadModel(config, device="cuda")
-
-# launch calibration of a new model (neuron thresholds, product-key memories) on its first 64 training rows
-first_rows = [torch.randint(0, config.vocab_size, (8, 1024), device="cuda") for _ in range(8)]
-calibrate_fresh_model(model, first_rows)
-
-ids = torch.randint(0, config.vocab_size, (8, 1024), device="cuda")  # (B, T); T % dendritic_chunk_size == 0
-logits = model(ids).logits                                        # (B, T, V)
-
-targets = torch.roll(ids, -1, dims=1)
-targets[:, -1] = -100                                             # -100 is ignored
-loss = model.loss(ids, targets).loss                              # cross entropy + copy-switch auxiliary loss
-loss.backward()
-```
-
-`model.save_pretrained(path)` writes a checkpoint directory (`config.json` and `model.safetensors`) and
-`NeuronSparkLMHeadModel.from_pretrained(path)` loads one.  To recompute the dendritic neuron layers in the backward
-pass, set `model.gradient_checkpointing = True` (or an integer `k`: the first `k` dendritic neuron layers, as many as a
-memory budget needs); to recompute the hippocampal layers as well (long rows), also set
-`model.hippocampal_checkpointing = True`.
-
-### Generation
-
-```python
-prompt = ids[:1, :512]
-out = model.generate(prompt, max_length=768)                                     # greedy
-out = model.generate(prompt, max_length=768, top_k=50, top_p=0.9, temperature=0.8)
-```
-
-`generate` decodes with CUDA graphs.  `max_length` counts the prompt and the new tokens together.  A batch holds 1 to 32
-prompts of equal length.
-
-The inference cache can also be driven step by step:
-
-```python
-with torch.no_grad():
-    cache = model.allocate_inference_cache(batch_size=1, max_seqlen=2048)
-    logits = model(prompt, inference_params=cache, num_last_tokens=1).logits    # prefill
-    token = logits[:, -1].argmax(-1, keepdim=True)
-    logits = model(token, inference_params=cache).logits                       # one decode step
-```
-
-The dendritic-layer state in the cache is stored in bf16 by default.  To store it in fp32, pass
-`dendritic_state_dtype="float32"` to `allocate_inference_cache` or `generate`, or
-`inference_dendritic_state_dtype="float32"` to `from_pretrained`.  fp32 storage uses twice the memory.
-
-## Operators
+## Operator families
 
 `neuronspark/ops` has one file per operator family.  Each family provides a public
 function and a pure-PyTorch reference `*_ref` with the same signature.  Kernels are registered as `torch.library`
@@ -271,7 +339,7 @@ out = kernel.run(q, k, gv, cum, beta, qtok, ktok, orders, scale)               #
 ref = kernel._entrypoint.ref(q, k, gv, cum, beta, qtok, ktok, orders, scale)   # its pure-PyTorch reference
 ```
 
-`hf_kernels/b200`: the 81 operators of this branch; `hf_kernels/gb300`: the 51 operators of `main` at tag
+`hf_kernels/b200`: the 81 operators of `main`; `hf_kernels/gb300`: the 51 operators of tag
 `gb300-operators-20261116`.  `hf_kernels/README.md` describes the packages; the `TABLE.md` of each set lists how
 every package was checked on a B200.
 
@@ -291,7 +359,8 @@ python benchmarks/benchmark_generation.py
 
 The first script times a full training step (8 × 1024 tokens: forward, backward, optimizer).  The second times prefill
 at batch 1 and 8, CUDA-graph decoding at batch 1, 8 and 32, and end-to-end generation.  Both run a fresh model of the
-default configuration (calibrated on random rows); `--ckpt DIR` loads a checkpoint directory instead.
+default configuration (calibrated on random rows); `--ckpt` loads a checkpoint instead (anything `from_pretrained`
+takes).
 
 ## Citation
 

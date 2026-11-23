@@ -74,5 +74,5 @@ def require_sm100(dev: _Device, what: str) -> None:
     no tcgen05 or tensor memory."""
     cap = device_capability(dev)
     if cap[0] != SM100[0]:
-        raise RuntimeError(f"neuronspark.{what}: requires a datacenter Blackwell GPU (compute capability 10.x: B200, "
-                           f"GB200, B300, GB300), got {cap[0]}.{cap[1]}")
+        raise RuntimeError(f"neuronspark.{what}: requires a datacenter Blackwell GPU (compute capability 10.x; the "
+                           f"supported models are NVIDIA B200 and GB300), got {cap[0]}.{cap[1]}")

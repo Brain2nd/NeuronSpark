@@ -13,8 +13,8 @@ device time of the step's kernels (CUPTI, L2 flushed before each step).  The wei
 loaded checkpoint is not written back.
 
 By default a fresh model is launched from ``NeuronSparkConfig()`` (the default configuration) and calibrated on the
-first benchmark batches (the launch calibration of a new training run); ``--ckpt`` loads a local checkpoint directory
-(``config.json`` + ``model.safetensors``, as written by ``save_pretrained``) instead.
+first benchmark batches (the launch calibration of a new training run); ``--ckpt`` loads a checkpoint instead (anything
+``from_pretrained`` takes: a checkpoint directory, a training line, a repository on the Hugging Face Hub).
 
 Example::
 
@@ -131,7 +131,8 @@ def make_batches(n: int, rows: int, seq_len: int, vocab: int, seed: int, tokens:
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--ckpt", default=None, help="checkpoint directory (default: a fresh, calibrated launch)")
+    p.add_argument("--ckpt", default=None, help="a checkpoint: a local path or a repository on the Hugging Face Hub "
+                                                "(default: a fresh, calibrated launch)")
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--seq-len", type=int, default=1024)
     p.add_argument("--gradient-checkpointing", action="store_true")

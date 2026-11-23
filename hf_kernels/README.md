@@ -6,8 +6,8 @@ installing this repository.
 
 | directory | operators | exported from | how each was checked |
 |---|---|---|---|
-| `b200/` | 81 | branch `b200`: 74 packages of b955637, the seven that contain `neuronspark/ops/triton/pool_ring.py` of 93d2f38 (the only file that differs between the two) | `b200/TABLE.md` |
-| `gb300/` | 51 | `main` at 5c2720b (tag `gb300-operators-20261116`) | `gb300/TABLE.md` |
+| `b200/` | 81 | `main` (the B200's operators): 74 packages of b955637, the seven that contain `neuronspark/ops/triton/pool_ring.py` of 93d2f38 (the only file that differs between the two) | `b200/TABLE.md` |
+| `gb300/` | 51 | tag `gb300-operators-20261116` (5c2720b, the GB300's operators) | `gb300/TABLE.md` |
 
 A package is `<set>/<operator>/`: `README.md` (its card: the interface, the requirements, the source commit, the
 licence) and `build/torch-cuda/` (what the loader reads, with the digest of its files in `metadata.json`).

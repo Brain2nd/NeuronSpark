@@ -1,6 +1,6 @@
 # The B200 kernel packages: how each was checked
 
-81 operators of branch `b200`, each exported with the exporter of Kernel Design Agents (NVlabs/kda,
+81 operators of `main` (the B200's operators), each exported with the exporter of Kernel Design Agents (NVlabs/kda,
 `scripts/export_huggingface.py`) and kernel-builder 0.18.3, loaded with `kernels.get_local_kernel(<package>,
 trust_remote_code=True)` in a process without a GPU and without this repository, and then run on an NVIDIA B200
 (torch 2.9.1+cu130, triton 3.5.1) against the operator of the commit it was exported from.

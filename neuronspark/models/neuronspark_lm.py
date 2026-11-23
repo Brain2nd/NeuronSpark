@@ -625,14 +625,18 @@ class NeuronSparkLMHeadModel(nn.Module, GenerationMixin):
     # ------------------------------------------------------------------------------------------------ checkpoints
     @classmethod
     def from_pretrained(cls, path, device: Union[str, torch.device] = "cuda", allow_uncalibrated: bool = False,
-                        impl: str = "kernel", inference_dendritic_state_dtype: Optional[str] = None
-                        ) -> "NeuronSparkLMHeadModel":
-        """Load a checkpoint directory (``config.json`` + ``model.safetensors``, the format of
-        :mod:`neuronspark.utils.hf`); see :func:`neuronspark.utils.hf.load_pretrained`."""
+                        impl: str = "kernel", inference_dendritic_state_dtype: Optional[str] = None,
+                        revision: Optional[str] = None) -> "NeuronSparkLMHeadModel":
+        """Load a model: ``path`` is a repository on the Hugging Face Hub (``"owner/name"``, at ``revision`` when
+        given; fetched once) or a local path -- a checkpoint directory (``config.json`` + ``model.safetensors``, the
+        format of :mod:`neuronspark.utils.hf`) or a training line of NeuronSpark-Trainer (its run directory, one of
+        its checkpoints, its backup).  See :func:`neuronspark.utils.hf.load_pretrained` and
+        :mod:`neuronspark.utils.hub`; :func:`neuronspark.load_tokenizer` takes the same argument."""
         from neuronspark.utils.hf import load_pretrained
 
         return load_pretrained(path, device=device, allow_uncalibrated=allow_uncalibrated, impl=impl,
-                               inference_dendritic_state_dtype=inference_dendritic_state_dtype, model_cls=cls)
+                               inference_dendritic_state_dtype=inference_dendritic_state_dtype, model_cls=cls,
+                               revision=revision)
 
     def save_pretrained(self, path, tokenizer_dir=None) -> dict:
         """Write the checkpoint directory (``config.json`` and ``model.safetensors`` with ``backbone.*`` keys); copy

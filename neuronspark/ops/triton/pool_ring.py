@@ -48,11 +48,13 @@ Operators (each: private launcher, ``torch.library`` custom op with a fake, publ
     over RECALL_STATS_SPLIT programs per query block -- fewer when W / 128 has fewer factors of two -- their
     statistics combined by the value pass) and a value pass (p times the values on bf16 tensor cores, fp32
     accumulation, the value columns split over the programs); the split programs finish a few pairs soonest.
-    T >= 64, more pairs: one program per (pair, block of 128 query rows) over the ring's tiles that hold a valid slot
-    for the block (128 x 128 tiles, the blocks with the most slots first): the row max / sum, then the scores again
-    and p times the values, the fp32 accumulator kept on the tensor cores' memory; no scratch.  T < 64: one kernel
-    with 16-row tiles recomputing the scores in the value pass.  All use ``tl.exp`` (ex2.approx after the log2 e
-    multiply) and one reciprocal per row.
+    T >= 64, more pairs (and every value width that is not a multiple of 128): one program per (pair, block of 128
+    query rows) over the ring's tiles that hold a valid slot for the block (128 x 128 tiles, the blocks with the most
+    slots first): the row max / sum, then the scores again and p times the values, the fp32 accumulator kept on the
+    tensor cores' memory; no scratch.  T < 64: one kernel with 16-row tiles recomputing the scores in the value pass.
+    All use ``tl.exp`` (ex2.approx after the log2 e multiply) and one reciprocal per row.  The ring pointer may be any
+    int64 (token t of the call is at slot ``(p0 + t) mod W``); an argument whose view spans 2^31 elements or more is
+    refused (the kernels address an argument's elements with int32 offsets); a row without a valid slot reads 0.
 
 Numerics: every bf16 rounding point of the reference chain is kept; the fp32 summation orders of the tensor-core dots,
 the chunked / online softmax denominators and the approximate exponential of the prefill recall differ from it.
@@ -125,7 +127,8 @@ RECALL_VALUE_WARPS = 8
 RECALL_VALUE_STAGES = 1
 RECALL_VALUE_BDV = 128
 # prefill recall, one-program-per-query-block form (T >= 64): from this many (row, head) pairs of a call on (below it
-# the two-launch form, whose split programs finish a few pairs sooner); query rows per program, warps, stages
+# the two-launch form, whose split programs finish a few pairs sooner; a value width that RECALL_VALUE_BDV does not
+# divide takes this form at any size); query rows per program, warps, stages
 RECALL_BLOCK_MIN_BG = 24
 RECALL_BLOCK_BT = 128
 RECALL_BLOCK_WARPS = 8
@@ -924,7 +927,7 @@ def _ring_fast_kernel(Q, sq_b, sq_g, sq_t, sq_d, KR, sk_b, sk_h, sk_w, sk_d, GV,
     q = tl.load(Q + b * sq_b + g * sq_g + t[:, None] * sq_t + dd[None, :] * sq_d, mask=tm[:, None],
                 other=0.0).to(tl.bfloat16)
     if XQ:
-        ct = tl.load(CW + b * scw_b + hr * scw_h + ((p0 + t) % W) * scw_w, mask=tm, other=0.0)
+        ct = tl.load(CW + b * scw_b + hr * scw_h + ((p0 % W + W + t) % W) * scw_w, mask=tm, other=0.0)
     else:
         ct = tl.load(CA + b * sca_b + g * sca_g + t * sca_t, mask=tm, other=0.0)
     m_i = tl.full([BT], float("-inf"), tl.float32)
@@ -985,7 +988,7 @@ def _ring_stats_kernel(Q, sq_b, sq_g, sq_t, sq_d, KR, sk_b, sk_h, sk_w, sk_d,
     q = tl.load(Q + b * sq_b + g * sq_g + t[:, None] * sq_t + dd[None, :] * sq_d, mask=tm[:, None],
                 other=0.0).to(tl.bfloat16)
     if XQ:
-        ct = tl.load(CW + b * scw_b + hr * scw_h + ((p0 + t) % W) * scw_w, mask=tm, other=0.0)
+        ct = tl.load(CW + b * scw_b + hr * scw_h + ((p0 % W + W + t) % W) * scw_w, mask=tm, other=0.0)
     else:
         ct = tl.load(CA + b * sca_b + g * sca_g + t * sca_t, mask=tm, other=0.0)
     nT = tl.cdiv(T, BT)
@@ -1124,8 +1127,9 @@ def _ring_block_kernel(Q, sq_b, sq_g, sq_t, sq_d, KR, sk_b, sk_h, sk_w, sk_d, GV
     from the clocks, every slot inside them still masked by its own clock and causality).  Pass 1: per tile the logits
     x and the online row max m / sum l.  Pass 2: the logits again, p = bf16(exp(x - m) * (1 / l)) (the normalised
     probability rounded to bf16, as the reference rounds it) times the values on bf16 tensor cores, accumulated in
-    fp32; out = bf16(acc) (0 for a row without a valid slot).  No scratch: the scores are formed twice, and the
-    accumulator is only the product's (it is never rescaled)."""
+    fp32; out = bf16(acc) (0 for a row without a valid slot).  No scratch: the scores are formed twice, by the same
+    helper on the same operands (the same instruction sequence, so pass 2 reads the logits pass 1 took the maximum
+    of), and the accumulator is only the product's (it is never rescaled)."""
     pbg = tl.program_id(0)
     pt = tl.num_programs(1) - 1 - tl.program_id(1)
     b = pbg // G
@@ -1208,8 +1212,6 @@ def _check_recall(q4, k_ring, gv_ring, cum_ring, ct3, p0, matches, beta, T, B, G
                            "dk / dv powers of two in [16, 256])")
     if T > W:
         raise RuntimeError(f"ring_recall_prefill: a call of {T} tokens exceeds the ring ({W} slots)")
-    if T >= RECALL_BT and dv % RECALL_VALUE_BDV:
-        raise RuntimeError(f"ring_recall_prefill: dv {dv} is not a multiple of the value block {RECALL_VALUE_BDV}")
     if k_ring.dtype != torch.bfloat16 or gv_ring.dtype != torch.bfloat16 or cum_ring.dtype != torch.float32:
         raise RuntimeError("ring_recall_prefill: bf16 rings and fp32 clocks are required")
     H = int(k_ring.shape[1])
@@ -1241,6 +1243,12 @@ def _check_recall(q4, k_ring, gv_ring, cum_ring, ct3, p0, matches, beta, T, B, G
             raise RuntimeError("ring_recall_prefill: the matches must share one layout")
         if beta is None or beta.dtype != torch.float32 or beta.dim() != 2 or tuple(beta.shape) != (n_ind, H):
             raise RuntimeError(f"ring_recall_prefill: beta must be ({n_ind}, {H}) fp32")
+    # the kernels address the elements of an argument with int32 offsets
+    for name, t in (("q4", q4), ("k_ring", k_ring), ("gv_ring", gv_ring), ("cum_ring", cum_ring), ("ct3", ct3),
+                    *((f"matches[{i}]", m) for i, m in enumerate(matches))):
+        if t is not None and sum((n - 1) * abs(st) for n, st in zip(t.shape, t.stride())) >= 2 ** 31:
+            raise RuntimeError(f"ring_recall_prefill ({name}): the view spans 2^31 elements or more (shape "
+                               f"{tuple(t.shape)}, strides {tuple(t.stride())}): beyond the kernels' int32 offsets")
 
 
 def _ring_recall_prefill_fwd(q4: torch.Tensor, k_ring: torch.Tensor, gv_ring: torch.Tensor, cum_ring: torch.Tensor,
@@ -1262,8 +1270,9 @@ def _ring_recall_prefill_fwd(q4: torch.Tensor, k_ring: torch.Tensor, gv_ring: to
     gs = (gv_ring, gv_ring.stride(0), gv_ring.stride(1), gv_ring.stride(2), gv_ring.stride(3))
     cs = (ct, sct[0], sct[1], sct[2], cum_ring, cum_ring.stride(0), cum_ring.stride(1), cum_ring.stride(2))
     inds = (mlist[0], mlist[1], mlist[2], mlist[3], sm[0], sm[1], sm[2], be, sbe[0], sbe[1])
-    if T >= RECALL_BT and B * G >= RECALL_BLOCK_MIN_BG:
-        # one program per query block: the row statistics, then the scores again and the values
+    if T >= RECALL_BT and (B * G >= RECALL_BLOCK_MIN_BG or dv % RECALL_VALUE_BDV):
+        # one program per query block: the row statistics, then the scores again and the values (also every call
+        # whose value width the value launch's column blocks do not divide)
         _ring_block_kernel[(B * G, triton.cdiv(T, RECALL_BLOCK_BT))](
             *qs, *ks, *gs, *cs, p0, out, out.stride(0), out.stride(1), out.stride(2), float(scale), T, W, G, int(hr),
             *inds, XQ=bool(xq), DK=dk, DV=dv, BT=RECALL_BLOCK_BT, BW=BW, N_IND=n_ind, OUT_DTYPE=_OUT_TL[out_dtype],

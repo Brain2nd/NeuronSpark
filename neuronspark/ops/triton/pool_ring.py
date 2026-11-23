@@ -39,19 +39,23 @@ Operators (each: private launcher, ``torch.library`` custom op with a fake, publ
 ``ring_recall_prefill``  prefill: the pool read of every query row of the call over the whole ring (earlier calls'
     events at their clocks, this call's events causal), for the six heads (``xq=False``: group g reads ring head g) or
     the extra queries (``xq=True``: every group reads ring head ``hr``, the query clocks are those of this call's
-    slots).  T >= 64: one pass, program (query block, b g[, split]), the query blocks with the most slots first: the
-    ring's tiles in ring order ending at the tile of the block's newest slot, between the first and the last tile that
-    holds a valid slot for the block (bounds from the clocks; every slot inside still masked by its clock and
-    causality), per tile the logits, the online row max m / sum l, ``acc = sum bf16(exp(x - m)) gv`` on bf16 tensor
-    cores with fp32 accumulation, rescaled when m rises, out = bf16(acc / l); at batch 1 the tiles are split over
-    programs whose (m, l, acc) a combine kernel merges in split order.  The probabilities are rounded to bf16 before
-    the normalisation (the reference rounds the normalised ones).  T < 64: one kernel with 16-row tiles recomputing the
-    scores in the value pass (``p = bf16(exp(x - m) * (1 / l))``).  Both use ``tl.exp`` (ex2.approx after the log2 e
-    multiply).
+    slots).  The probabilities are rounded to bf16 where the reference rounds them, after the normalisation
+    (``p = bf16(exp(x - m) * (1 / l))`` with the row's final max m and sum l), so every form passes over the scores
+    twice; a form that rounds ``exp(x - m)`` before the row sum is known reads within the rule on small values and
+    outside it on a trained model's (values of tens: the read's rounding then exceeds the rule's absolute bound).
+    T >= 64, fewer than RECALL_BLOCK_MIN_BG (row, head) pairs: two launches -- a statistics pass (the scores of every
+    valid (64 x 128) tile into an fp32 scratch, the online row max / sum, a per-tile validity flag; the W slots split
+    over RECALL_STATS_SPLIT programs per query block -- fewer when W / 128 has fewer factors of two -- their
+    statistics combined by the value pass) and a value pass (p times the values on bf16 tensor cores, fp32
+    accumulation, the value columns split over the programs); the split programs finish a few pairs soonest.
+    T >= 64, more pairs: one program per (pair, block of 128 query rows) over the ring's tiles that hold a valid slot
+    for the block (128 x 128 tiles, the blocks with the most slots first): the row max / sum, then the scores again
+    and p times the values, the fp32 accumulator kept on the tensor cores' memory; no scratch.  T < 64: one kernel
+    with 16-row tiles recomputing the scores in the value pass.  All use ``tl.exp`` (ex2.approx after the log2 e
+    multiply) and one reciprocal per row.
 
-Numerics: every bf16 rounding point of the reference chain is kept except the one of the probabilities in the prefill
-recall's one-pass form (see above); the fp32 summation orders of the tensor-core dots, the chunked / online softmax
-denominators and the approximate exponential of the prefill recall differ from it.
+Numerics: every bf16 rounding point of the reference chain is kept; the fp32 summation orders of the tensor-core dots,
+the chunked / online softmax denominators and the approximate exponential of the prefill recall differ from it.
 Tests: the per-operator tolerance rule of :mod:`neuronspark.utils.testing` against the references.
 
 Interface (shared counters of ``InferenceParams``, read during a layer call, advanced by the model after the call):
@@ -77,7 +81,9 @@ from neuronspark.ops.triton._ptx import (  # noqa: F401  (Triton resolves the he
 __all__ = [
     "RING2_QUERY_ROWS", "RING2_CONFIGS", "XQ_FORM_WARPS", "RING_WRITE_HEAD_DIM",
     "RING_WRITE_ROWS", "RING_WRITE_WARPS", "RECALL_BT", "RECALL_BT_SHORT", "RECALL_BW", "RECALL_WARPS",
-    "RECALL_STAGES", "RECALL_PASS_CONFIGS", "RECALL_COMBINE_WARPS",
+    "RECALL_STAGES", "RECALL_STATS_SPLIT", "RECALL_STATS_WARPS", "RECALL_STATS_WARPS_ONE_ROW", "RECALL_STATS_STAGES",
+    "RECALL_VALUE_WARPS", "RECALL_VALUE_STAGES", "RECALL_VALUE_BDV",
+    "RECALL_BLOCK_MIN_BG", "RECALL_BLOCK_BT", "RECALL_BLOCK_WARPS", "RECALL_BLOCK_STAGES",
     "ring_read_t1", "ring_read_t1_ref",
     "xq_form_t1", "xq_form_t1_ref", "xq_weight_stack", "xq_head_gain",
     "ring_write_prefill", "ring_write_prefill_ref",
@@ -108,13 +114,22 @@ RECALL_BT_SHORT = 16
 RECALL_BW = 128
 RECALL_WARPS = 8
 RECALL_STAGES = 1
-# prefill recall, one-pass form (T >= 64): (largest batch, query rows per program, ring slots per tile, splits of a
-# block's tiles (> 1: partials and a combine kernel), warps, stages); the first row with b <= its bound
-RECALL_PASS_CONFIGS = (
-    (1, 64, 128, 2, 8, 1),
-    (None, 128, 128, 1, 8, 1),
-)
-RECALL_COMBINE_WARPS = 8
+# prefill recall, two-launch form (T >= 64): statistics pass (its W slots split over gcd(RECALL_STATS_SPLIT, W / RECALL_BW)
+# programs; warps for a call of several rows / of one row, whose grid leaves SMs free), value pass, value columns per
+# value program
+RECALL_STATS_SPLIT = 4
+RECALL_STATS_WARPS = 4
+RECALL_STATS_WARPS_ONE_ROW = 8
+RECALL_STATS_STAGES = 1
+RECALL_VALUE_WARPS = 8
+RECALL_VALUE_STAGES = 1
+RECALL_VALUE_BDV = 128
+# prefill recall, one-program-per-query-block form (T >= 64): from this many (row, head) pairs of a call on (below it
+# the two-launch form, whose split programs finish a few pairs sooner); query rows per program, warps, stages
+RECALL_BLOCK_MIN_BG = 24
+RECALL_BLOCK_BT = 128
+RECALL_BLOCK_WARPS = 8
+RECALL_BLOCK_STAGES = 1
 
 _OUT_TL = {torch.float32: tl.float32, torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}
 
@@ -945,19 +960,172 @@ def _ring_fast_kernel(Q, sq_b, sq_g, sq_t, sq_d, KR, sk_b, sk_h, sk_w, sk_d, GV,
 
 
 @triton.jit
-def _ring_recall_kernel(Q, sq_b, sq_g, sq_t, sq_d, KR, sk_b, sk_h, sk_w, sk_d, GV, sg_b, sg_h, sg_w, sg_d,
+def _ring_stats_kernel(Q, sq_b, sq_g, sq_t, sq_d, KR, sk_b, sk_h, sk_w, sk_d,
+                       CA, sca_b, sca_g, sca_t, CW, scw_b, scw_h, scw_w, P0,
+                       scale, T, W, G, HR,
+                       M0, M1, M2, M3, sm_b, sm_t, sm_w, BETA, sbe_n, sbe_h, SCR, MST, LST, VFL,
+                       XQ: tl.constexpr, DK: tl.constexpr,
+                       BT: tl.constexpr, BW: tl.constexpr, N_IND: tl.constexpr, NSPLIT: tl.constexpr):
+    """Two-launch recall, launch 1: program (t block, b g, split) -- the scores x of every valid (BT, BW) tile of its
+    W / NSPLIT slots into SCR, the split's row max / sum (raw: -inf / 0 without a valid slot) into MST / LST, a
+    per-(program, tile) validity flag into VFL.  A tile is valid for the block when one of its slots has a finite clock
+    and is not causal for the block's last valid row."""
+    pt = tl.program_id(0)
+    pbg = tl.program_id(1)
+    b = pbg // G
+    g = pbg % G
+    if XQ:
+        hr = HR
+    else:
+        hr = g
+    t = pt * BT + tl.arange(0, BT)
+    tm = t < T
+    p0 = tl.load(P0)
+    dd = tl.arange(0, DK)
+    q = tl.load(Q + b * sq_b + g * sq_g + t[:, None] * sq_t + dd[None, :] * sq_d, mask=tm[:, None],
+                other=0.0).to(tl.bfloat16)
+    if XQ:
+        ct = tl.load(CW + b * scw_b + hr * scw_h + ((p0 + t) % W) * scw_w, mask=tm, other=0.0)
+    else:
+        ct = tl.load(CA + b * sca_b + g * sca_g + t * sca_t, mask=tm, other=0.0)
+    nT = tl.cdiv(T, BT)
+    prog = pbg * nT + pt
+    ps = tl.program_id(2)
+    scr = SCR + (prog * BT + tl.arange(0, BT))[:, None].to(tl.int64) * W
+    t_max = tl.minimum(pt * BT + BT, T) - 1
+    m_i = tl.full([BT], float("-inf"), tl.float32)
+    l_i = tl.zeros([BT], dtype=tl.float32)
+    WS = W // NSPLIT
+    for w0 in range(ps * WS, ps * WS + WS, BW):
+        w = w0 + tl.arange(0, BW)
+        cw, causal, valid = _rf_valid(CW, scw_b, scw_h, scw_w, b, hr, w, t, tm, p0, T, W)
+        jw = (w.to(tl.int64) - p0) % W
+        jw = tl.where(jw < 0, jw + W, jw)
+        anyv = tl.sum(((cw != float("inf")) & ((jw >= T) | (jw <= t_max))).to(tl.int32)) > 0
+        if anyv:
+            x = _rf_x(q, ct, cw, causal, valid, KR, sk_b, sk_h, sk_w, sk_d,
+                      M0, M1, M2, M3, sm_b, sm_t, sm_w, BETA, sbe_n, sbe_h, scale, b, hr, t, tm, w, DK, N_IND)
+            tl.store(scr + w[None, :], x)
+            m_new = tl.maximum(m_i, tl.max(x, axis=1))
+            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+            alpha = tl.where(m_i == float("-inf"), 0.0, tl.exp(m_i - m_safe))
+            pe = tl.where(valid, tl.exp(x - m_safe[:, None]), 0.0)
+            l_i = l_i * alpha + tl.sum(pe, axis=1)
+            m_i = m_new
+            tl.store(VFL + prog * (W // BW) + w0 // BW, 1)
+        else:
+            tl.store(VFL + prog * (W // BW) + w0 // BW, 0)
+    tl.store(MST + (prog * NSPLIT + ps) * BT + tl.arange(0, BT), m_i)
+    tl.store(LST + (prog * NSPLIT + ps) * BT + tl.arange(0, BT), l_i)
+
+
+@triton.jit
+def _ring_value_kernel(GV, sg_b, sg_h, sg_w, sg_d, OUT, so_t, so_b, so_c, T, W, G, HR, SCR, MST, LST, VFL,
+                       XQ: tl.constexpr, DV: tl.constexpr, BT: tl.constexpr, BW: tl.constexpr,
+                       OUT_DTYPE: tl.constexpr, BDV: tl.constexpr, NSPLIT: tl.constexpr):
+    """Two-launch recall, launch 2: the row max m / sum l combined from the NSPLIT splits' statistics, p = exp(x - m) *
+    (1 / l) from the stored scores, rounded to bf16, times the ring values on the valid tiles (VFL) into a (BT, BDV) fp32
+    accumulator."""
+    pt = tl.program_id(0)
+    pbg = tl.program_id(1)
+    pd = tl.program_id(2)
+    b = pbg // G
+    g = pbg % G
+    if XQ:
+        hr = HR
+    else:
+        hr = g
+    t = pt * BT + tl.arange(0, BT)
+    tm = t < T
+    nT = tl.cdiv(T, BT)
+    prog = pbg * nT + pt
+    scr = SCR + (prog * BT + tl.arange(0, BT))[:, None].to(tl.int64) * W
+    m_r = tl.full([BT], float("-inf"), tl.float32)
+    for ps in tl.static_range(NSPLIT):
+        m_r = tl.maximum(m_r, tl.load(MST + (prog * NSPLIT + ps) * BT + tl.arange(0, BT)))
+    m_safe = tl.where(m_r == float("-inf"), 0.0, m_r)
+    l_r = tl.zeros([BT], dtype=tl.float32)
+    for ps in tl.static_range(NSPLIT):
+        m_s = tl.load(MST + (prog * NSPLIT + ps) * BT + tl.arange(0, BT))
+        l_s = tl.load(LST + (prog * NSPLIT + ps) * BT + tl.arange(0, BT))
+        l_r = l_r + tl.where(l_s > 0.0, l_s * tl.exp(m_s - m_safe), 0.0)
+    l_safe = tl.where(l_r > 0.0, l_r, 1.0)
+    inv_l = 1.0 / l_safe
+    dvv = pd * BDV + tl.arange(0, BDV)
+    acc = tl.zeros([BT, BDV], dtype=tl.float32)
+    for w0 in range(0, W, BW):
+        w = w0 + tl.arange(0, BW)
+        vf = tl.load(VFL + prog * (W // BW) + w0 // BW)
+        if vf > 0:
+            x = tl.load(scr + w[None, :])
+            valid = x != float("-inf")
+            pr = tl.where(valid, tl.exp(x - m_safe[:, None]) * inv_l[:, None], 0.0).to(tl.bfloat16)
+            gv = tl.load(GV + b * sg_b + hr * sg_h + w[:, None] * sg_w + dvv[None, :] * sg_d)
+            acc = tl.dot(pr, gv, acc)
+    tl.store(OUT + t[:, None] * so_t + b * so_b + (g * DV + dvv)[None, :] * so_c,
+             acc.to(tl.bfloat16).to(OUT_DTYPE), mask=tm[:, None])                    # autocast bmm: bf16 output
+
+
+def _recall_ind(ind4) -> Tuple[List[torch.Tensor], Optional[torch.Tensor]]:
+    """``ind4`` -> (matches, beta): None, (matches, beta) or ("matches", matches, beta)."""
+    if ind4 is None:
+        return [], None
+    if isinstance(ind4, torch.Tensor) or not isinstance(ind4, (tuple, list)):
+        raise RuntimeError("ring_recall_prefill: ind4 must be None or (matches, beta): the induction term is formed "
+                           "in the kernel from the bool match matrices")
+    if len(ind4) == 3 and isinstance(ind4[0], str):
+        ind4 = ind4[1:]
+    if len(ind4) != 2:
+        raise RuntimeError("ring_recall_prefill: ind4 must be (matches, beta)")
+    matches, beta = ind4
+    return list(matches), beta
+
+
+@triton.jit
+def _recall_tile(i, tile_s, ntl, p0, T, W, t, tm, ct, q, cwb, scw_w, kb, sk_w, sk_d, scale, mrow,
+                 M0, M1, M2, M3, sm_w, be0, be1, be2, be3,
+                 DK: tl.constexpr, BW: tl.constexpr, N_IND: tl.constexpr):
+    """Tile i of the block (ring order from tile_s): the rows' logits x = bf16(bf16(q . k) * scale) + bf16(clock bias
+    [+ induction term]), -inf where the slot is not valid for the row."""
+    dd = tl.arange(0, DK)
+    w = ((tile_s + i) % ntl) * BW + tl.arange(0, BW)
+    jw = (w - p0 + W) % W
+    cw = tl.load(cwb + w * scw_w)
+    k = tl.load(kb + w[:, None] * sk_w + dd[None, :] * sk_d)
+    s = tl.dot(q, tl.trans(k)).to(tl.bfloat16).to(tl.float32)            # autocast bmm: bf16 output
+    s = (s * scale).to(tl.bfloat16).to(tl.float32)                      # bf16 tensor x gain: bf16 result
+    causal = (jw[None, :] < T) & (jw[None, :] > t[:, None])
+    valid = (~causal) & (cw[None, :] != float("inf")) & tm[:, None]
+    bias = ct[:, None] - cw[None, :]
+    if N_IND > 0:
+        off = mrow[:, None] + w[None, :] * sm_w
+        iv = tl.load(M0 + off, mask=tm[:, None], other=0).to(tl.float32) * be0
+        if N_IND > 1:
+            iv = iv + tl.load(M1 + off, mask=tm[:, None], other=0).to(tl.float32) * be1
+        if N_IND > 2:
+            iv = iv + tl.load(M2 + off, mask=tm[:, None], other=0).to(tl.float32) * be2
+        if N_IND > 3:
+            iv = iv + tl.load(M3 + off, mask=tm[:, None], other=0).to(tl.float32) * be3
+        bias = bias + iv
+    bias = bias.to(tl.bfloat16).to(tl.float32)
+    return tl.where(valid, s + bias, float("-inf"))
+
+
+@triton.jit
+def _ring_block_kernel(Q, sq_b, sq_g, sq_t, sq_d, KR, sk_b, sk_h, sk_w, sk_d, GV, sg_b, sg_h, sg_w, sg_d,
                         CA, sca_b, sca_g, sca_t, CW, scw_b, scw_h, scw_w, P0,
                         OUT, so_t, so_b, so_c, scale, T, W, G, HR,
-                        M0, M1, M2, M3, sm_b, sm_t, sm_w, BETA, sbe_n, sbe_h, MLS, ACC,
+                        M0, M1, M2, M3, sm_b, sm_t, sm_w, BETA, sbe_n, sbe_h,
                         XQ: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
-                        BT: tl.constexpr, BW: tl.constexpr, N_IND: tl.constexpr, OUT_DTYPE: tl.constexpr,
-                        NSPLIT: tl.constexpr):
-    """One-pass recall (T >= RECALL_BT), program (b g, query block; the blocks with the most slots first): the ring's
-    tiles in ring order ending at the tile of the block's newest slot, from the first to the last tile that holds a
-    valid slot for the block (the bounds from the clocks; every slot inside them still masked by its own clock and
-    causality), per tile the logits, the online row max m / sum l, ``acc = sum bf16(exp(x - m)) gv`` rescaled when m
-    rises; out = bf16(acc / l) (0 for a row without a valid slot).  NSPLIT > 1: program axis 2 takes its share of the
-    block's tiles and stores (m, l) to MLS and acc to ACC for the combine kernel."""
+                        BT: tl.constexpr, BW: tl.constexpr, N_IND: tl.constexpr, OUT_DTYPE: tl.constexpr):
+    """The recall of one query block in one program (the calls of RECALL_BLOCK_MIN_BG (row, head) pairs and more),
+    program (b g, query block; the blocks with the most slots first), over the ring's tiles between the first and the
+    last that hold a valid slot for the block (ring order ending at the tile of the block's newest slot; the bounds
+    from the clocks, every slot inside them still masked by its own clock and causality).  Pass 1: per tile the logits
+    x and the online row max m / sum l.  Pass 2: the logits again, p = bf16(exp(x - m) * (1 / l)) (the normalised
+    probability rounded to bf16, as the reference rounds it) times the values on bf16 tensor cores, accumulated in
+    fp32; out = bf16(acc) (0 for a row without a valid slot).  No scratch: the scores are formed twice, and the
+    accumulator is only the product's (it is never rescaled)."""
     pbg = tl.program_id(0)
     pt = tl.num_programs(1) - 1 - tl.program_id(1)
     b = pbg // G
@@ -984,6 +1152,10 @@ def _ring_recall_kernel(Q, sq_b, sq_g, sq_t, sq_d, KR, sk_b, sk_h, sk_w, sk_d, G
     kb = KR + b64 * sk_b + hr * sk_h
     gb = GV + b64 * sg_b + hr * sg_h
     mrow = b64 * sm_b + t.to(tl.int64) * sm_t                     # the matches' row offsets (int64)
+    be0 = 0.0
+    be1 = 0.0
+    be2 = 0.0
+    be3 = 0.0
     if N_IND > 0:
         be0 = tl.load(BETA + hr * sbe_h)
     if N_IND > 1:
@@ -1006,106 +1178,26 @@ def _ring_recall_kernel(Q, sq_b, sq_g, sq_t, sq_d, KR, sk_b, sk_h, sk_w, sk_d, G
         i_hi = tl.where(anyv, i, i_hi)
     m_i = tl.full([BT], float("-inf"), tl.float32)
     l_i = tl.zeros([BT], dtype=tl.float32)
-    acc = tl.zeros([BT, DV], dtype=tl.float32)
-    if NSPLIT > 1:
-        sp = tl.program_id(2)
-        per = tl.cdiv(i_hi + 1 - i_lo, NSPLIT)
-        i_a = i_lo + sp * per
-        i_b = tl.minimum(i_a + per, i_hi + 1)
-    else:
-        i_a = i_lo
-        i_b = i_hi + 1
-    for i in range(i_a, i_b):
-        w = ((tile_s + i) % ntl) * BW + tl.arange(0, BW)
-        jw = (w - p0 + W) % W
-        cw = tl.load(cwb + w * scw_w)
-        k = tl.load(kb + w[:, None] * sk_w + dd[None, :] * sk_d)
-        s = tl.dot(q, tl.trans(k)).to(tl.bfloat16).to(tl.float32)        # autocast bmm: bf16 output
-        s = (s * scale).to(tl.bfloat16).to(tl.float32)                  # bf16 tensor x gain: bf16 result
-        causal = (jw[None, :] < T) & (jw[None, :] > t[:, None])
-        valid = (~causal) & (cw[None, :] != float("inf")) & tm[:, None]
-        bias = ct[:, None] - cw[None, :]
-        if N_IND > 0:
-            off = mrow[:, None] + w[None, :] * sm_w
-            iv = tl.load(M0 + off, mask=tm[:, None], other=0).to(tl.float32) * be0
-            if N_IND > 1:
-                iv = iv + tl.load(M1 + off, mask=tm[:, None], other=0).to(tl.float32) * be1
-            if N_IND > 2:
-                iv = iv + tl.load(M2 + off, mask=tm[:, None], other=0).to(tl.float32) * be2
-            if N_IND > 3:
-                iv = iv + tl.load(M3 + off, mask=tm[:, None], other=0).to(tl.float32) * be3
-            bias = bias + iv
-        bias = bias.to(tl.bfloat16).to(tl.float32)
-        x = tl.where(valid, s + bias, float("-inf"))
+    for i in range(i_lo, i_hi + 1):
+        x = _recall_tile(i, tile_s, ntl, p0, T, W, t, tm, ct, q, cwb, scw_w, kb, sk_w, sk_d, scale, mrow,
+                         M0, M1, M2, M3, sm_w, be0, be1, be2, be3, DK, BW, N_IND)
         m_new = tl.maximum(m_i, tl.max(x, axis=1))
         m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
         alpha = tl.exp(m_i - m_safe)                                    # 0 while m_i = -inf
-        pe = tl.exp(x - m_safe[:, None])                                # 0 where invalid
-        l_i = l_i * alpha + tl.sum(pe, axis=1)
-        v = tl.load(gb + w[:, None] * sg_w + dv[None, :] * sg_d)
-        acc = tl.dot(pe.to(tl.bfloat16), v, acc * alpha[:, None])
+        l_i = l_i * alpha + tl.sum(tl.exp(x - m_safe[:, None]), axis=1)  # exp(-inf) = 0 where invalid
         m_i = m_new
-    if NSPLIT > 1:
-        part = (pbg.to(tl.int64) * tl.num_programs(1) + pt) * NSPLIT + sp
-        rr = tl.arange(0, BT)
-        tl.store(MLS + (part * 2) * BT + rr, m_i)
-        tl.store(MLS + (part * 2 + 1) * BT + rr, l_i)
-        tl.store(ACC + (part * BT + rr)[:, None] * DV + dv[None, :], acc)
-    else:
-        acc = acc / tl.where(l_i > 0.0, l_i, 1.0)[:, None]
-        tl.store(OUT + t.to(tl.int64)[:, None] * so_t + b64 * so_b + (g * DV + dv)[None, :] * so_c,
-                 acc.to(tl.bfloat16).to(OUT_DTYPE), mask=tm[:, None])                # autocast bmm: bf16 output
-
-
-@triton.jit
-def _ring_recall_combine_kernel(MLS, ACC, OUT, so_t, so_b, so_c, T, G, DV: tl.constexpr, BT: tl.constexpr,
-                                NSPLIT: tl.constexpr, OUT_DTYPE: tl.constexpr):
-    """Program (b g, query block): the splits' (m, l, acc) combined in split order, out = bf16(sum acc_s e^(m_s - m)
-    / sum l_s e^(m_s - m)) (0 for a row without a valid slot)."""
-    pbg = tl.program_id(0)
-    pt = tl.program_id(1)
-    b = (pbg // G).to(tl.int64)
-    g = pbg % G
-    rr = tl.arange(0, BT)
-    dv = tl.arange(0, DV)
-    t = pt * BT + rr
-    base = (pbg.to(tl.int64) * tl.num_programs(1) + pt) * NSPLIT
-    m = tl.full([BT], float("-inf"), tl.float32)
-    for sp in tl.static_range(NSPLIT):
-        m = tl.maximum(m, tl.load(MLS + ((base + sp) * 2) * BT + rr))
-    m = tl.where(m == float("-inf"), 0.0, m)
-    l = tl.zeros([BT], tl.float32)
-    acc = tl.zeros([BT, DV], tl.float32)
-    for sp in tl.static_range(NSPLIT):
-        f = tl.exp(tl.load(MLS + ((base + sp) * 2) * BT + rr) - m)
-        l = l + tl.load(MLS + ((base + sp) * 2 + 1) * BT + rr) * f
-        acc = acc + tl.load(ACC + ((base + sp) * BT + rr)[:, None] * DV + dv[None, :]) * f[:, None]
-    acc = acc / tl.where(l > 0.0, l, 1.0)[:, None]
-    tl.store(OUT + t.to(tl.int64)[:, None] * so_t + b * so_b + (g * DV + dv)[None, :] * so_c,
-             acc.to(tl.bfloat16).to(OUT_DTYPE), mask=(t < T)[:, None])
-
-
-def _recall_config(B: int) -> Tuple[int, int, int, int, int]:
-    """(query rows per program, slots per tile, splits, warps, stages) of the one-pass recall for batch B."""
-    for bmax, bt, bw, nsp, warps, stages in RECALL_PASS_CONFIGS:
-        if bmax is None or int(B) <= bmax:
-            return bt, bw, nsp, warps, stages
-    raise AssertionError("RECALL_PASS_CONFIGS has no catch-all row")  # pragma: no cover
-
-
-def _recall_ind(ind4) -> Tuple[List[torch.Tensor], Optional[torch.Tensor]]:
-    """``ind4`` -> (matches, beta): None, (matches, beta) or ("matches", matches, beta)."""
-    if ind4 is None:
-        return [], None
-    if isinstance(ind4, torch.Tensor) or not isinstance(ind4, (tuple, list)):
-        raise RuntimeError("ring_recall_prefill: ind4 must be None or (matches, beta): the induction term is formed "
-                           "in the kernel from the bool match matrices")
-    if len(ind4) == 3 and isinstance(ind4[0], str):
-        ind4 = ind4[1:]
-    if len(ind4) != 2:
-        raise RuntimeError("ring_recall_prefill: ind4 must be (matches, beta)")
-    matches, beta = ind4
-    return list(matches), beta
+    m_safe = tl.where(m_i == float("-inf"), 0.0, m_i)
+    inv_l = 1.0 / tl.where(l_i > 0.0, l_i, 1.0)                         # one reciprocal per row
+    acc = tl.zeros([BT, DV], dtype=tl.float32)
+    for i in range(i_lo, i_hi + 1):
+        w = ((tile_s + i) % ntl) * BW + tl.arange(0, BW)
+        x = _recall_tile(i, tile_s, ntl, p0, T, W, t, tm, ct, q, cwb, scw_w, kb, sk_w, sk_d, scale, mrow,
+                         M0, M1, M2, M3, sm_w, be0, be1, be2, be3, DK, BW, N_IND)
+        pr = (tl.exp(x - m_safe[:, None]) * inv_l[:, None]).to(tl.bfloat16)
+        v = tl.load(gb + w[:, None] * sg_w + dv[None, :] * sg_d)
+        acc = tl.dot(pr, v, acc)
+    tl.store(OUT + t.to(tl.int64)[:, None] * so_t + b64 * so_b + (g * DV + dv)[None, :] * so_c,
+             acc.to(tl.bfloat16).to(OUT_DTYPE), mask=tm[:, None])                    # autocast bmm: bf16 output
 
 
 def _check_recall(q4, k_ring, gv_ring, cum_ring, ct3, p0, matches, beta, T, B, G, W, dk, dv, out_dtype, xq, hr):
@@ -1116,6 +1208,8 @@ def _check_recall(q4, k_ring, gv_ring, cum_ring, ct3, p0, matches, beta, T, B, G
                            "dk / dv powers of two in [16, 256])")
     if T > W:
         raise RuntimeError(f"ring_recall_prefill: a call of {T} tokens exceeds the ring ({W} slots)")
+    if T >= RECALL_BT and dv % RECALL_VALUE_BDV:
+        raise RuntimeError(f"ring_recall_prefill: dv {dv} is not a multiple of the value block {RECALL_VALUE_BDV}")
     if k_ring.dtype != torch.bfloat16 or gv_ring.dtype != torch.bfloat16 or cum_ring.dtype != torch.float32:
         raise RuntimeError("ring_recall_prefill: bf16 rings and fp32 clocks are required")
     H = int(k_ring.shape[1])
@@ -1168,25 +1262,29 @@ def _ring_recall_prefill_fwd(q4: torch.Tensor, k_ring: torch.Tensor, gv_ring: to
     gs = (gv_ring, gv_ring.stride(0), gv_ring.stride(1), gv_ring.stride(2), gv_ring.stride(3))
     cs = (ct, sct[0], sct[1], sct[2], cum_ring, cum_ring.stride(0), cum_ring.stride(1), cum_ring.stride(2))
     inds = (mlist[0], mlist[1], mlist[2], mlist[3], sm[0], sm[1], sm[2], be, sbe[0], sbe[1])
-    if T >= RECALL_BT:
-        bt, bw, nsp, nwarp, nst = _recall_config(B)
-        if W % bw:
-            raise RuntimeError(f"ring_recall_prefill: W {W} is not a multiple of the tile of {bw} slots")
-        nT = triton.cdiv(T, bt)
-        if nsp > 1:
-            mls = torch.empty((B * G * nT * nsp * 2 * bt,), dtype=torch.float32, device=dev)
-            accs = torch.empty((B * G * nT * nsp * bt, dv), dtype=torch.float32, device=dev)
-        else:
-            mls = accs = out
-        _ring_recall_kernel[(B * G, nT, nsp)](
+    if T >= RECALL_BT and B * G >= RECALL_BLOCK_MIN_BG:
+        # one program per query block: the row statistics, then the scores again and the values
+        _ring_block_kernel[(B * G, triton.cdiv(T, RECALL_BLOCK_BT))](
             *qs, *ks, *gs, *cs, p0, out, out.stride(0), out.stride(1), out.stride(2), float(scale), T, W, G, int(hr),
-            *inds, mls, accs, XQ=bool(xq), DK=dk, DV=dv, BT=bt, BW=bw, N_IND=n_ind,
-            OUT_DTYPE=_OUT_TL[out_dtype], NSPLIT=nsp, num_warps=nwarp, num_stages=nst,
-            enable_fp_fusion=False)
-        if nsp > 1:
-            _ring_recall_combine_kernel[(B * G, nT)](mls, accs, out, out.stride(0), out.stride(1), out.stride(2), T, G,
-                                                     DV=dv, BT=bt, NSPLIT=nsp, OUT_DTYPE=_OUT_TL[out_dtype],
-                                                     num_warps=RECALL_COMBINE_WARPS)
+            *inds, XQ=bool(xq), DK=dk, DV=dv, BT=RECALL_BLOCK_BT, BW=BW, N_IND=n_ind, OUT_DTYPE=_OUT_TL[out_dtype],
+            num_warps=RECALL_BLOCK_WARPS, num_stages=RECALL_BLOCK_STAGES, enable_fp_fusion=False)
+    elif T >= RECALL_BT:
+        # two launches: statistics (no accumulator) and values
+        BT = RECALL_BT
+        nT = triton.cdiv(T, BT)
+        nsp = math.gcd(RECALL_STATS_SPLIT, W // BW)           # the slot ranges: whole BW tiles each
+        scr = torch.empty((B * G * nT * BT, W), dtype=torch.float32, device=dev)
+        mst = torch.empty((B * G * nT * nsp * BT,), dtype=torch.float32, device=dev)
+        lst = torch.empty((B * G * nT * nsp * BT,), dtype=torch.float32, device=dev)
+        vfl = torch.empty((B * G * nT, W // BW), dtype=torch.int32, device=dev)
+        _ring_stats_kernel[(nT, B * G, nsp)](
+            *qs, *ks, *cs, p0, float(scale), T, W, G, int(hr), *inds, scr, mst, lst, vfl,
+            XQ=bool(xq), DK=dk, BT=BT, BW=BW, N_IND=n_ind, NSPLIT=nsp,
+            num_warps=RECALL_STATS_WARPS_ONE_ROW if B == 1 else RECALL_STATS_WARPS, num_stages=RECALL_STATS_STAGES)
+        _ring_value_kernel[(nT, B * G, dv // RECALL_VALUE_BDV)](
+            *gs, out, out.stride(0), out.stride(1), out.stride(2), T, W, G, int(hr), scr, mst, lst, vfl,
+            XQ=bool(xq), DV=dv, BT=BT, BW=BW, OUT_DTYPE=_OUT_TL[out_dtype], BDV=RECALL_VALUE_BDV,
+            NSPLIT=nsp, num_warps=RECALL_VALUE_WARPS, num_stages=RECALL_VALUE_STAGES)
     else:
         BT = RECALL_BT_SHORT
         _ring_fast_kernel[(triton.cdiv(T, BT), B * G, 1)](
